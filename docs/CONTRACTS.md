@@ -37,7 +37,10 @@ job INSERT + plan used_at + mutation lease + event). One-shot execution:
 (single-statement predicate); runner consumes `attempt_claimed` before
 opening logs. `execution_leases` arbitrate probes vs mutation
 (`leases.py`); mutation leases never time-expire, probe leases are
-bounded and reclaimable. Runner argv is `runner <job-id> <nonce>` and refuses
+bounded and reclaimable. Terminal DB state never releases mutation
+ownership: only `tx.release_ownership()`, called by a reconciler after
+proving unit confirmed-stopped + no execution-marked processes,
+disposes the lease (F02). Runner argv is `runner <job-id> <nonce>` and refuses
 mismatches with exit 6 before any mutation.
 
 Steps mirror states plus `not_applicable` only when the adapter declares it in `plan()`
@@ -119,9 +122,14 @@ example). Unknown estimates block. No wholesale archiving of the observed
   queue tables `probe_requests`/`probe_results`; dispatcher (ubuntu) executes
   ops `inspect|discover|activity|plan|verify`; API waits bounded (threadpool),
   else cached+stale. Probe/mutation exclusion owned by dispatcher.
-- Canonical env (`owner_env.py`): allow-list UID/GID/HOME/PATH/release root/
-  cwd/interpreter/node/config/inventory/bus; release pointer resolved once per
-  job into `jobs.release_path`; preview and apply share it.
+- Canonical env (`owner_env.py::build_owner_contract`): ONE typed
+  OwnerExecutionContract (uid/gid/user/home/path/config/release/venv/
+  node/npm/npx/xdg/dbus/locale/nnp-policy/manager-scope/config-identity/
+  sudo-profile); runner launch args, probe launch args, and environment
+  fingerprint all derive from it — never reconstructed per module.
+  Release pointer resolved once per job into `jobs.release_path`;
+  preview and apply share it; the phase worker recomputes and refuses
+  on mismatch.
 - Attempts: `jobs.attempt_nonce` (claim token) + `attempt_claimed` consumed
   atomically with expected state+unit+release; units named
   `ega-update-job-<32hex-uuid>.service`. Dispatcher lock handle held for life.
