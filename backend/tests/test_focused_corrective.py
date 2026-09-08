@@ -8,6 +8,7 @@ mocked away. Python 3.10 compatible, pytest style, stdlib + backend.
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import os
 import sqlite3
@@ -37,6 +38,29 @@ from backend.app.admission import admit as admit_lib
 from backend.app import plans as plans_lib
 
 import support as support_lib
+
+
+def _load_deploy_script(module_name, filename):
+    """Load a dash-named deploy script by file path (B2).
+
+    deploy/etc/validate-archive.py cannot be imported with a plain
+    `import` statement; load it explicitly with importlib under a
+    stable unique test module name. Shared by all N17 tests so the
+    sys.path hack is not repeated per test.
+    """
+    path = os.path.join(_REPO_ROOT, "deploy", "etc", filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load %s" % path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+validate_archive = _load_deploy_script(
+    "ega_test_validate_archive",
+    "validate-archive.py",
+)
 
 
 def _fresh_db(tmp_path, name="n.db"):
@@ -723,9 +747,6 @@ def _safe_members():
 
 
 def test_n17_rejects_absolute_member(tmp_path):
-    import sys as _sys
-    _sys.path.insert(0, os.path.join(_REPO_ROOT, "deploy", "etc"))
-    import validate_archive
     path = str(tmp_path / "evil.tar")
     _write_tar(path, _safe_members() + [
         {"name": "/etc/evil", "data": b"x"}])
@@ -733,9 +754,6 @@ def test_n17_rejects_absolute_member(tmp_path):
 
 
 def test_n17_rejects_traversal_member(tmp_path):
-    import sys as _sys
-    _sys.path.insert(0, os.path.join(_REPO_ROOT, "deploy", "etc"))
-    import validate_archive
     path = str(tmp_path / "evil.tar")
     _write_tar(path, _safe_members() + [
         {"name": "../../evil", "data": b"x"}])
@@ -743,9 +761,6 @@ def test_n17_rejects_traversal_member(tmp_path):
 
 
 def test_n17_rejects_escaping_symlink_and_hardlink(tmp_path):
-    import sys as _sys
-    _sys.path.insert(0, os.path.join(_REPO_ROOT, "deploy", "etc"))
-    import validate_archive
     for link_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
         path = str(tmp_path / "evil.tar")
         _write_tar(path, _safe_members() + [
@@ -755,9 +770,6 @@ def test_n17_rejects_escaping_symlink_and_hardlink(tmp_path):
 
 
 def test_n17_rejects_special_and_bad_modes(tmp_path):
-    import sys as _sys
-    _sys.path.insert(0, os.path.join(_REPO_ROOT, "deploy", "etc"))
-    import validate_archive
     path = str(tmp_path / "evil.tar")
     _write_tar(path, _safe_members() + [
         {"name": "backend/dev", "type": tarfile.CHRTYPE}])
@@ -769,9 +781,6 @@ def test_n17_rejects_special_and_bad_modes(tmp_path):
 
 
 def test_n17_accepts_safe_archive(tmp_path):
-    import sys as _sys
-    _sys.path.insert(0, os.path.join(_REPO_ROOT, "deploy", "etc"))
-    import validate_archive
     path = str(tmp_path / "good.tar")
     _write_tar(path, _safe_members())
     assert validate_archive.validate(path, str(tmp_path / "dest")) == 0

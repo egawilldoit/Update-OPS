@@ -8,6 +8,7 @@ instruction. Python 3.10 compatible, pytest style.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -26,7 +27,28 @@ _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 
-import quiescence_check as qc_lib
+
+def _load_script_module(module_name, filename):
+    """Load a dash-named deploy script by file path (B1).
+
+    deploy/etc/quiescence-check.py is a valid executable script name
+    but cannot be imported with a plain `import` statement; load it
+    explicitly with importlib under a stable unique test module name.
+    Does not mutate production imports.
+    """
+    path = os.path.join(_DEPLOY_ETC, filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load %s" % path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+qc_lib = _load_script_module(
+    "ega_test_quiescence_check",
+    "quiescence-check.py",
+)
 
 import support as support_lib
 
@@ -294,7 +316,6 @@ def test_scripts_use_checkout_controller_not_release_cli():
 
 def _quiescent_env(tmp_path, monkeypatch, name="g78"):
     """Empty migrated DB + fresh heartbeat + drain + stopped units."""
-    import quiescence_check as qc_lib
 
     state_dir = str(tmp_path / ("%s-state" % name))
     os.makedirs(state_dir, exist_ok=True)
@@ -323,7 +344,6 @@ def _quiescent_env(tmp_path, monkeypatch, name="g78"):
 
 
 def test_g07_jobs_unreadable_not_empty(tmp_path):
-    import quiescence_check as qc_lib
 
     state_dir = str(tmp_path / "state")
     os.makedirs(state_dir, exist_ok=True)
@@ -343,7 +363,6 @@ def test_g07_jobs_unreadable_not_empty(tmp_path):
 def test_g07_missing_leases_table_blocks(tmp_path, monkeypatch):
     """A v4-schema DB without execution_leases is corruption, not zero
     leases (G07): explicit version-aware handling, no silent downgrade."""
-    import quiescence_check as qc_lib
     from backend.app import db as db_lib
 
     state_dir, config_path, db_path = _quiescent_env(
@@ -361,7 +380,6 @@ def test_g07_missing_leases_table_blocks(tmp_path, monkeypatch):
 def test_g08_terminal_held_lease_blocks(tmp_path, monkeypatch):
     """Terminal job + unreleased mutation lease blocks maintenance
     even with everything else clean (G08)."""
-    import quiescence_check as qc_lib
     from backend.app import tx as tx_lib
 
     state_dir, config_path, db_path = _quiescent_env(
@@ -388,7 +406,6 @@ def test_g08_terminal_held_lease_blocks(tmp_path, monkeypatch):
 
 
 def test_g08_terminal_held_live_delegated_blocks(tmp_path, monkeypatch):
-    import quiescence_check as qc_lib
     from backend.app import tx as tx_lib
 
     state_dir, config_path, db_path = _quiescent_env(
@@ -430,7 +447,6 @@ def test_g08_terminal_held_live_delegated_blocks(tmp_path, monkeypatch):
 
 
 def test_g08_terminal_held_unknown_delegated_blocks(tmp_path, monkeypatch):
-    import quiescence_check as qc_lib
     from backend.app import tx as tx_lib
 
     state_dir, config_path, db_path = _quiescent_env(
@@ -473,7 +489,6 @@ def test_g08_terminal_held_unknown_delegated_blocks(tmp_path, monkeypatch):
 
 
 def test_g08_clean_state_potentially_quiescent(tmp_path, monkeypatch):
-    import quiescence_check as qc_lib
 
     state_dir, config_path, db_path = _quiescent_env(
         tmp_path, monkeypatch, name="g08clean")
@@ -483,7 +498,6 @@ def test_g08_clean_state_potentially_quiescent(tmp_path, monkeypatch):
 
 
 def test_g08_unknown_runner_blocks(tmp_path, monkeypatch):
-    import quiescence_check as qc_lib
 
     state_dir, config_path, db_path = _quiescent_env(
         tmp_path, monkeypatch, name="g08ru")
@@ -520,7 +534,6 @@ def test_scripts_use_checkout_controller_not_release_cli():
 
 
 def test_g08_drain_absent_blocks(tmp_path, monkeypatch):
-    import quiescence_check as qc_lib
 
     state_dir, config_path, db_path = _quiescent_env(
         tmp_path, monkeypatch, name="g08drain")
