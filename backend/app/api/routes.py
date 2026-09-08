@@ -207,18 +207,20 @@ LOG_TRUNCATION_MARKER = ("[truncated: per-job log cap reached; "
 
 def _known_secrets():
     # type: () -> tuple
-    """Best-effort known secrets for log redaction; () when unavailable."""
-    try:
-        return load_secret_values(settings)
-    except Exception:
-        return ()
+    """Known secrets for log re-redaction (G05: no silent degradation).
+
+    Propagates SecretSourceError so the logs endpoint fails closed
+    (503) instead of serving weakened re-redaction of external text.
+    """
+    return load_secret_values(settings)
 
 
 def _safe_detail(text, limit=200):
     # type: (object, int) -> str
-    """R11: exception-derived API detail is sanitized, never raw."""
+    """R11: exception-derived API detail is sanitized, never raw. A
+    broken secret source yields a fixed safe literal (G05), never raw
+    exception text and never a secondary crash inside error handling."""
     try:
-        from ..sanitize import sanitize_text
         return sanitize_text(str(text or ""), _known_secrets())[:limit]
     except Exception:
         return "unavailable"

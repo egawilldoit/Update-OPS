@@ -1,4 +1,4 @@
-# Update-OPS V1 — Senior-Review Correction Ledger (R01–R36)
+# Update-OPS V1 — Senior-Review Correction Ledger (R01–R36, N01–N18, F01–F16, G01–G08)
 
 Branch: `feat/v1-implementation`. Baseline: `2e0f898`.
 Statuses: `open` → `implementing` → `implemented-static` → `runtime-pending`.
@@ -105,3 +105,18 @@ Statuses: implemented-static only. No verified/accepted/passed.
 | F14 | Plan/tool resolved before probe enqueue (no repair UPDATE) | `cli.py` | F14 test |
 | F15 | Immutable staging + digest + validate + re-verify + extract staged + digest record | `install.sh`, `upgrade.sh` | F15 test |
 | F16 | Stale architecture sweep (docstring, dead flag, source-scan test) | `runner.py`, tests | F16 test |
+
+# Final pre-runtime surgical corrections (G01–G08, this pass)
+
+Statuses: implemented-static only. No verified/accepted/passed.
+
+| ID | Root-cause fix | Files | Regression tests |
+| --- | --- | --- | --- |
+| G01 | Orphaned `try:` + duplicated gate comment removed from `Runner.run()`; try/except balance + fragment tripwires | `runner.py` | `test_final_integration.py` G01 block (3) |
+| G02 | Receipt never overrides surviving processes: `decide()` orders unit → processes → delegated → receipt; `procs=None` means unprovable and holds | `reconcile_core.py`, `dispatch.py`, `reconcile.py` | G02 block (2) + updated decide matrix |
+| G03 | Shared `delegated_quiescence()` (plan services, user-then-system bus, per-service proof); dispatcher + SSH use the same entry point; retention protects held-lease jobs/plans | `reconcile_core.py`, `dispatch.py`, `reconcile.py`, `retention.py` | G03 block (6) |
+| G04 | Privilege truth: job execution is NNP-off (Hermes sudo path requires elevation); contract binds `runner/scope_no_new_privileges=false` + `privilege_profile`; launch argv states it; templates match reality | `owner_env.py`, templates | G04 block (4) |
+| G05 | `SecretSourceError` distinguishes broken source from by-design empty; all durable paths fail closed; JobLog init gates mutation | `config.py`, `sanitize.py`, `receipts.py`, `runner.py`, `routes.py` | G05 block (4) |
+| G06 | `RECOVERY_RESOLVED_VALUES=("none",)`: success requires exactly `none` in validate + binding | `receipts.py` | G06 allowlist test |
+| G07 | Deploy quiescence is proof-structured: unreadable jobs/leases/plans block; pre-lease schemas explicit; missing tables block | `quiescence-check.py` | G07 block (2) |
+| G08 | Held leases independently fatal; terminal-owned jobs in delegated/unit/process proof | `quiescence-check.py` | G08 block (6) |

@@ -106,11 +106,19 @@ controller and script behavior), `backend/tests/support.py`
 `test_execution.py`, `test_api_flows.py`, `test_update_console.py`,
 and `test_core_corrective.py` to shared admission, receipts v2
 binding, and contradiction-free success evidence.
-New regression artifact: `backend/tests/test_final_integration.py`
-(F01–F16 blocks) plus `backend/tests/support.py` shared admission
-fixtures, `backend/tests/test_deploy_bootstrap.py` (F06–F10 script and
-controller behavior), and conversions of older suites to the shared
-admission service.
+
+## Final pre-runtime surgical addendum (G01–G08, main-agent pass)
+
+Previous baseline `d4b1ba3281db36b626bf03ac4f7c26e7314a7a03`. This
+pass: uncommitted at matrix-update time — exact resulting SHA recorded
+as `PENDING:final-sha` until the implementation commit lands (this
+marker is the explicit placeholder required before a SHA exists; the
+report carries the final SHA). Every row: `implemented-static`,
+result `NOT EXECUTED — IMPLEMENTATION PHASE`. No runtime PASS claimed.
+New regression artifacts: `backend/tests/test_final_integration.py`
+(G01–G08 blocks) plus `backend/tests/test_core_corrective.py`
+(updated decide matrix) and `backend/tests/test_deploy_bootstrap.py`
+(G07/G08 fail-closed controller behavior).
 
 ## Main-agent core corrective addendum (senior review R01–R36, Gate A–C)
 

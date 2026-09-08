@@ -39,8 +39,10 @@ opening logs. `execution_leases` arbitrate probes vs mutation
 (`leases.py`); mutation leases never time-expire, probe leases are
 bounded and reclaimable. Terminal DB state never releases mutation
 ownership: only `tx.release_ownership()`, called by a reconciler after
-proving unit confirmed-stopped + no execution-marked processes,
-disposes the lease (F02). Runner argv is `runner <job-id> <nonce>` and refuses
+proving unit confirmed-stopped + no execution-marked processes + no
+unresolved delegated mutation, disposes the lease (F02/G02/G03). A
+valid receipt proves outcome, never quiescence. Runner argv is
+`runner <job-id> <nonce>` and refuses
 mismatches with exit 6 before any mutation.
 
 Steps mirror states plus `not_applicable` only when the adapter declares it in `plan()`
@@ -127,7 +129,11 @@ example). Unknown estimates block. No wholesale archiving of the observed
   node/npm/npx/xdg/dbus/locale/nnp-policy/manager-scope/config-identity/
   sudo-profile); runner launch args, probe launch args, and environment
   fingerprint all derive from it — never reconstructed per module.
-  Release pointer resolved once per job into `jobs.release_path`;
+  Privilege truth (G04): job execution is NNP-off
+  (`runner/scope_no_new_privileges=false`,
+  `privilege_profile=owner-exec-nnp-off`) so the inventoried Hermes
+  sudo path can elevate; the fingerprint binds it. Release pointer
+  resolved once per job into `jobs.release_path`;
   preview and apply share it; the phase worker recomputes and refuses
   on mismatch.
 - Attempts: `jobs.attempt_nonce` (claim token) + `attempt_claimed` consumed
@@ -156,7 +162,10 @@ example). Unknown estimates block. No wholesale archiving of the observed
   replay precedes all admission conditions.
 - Config/secrets (`readiness.py`): placeholders fail readiness; per-service
   secret files with validated readability; one env-style parser
-  (`sanitize.parse_secrets_file`); `api.env`/`worker.env` non-secret only.
+  (`sanitize.parse_secrets_content`); `api.env`/`worker.env` non-secret only.
+  A configured-but-broken secret source raises `SecretSourceError` and
+  fails durable evidence closed (G05); only an unconfigured source
+  validly yields an empty set.
 - Migrations: `backend/migrations/NNN_*.sql` single ordered source +
   `schema_migrations` ledger; code version `CODE_VERSION`; startup validates,
   deploy migrates; rollback compat from ledger.
