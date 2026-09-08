@@ -1259,3 +1259,124 @@ def test_h06_mid_execute_evidence_failure_no_success(tmp_path,
     out = runner._do_execute(_types.SimpleNamespace(), 30.0)
     assert out["state"] == "interrupted"
     assert out["error_code"] == "interrupted"
+
+
+# -- S01 secrets.env readiness contract ----------------------------------------
+
+def _read_text(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_s01_install_provisions_empty_source():
+    src = _read_text(os.path.join(_REPO_ROOT, "deploy", "scripts",
+                                  "install.sh"))
+    assert "secrets.env" in src
+    # Never overwrites owner-managed files; never writes values.
+    assert '[ -e "$ETC/secrets.env" ]' in src
+    assert "chmod 0640 \"$ETC/secrets.env\"" in src
+    assert "chown root:ega-update \"$ETC/secrets.env\"" in src
+    assert "created empty known-secret source" in src
+    for forbidden in ("0644", "0666", "0777"):
+        assert ("chmod %s \"$ETC/secrets.env\"" % forbidden) not in src
+
+
+def test_s01_upgrade_ensures_source_idempotently():
+    src = _read_text(os.path.join(_REPO_ROOT, "deploy", "scripts",
+                                  "upgrade.sh"))
+    assert '[ -e "$ETC/secrets.env" ]' in src
+    assert "chmod 0640 \"$ETC/secrets.env\"" in src
+    assert "chown root:ega-update \"$ETC/secrets.env\"" in src
+
+
+def test_s01_validator_requires_shared_source():
+    """The stage gate requires secrets.env present at exactly 0640
+    root:ega-update — group-readable by design (both service users
+    read via group), never owner-only, never world-readable."""
+    import importlib.util as _ilu
+
+    path = os.path.join(_REPO_ROOT, "deploy", "etc",
+                        "validate-release.py")
+    spec = _ilu.spec_from_file_location("validate_release_s01", path)
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.SECRETS_TABLE["secrets.env"] == \
+        (True, 0o640, "root", "ega-update")
+
+
+def test_s01_both_service_identities_read_via_group():
+    """ubuntu (worker) and ega-update (API) are both in ega-update;
+    /etc/ega-update is group-traversable; service units run as those
+    users — so 0640 root:ega-update is readable by both readers."""
+    install_src = _read_text(os.path.join(
+        _REPO_ROOT, "deploy", "scripts", "install.sh"))
+    assert 'usermod -aG ega-update "$API_USER"' in install_src
+    assert 'usermod -aG ega-update "$TOOL_OWNER"' in install_src
+    assert 'chmod 0750 "$ETC"' in install_src
+    api_src = _read_text(os.path.join(
+        _REPO_ROOT, "systemd", "ega-update-api.service"))
+    assert "User=ega-update" in api_src
+    worker_src = _read_text(os.path.join(
+        _REPO_ROOT, "systemd", "ega-update-worker.service"))
+    assert "User=ubuntu" in worker_src
+
+
+def test_s01_config_and_example_agree_on_location():
+    import json as _json
+    from backend.app.config import settings as settings_lib
+
+    assert str(getattr(settings_lib, "secrets_file", "")) == \
+        "/etc/ega-update/secrets.env"
+    with open(os.path.join(_REPO_ROOT, "deploy", "etc",
+                           "config.example.json"), "r",
+              encoding="utf-8") as fh:
+        example = _json.load(fh)
+    assert example.get("secrets_file") == \
+        "/etc/ega-update/secrets.env"
+    assert "0640" in str(example.get("_comment_secrets_file", ""))
+    assert "0600" not in str(
+        example.get("_comment_secrets_file", ""))
+
+
+def test_s01_empty_readable_source_means_no_secrets(tmp_path):
+    """An empty provisioned file is valid: no additional known
+    secrets configured."""
+    import types as _types
+    from backend.app.config import load_secret_values
+
+    path = str(tmp_path / "secrets.env")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("")
+    settings = _types.SimpleNamespace(secrets_file=path)
+    assert load_secret_values(settings) == ()
+
+
+def test_s01_configured_missing_source_raises(tmp_path):
+    import types as _types
+    from backend.app.config import (SecretSourceError,
+                                    load_secret_values)
+
+    settings = _types.SimpleNamespace(
+        secrets_file=str(tmp_path / "no-such-secrets.env"))
+    try:
+        load_secret_values(settings)
+    except SecretSourceError:
+        pass
+    else:
+        raise AssertionError("missing source did not raise")
+
+
+def test_s01_unreadable_source_raises(tmp_path):
+    """A configured source that cannot be read as a file raises
+    (a directory deterministically fails the read on any uid)."""
+    import types as _types
+    from backend.app.config import (SecretSourceError,
+                                    load_secret_values)
+
+    settings = _types.SimpleNamespace(secrets_file=str(tmp_path))
+    try:
+        load_secret_values(settings)
+    except SecretSourceError:
+        pass
+    else:
+        raise AssertionError("unreadable source did not raise")

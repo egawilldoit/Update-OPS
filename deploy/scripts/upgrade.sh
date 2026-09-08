@@ -103,6 +103,21 @@ fi
 # quiescence/status/validator/migrate/readiness.
 export EGA_CONFIG_FILE="$ETC/config.json"
 
+# Known-secret redaction source (S01, idempotent): older installs may
+# predate secrets.env provisioning. Create EMPTY when absent so the
+# structural secret-source contract holds after upgrade; never touch an
+# existing owner-managed file, never write values, never print contents.
+# 0640 root:ega-update: readable by the ubuntu worker and the ega-update
+# API via group (see install.sh; 0600 root-owned would fail readiness).
+if [ -e "$ETC/secrets.env" ]; then
+  :
+else
+  : > "$ETC/secrets.env"
+  chmod 0640 "$ETC/secrets.env"
+  chown root:ega-update "$ETC/secrets.env"
+  echo "[upgrade] created empty known-secret source $ETC/secrets.env"
+fi
+
 # Config values come ONLY from the trusted checkout parser (F06/N16):
 # PYTHONPATH=$REPO_ROOT (operator checkout), never the candidate
 # release, never an old install. Existing config must parse; there are

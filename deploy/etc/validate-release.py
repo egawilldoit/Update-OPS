@@ -61,14 +61,20 @@ PORT_DROPIN_DEFAULT = ("/etc/systemd/system/ega-update-api.service.d/"
 
 # Secrets table: path -> (required, mode, owner, group). Owner/group are
 # checked when available; --skip-owner-check limits the gate to modes for
-# portable test environments.
+# portable test environments. S01: secrets.env is REQUIRED (fresh
+# installs provision it; readiness independently requires a readable
+# secret source) and EXACTLY 0640 root:ega-update — group-readable by
+# design, because the ubuntu worker and the ega-update API both read it
+# via group membership (0600 root-owned would fail readiness for both
+# service users, who are not root). Never world-readable, never
+# owner-only. csrf.secret stays 0600 (API-only inline fallback path).
 SECRETS_TABLE = {
     "config.json": (True, 0o640, "root", "ega-update"),
     "api.env": (True, 0o640, "root", "ega-update"),
     "worker.env": (True, 0o640, "root", "ega-update"),
     "csrf.secret": (True, 0o600, "root", "ega-update"),
     "tunnel.env": (False, 0o600, "root", "ega-update"),
-    "secrets.env": (False, 0o600, "root", "ega-update"),
+    "secrets.env": (True, 0o640, "root", "ega-update"),
     "cloudflared/credentials.json": (True, 0o600, "root", "ega-update"),
     "cloudflared/config.yml": (True, 0o640, "root", "ega-update"),
 }

@@ -11,7 +11,7 @@
   "csrf_secret_file": "/etc/ega-update/csrf.secret",
   "_comment_csrf_secret_file": "csrf_secret_file points at a file (0600) holding the CSRF secret; when set it overrides csrf_secret. Never inline real secrets.",
   "secrets_file": "/etc/ega-update/secrets.env",
-  "_comment_secrets_file": "secrets_file points at an env-style file (0600); secret values are never inlined in config.json.",
+  "_comment_secrets_file": "secrets_file points at an env-style file (0640 root:ega-update, provisioned EMPTY by install.sh/upgrade.sh when absent); secret values are never inlined in config.json. Empty means no additional known secrets (valid); missing/unreadable/malformed raises SecretSourceError.",
   "state_dir": "/var/lib/ega-update",
   "db_path": "/var/lib/ega-update/state.db",
   "log_dir": "/var/lib/ega-update/logs",

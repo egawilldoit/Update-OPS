@@ -19,7 +19,7 @@ tool's own CLI wrappers.
 | Drain file | `<state_dir>/drain` (`/var/lib/ega-update/drain`): API refuses new plans/jobs while present; absent by default |
 | Tunnel unit | `cloudflared-ega-update.service` (dedicated hostname → `127.0.0.1:8771`; placeholder config fail-closed, see §1) |
 | Release / pointer | `/opt/ega-update/releases/<commit>/` · `/opt/ega-update/current` |
-| Config / secrets | `/etc/ega-update/` (`config.json` 0640; `*.secret`/`tunnel.env` 0600) |
+| Config / secrets | `/etc/ega-update/` (`config.json` 0640; `csrf.secret`/`tunnel.env` 0600; `secrets.env` 0640 `root:ega-update`, provisioned empty by install/upgrade when absent) |
 | Env files | `/etc/ega-update/api.env` · `/etc/ega-update/worker.env` |
 | State DB | `/var/lib/ega-update/state.db` (SQLite WAL, outside releases) |
 | Worker lock | `/var/lib/ega-update/worker.lock` |
@@ -88,7 +88,11 @@ Symptoms: browser shows Access error / tunnel error / timeout; SSH fine.
 
 1. `systemctl status ega-update-api --no-pager`; `journalctl -u ega-update-api -n 100 --no-pager`.
 2. Common causes: bad `/etc/ega-update/api.env` or `config.json`
-   (permissions: `config.json` 0640 `root:ega-update`, secrets 0600),
+   (permissions: `config.json` 0640 `root:ega-update`,
+   `csrf.secret`/`tunnel.env` 0600, `secrets.env` 0640
+   `root:ega-update` — group-readable by design so the `ubuntu`
+   worker and the `ega-update` API both read it; never 0600
+   root-owned, which fails readiness for both service users),
    port already taken, broken `current` symlink, venv missing.
 3. Fix config/symlink, then `systemctl start ega-update-api`.
 4. Verify: `ss -ltnp | grep 127.0.0.1:8771` and an authenticated

@@ -227,6 +227,24 @@ chown root:ega-update "$ETC/api.env" "$ETC/worker.env"
 for f in "$ETC/csrf.secret" "$ETC/tunnel.env"; do
   [ -e "$f" ] || { touch "$f"; chmod 0600 "$f"; chown root:"$API_USER" "$f"; }
 done
+# Known-secret redaction source (S01): provisioned EMPTY when absent so a
+# fresh install satisfies the structural secret-source contract without
+# undocumented manual file creation. Empty means "no additional known
+# secrets" (valid); a configured source that later becomes missing,
+# unreadable, or malformed still raises SecretSourceError (G05/H06
+# unchanged). Never overwritten, never filled with values, never
+# printed. 0640 root:ega-update: the ubuntu worker AND the ega-update
+# API both read it via group (both are members; $ETC is 0750 group
+# traversable). Never world-readable, never owner-only (services are
+# not root — 0600 root-owned would fail readiness for both readers).
+if [ -e "$ETC/secrets.env" ]; then
+  :
+else
+  : > "$ETC/secrets.env"
+  chmod 0640 "$ETC/secrets.env"
+  chown root:ega-update "$ETC/secrets.env"
+  echo "[install] created empty known-secret source $ETC/secrets.env"
+fi
 # Cloudflared tunnel config: generate ONLY with an explicit placeholder
 # hostname (fail-closed). The tunnel service validates non-placeholder
 # before routing; see docs/RUNBOOK.md. Never invent a real hostname here.
