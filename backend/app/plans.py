@@ -93,24 +93,14 @@ def build_plan_row(tool_id, subject, install_identity, fingerprint,
         "required_checks_json": _canon(list(required_checks or [])),
         "restart_impact": str(restart_impact or "")[:2000],
         "env_fingerprint": str(env_fingerprint or ""),
+        "steps_json": _canon(list(steps or [])),
     }
-    row["plan_hash"] = canonical_plan_hash({
-        "tool_id": row["tool_id"], "subject": row["subject"],
-        "install_identity": row["install_identity"],
-        "fingerprint": row["fingerprint"], "target": row["target"],
-        "target_mode": row["target_mode"], "channel": row["channel"],
-        "services": services or [], "launch": launch or {},
-        "state_homes": state_homes or [],
-        "backup_scope": backup_scope or {},
-        "backup_policy": backup_policy or {},
-        "required_probes": required_probes or [],
-        "required_checks": required_checks or [],
-        "budgets": budgets or {}, "space_fs": space_fs or {},
-        "steps": steps or [], "deadlines": deadlines or {},
-        "config_hash": row["config_hash"],
-        "release_path": row["release_path"],
-    })
-    row["steps_json"] = _canon(list(steps or []))
+    # F01: exactly one canonical hash view. The initial hash input and the
+    # load-time hash input are the same function of the same row — no
+    # hand-maintained parallel field list that can drift (env_fingerprint
+    # was previously omitted here but present at load time, rejecting
+    # valid production plans as tampered).
+    row["plan_hash"] = canonical_plan_hash(_hash_view(row))
     return row
 
 

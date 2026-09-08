@@ -62,8 +62,9 @@ def v2_plan_row(conn, plan_id, tool_id="hermes", subject="owner@example.invalid"
         now.isoformat(), "evidence-%s" % activity_state, 1024, cfg, rel,
         now.isoformat(), exp.isoformat(), {}, envfp)
     row["id"] = plan_id
-    row["plan_hash"] = plans_lib.canonical_plan_hash(
-        plans_lib._hash_view(row))
+    # F01: no manual plan_hash repair. build_plan_row() is the single
+    # authority for the hash ("id" is not a hashed field); recomputing
+    # here would conceal a production hash-view divergence.
     conn.execute("BEGIN IMMEDIATE")
     plans_lib.insert_plan(conn, row)
     conn.commit()
