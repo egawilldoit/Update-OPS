@@ -159,11 +159,17 @@ def main(argv=None):
     ok, data, reason = load_receipt_file(receipt_path)
     receipt_view = None
     if ok and isinstance(data, dict):
-        bound, why = check_binding(data, job_d, args.job_id)
+        try:
+            plan = conn.execute("SELECT * FROM plans WHERE id=?",
+                                (job_d.get("plan_id", ""),)).fetchone()
+            plan_row = dict(plan) if plan is not None else None
+        except Exception:
+            plan_row = None
+        bound, why = check_binding(data, job_d, plan_row, args.job_id)
         if bound:
             receipt_view = dict(data)
             receipt_view["_valid"] = True
-            print("validated bound receipt: state=%s exit=%s" % (
+            print("validated bound receipt (job+plan+attempt): state=%s exit=%s" % (
                 data.get("state", "?"), data.get("exit_code", "?")))
         else:
             print("receipt present but UNBOUND (%s); never applied" % why)
@@ -238,7 +244,8 @@ def main(argv=None):
                         "error_detail": "ssh reconcile: %s" % detail[:400],
                         "recovery_required": 1 if needs_recovery else 0,
                         "unresolved": 0},
-                event="interrupted", event_detail=detail[:500])
+                event="interrupted", event_detail=detail[:500],
+                release_mutation=True)
             print("terminalized abandoned job as interrupted "
                   "(recovery=%s)" % int(needs_recovery))
             state = "interrupted"

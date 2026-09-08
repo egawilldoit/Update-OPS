@@ -119,72 +119,14 @@ def _owner_env_for_job(nonce):
 
 def _canonical_cmd(job_id, nonce, unit, env, paths):
     # type: (str, str, str, Dict[str, str], Dict[str, str]) -> list
+    """Single canonical launch: owner_env.build_transient_cmd is the one
+    source of unit properties (this wrapper only resolves interpreter +
+    working dir from the release paths)."""
+    from ..owner_env import build_transient_cmd
+
     release = paths.get("release_root", "") or "/opt/ega-update/current"
     python = paths.get("venv_python", "") or sys.executable
-    cmd = [
-        "systemd-run", "--user", "--collect",
-        "--unit=%s" % unit,
-        "--working-directory=%s" % release,
-        "--property=KillMode=control-group",
-        "--property=Restart=no",
-    ]
-    for key in ("EGA_CONFIG_FILE", "EGA_ATTEMPT_NONCE", "EGA_RELEASE_ROOT",
-                "PATH", "HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR",
-                "DBUS_SESSION_BUS_ADDRESS"):
-        value = env.get(key, "")
-        if value:
-            cmd.append("--setenv=%s=%s" % (key, value))
-    cmd += [python, "-m", "backend.app.worker.runner", job_id, nonce]
-    return cmd
-
-
-def _prove_launch(conn, job_id, unit, nonce,
-                  timeout_s=LAUNCH_PROVE_TIMEOUT_S):
-    # type: (...) -> str
-    """Prove the runner unit live/starting, or confirm it never started.
-
-    Returns live | starting | confirmed_absent | unknown. Unknown (bus
-    failure etc.) NEVER releases the reservation; reconcile owns it (R04).
-    """
-    deadline = time.time() + max(1.0, float(timeout_s))
-    while time.time() < deadline:
-        info = _units.query_unit(unit, timeout_s=5)
-        state = str(info.get("state", "unknown"))
-        if state in ("live", "starting"):
-            return state
-        if state == "confirmed_stopped":
-            break
-        try:
-            row = conn.execute(
-                "SELECT state, dispatch_nonce, finished_at FROM jobs"
-                " WHERE id=?", (job_id,)).fetchone()
-        except Exception:
-            row = None
-        if row is not None:
-            try:
-                if row["state"] != "preflight" \
-                        or row["dispatch_nonce"] != nonce \
-                        or row["finished_at"]:
-                    return "live"  # runner already ran/progressed
-            except Exception:
-                pass
-        time.sleep(0.5)
-    info = _units.query_unit(unit, timeout_s=5)
-    state = str(info.get("state", "unknown"))
-    if state in ("live", "starting"):
-        return state
-    if state == "confirmed_stopped":
-        # No receipt can exist yet (just spawned) and no procs expected;
-        # verify absence of execution-marked processes before concluding.
-        try:
-            from ..reconcile_core import job_processes, unit_hex
-            leftovers = job_processes(unit_hex(job_id), job_id)
-        except Exception:
-            return "unknown"
-        if leftovers:
-            return "unknown"
-        return "confirmed_absent"
-    return "unknown"
+    return build_transient_cmd(unit, release, env, python, job_id, nonce)
 
 
 def _prove_launch(conn, job_id, unit, nonce,
@@ -192,7 +134,8 @@ def _prove_launch(conn, job_id, unit, nonce,
     # type: (...) -> str
     """Prove live/starting, or confirm absence. Returns live | starting |
     confirmed_absent | unknown. Unknown never releases the reservation;
-    reconcile owns ambiguous launches (R04)."""
+    reconcile owns ambiguous launches (R04). There is exactly one
+    implementation of this function in this module."""
     deadline = time.time() + max(1.0, float(timeout_s))
     while time.time() < deadline:
         info = _units.query_unit(unit, timeout_s=5)
@@ -248,13 +191,10 @@ def dispatch_once(conn):
         _event(conn, job_id, "blocked",
                "owner env unresolvable: %s" % str(exc)[:300])
         return ""
-    try:
-        window = float(getattr(settings, "worker_claim_s", 10) or 10)
-    except (TypeError, ValueError):
-        window = 10.0
+    # Atomic single-statement claim (deadline enforced in SQL); the
+    # reservation-time claim_deadline governs, never a Python recompute.
     if not claim_with_nonce(conn, job_id, nonce, unit=unit,
-                            release_path=release,
-                            claim_deadline_s=window):
+                            release_path=release):
         return ""
     cmd = _canonical_cmd(job_id, nonce, unit, env, paths)
     try:
@@ -301,121 +241,40 @@ def _event(conn, job_id, event_type, detail):
 
 def _sanitize_payload(payload):
     # type: (Dict[str, Any]) -> Dict[str, Any]
+    # N12: sanitizer failure raises; run_probe_queue converts it to an
+    # error result (never persists raw probe output).
+    from ..config import load_secret_values
+    from ..sanitize import sanitize_json
+    return sanitize_json(payload, load_secret_values(settings))
+
+
+def _execute_probe_op(tool_id, op, request_id=""):
+    # type: (str, str, str) -> Tuple[str, Dict[str, Any]]
+    """Run one probe op supervised (N10): a worker process inside an
+    owned scope with a monotonic deadline. A hanging read-only probe
+    can never wedge the dispatcher loop. Returns (status, payload)."""
+    from .phase_run import run_supervised_phase
+
     try:
-        from ..config import load_secret_values
-        from ..sanitize import sanitize_json
-        return sanitize_json(payload, load_secret_values(settings))
+        log_dir = getattr(settings, "log_dir",
+                          "/var/lib/ega-update/logs") \
+            or "/var/lib/ega-update/logs"
     except Exception:
-        return payload
-
-
-def _execute_probe_op(tool_id, op):
-    # type: (str, str) -> Tuple[str, Dict[str, Any]]
-    """Run one probe op as the owner. Returns (status, payload)."""
+        log_dir = "/var/lib/ega-update/logs"
     try:
-        from ..adapters import registry as _registry
+        ok, data, error, timed_out = run_supervised_phase(
+            tool_id, request_id or "probe", "probe", {"op": op},
+            PROBE_OP_TIMEOUT_S, settings, log_dir,
+            lambda _s, _l: None, op=op)
     except Exception as exc:
-        return "error", {"reason": "adapter registry: %s" % exc}
-    try:
-        adapter = _registry.get_adapter(tool_id)
-    except KeyError:
-        return "error", {"reason": "unknown tool"}
-    except Exception as exc:
-        return "error", {"reason": "adapter unavailable: %s" % exc}
-    if not getattr(adapter, "enabled", True):
-        return "error", {"reason": "adapter disabled"}
-    try:
-        if op == "inspect":
-            return "ok", _dump(adapter.inspect())
-        if op == "discover":
-            return "ok", _dump(adapter.discover())
-        if op == "activity":
-            return "ok", _dump(adapter.activity())
-        if op == "plan":
-            planned = adapter.plan()
-            try:
-                activity = adapter.activity()
-            except Exception:
-                activity = None
-            try:
-                inspection = adapter.inspect()
-            except Exception:
-                inspection = None
-            return "ok", {
-                "planned": _dump(planned),
-                "activity": _dump(activity) if activity else {
-                    "state": "unknown",
-                    "evidence": "activity probe failed",
-                    "checked_at": utcnow_iso()},
-                "inspection": _dump(inspection) if inspection else {},
-            }
-        if op == "verify":
-            return "ok", _dump(adapter.verify())
-        if op == "refresh":
-            try:
-                inspection = adapter.inspect()
-            except Exception as exc:
-                return "error", {
-                    "reason": "inspect failed: %s" % str(exc)[:300]}
-            payload = {"inspection": _dump(inspection)}  # type: Dict[str, Any]
-            try:
-                payload["discovery"] = _dump(adapter.discover())
-            except Exception as exc:
-                payload["discovery"] = {
-                    "available": False,
-                    "unknown_reason": "discover failed: %s" % str(exc)[:300]}
-            try:
-                payload["activity"] = _dump(adapter.activity())
-            except Exception:
-                payload["activity"] = {
-                    "state": "unknown", "evidence": "activity failed",
-                    "checked_at": utcnow_iso()}
-            try:
-                payload["verification"] = _dump(adapter.verify())
-            except Exception as exc:
-                payload["verification"] = {
-                    "passed": False, "version": "",
-                    "error_detail": "verify failed: %s" % str(exc)[:300],
-                    "checks": []}
-            return "ok", payload
-    except Exception as exc:
-        return "error", {"reason": "probe crashed: %s" % str(exc)[:300]}
-    return "error", {"reason": "unknown op"}
-
-
-def _dump(model):
-    # type: (object) -> Dict[str, Any]
-    try:
-        if model is None:
-            return {}
-        if hasattr(model, "model_dump"):
-            data = model.model_dump()
-        elif isinstance(model, dict):
-            data = dict(model)
-        else:
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        # Preserve explicitly attached non-field extras (e.g.
-        # daemon_expected, manual_restart_limitation): model_dump drops
-        # them, but they are part of the plan contract (R15/R25/R27).
-        try:
-            extra = vars(model)
-        except Exception:
-            extra = {}
-        if isinstance(extra, dict):
-            for key, value in extra.items():
-                try:
-                    if key.startswith("_") or key in data:
-                        continue
-                    if isinstance(value, (str, bool, int, float)) or \
-                            value is None:
-                        data[key] = value
-                except Exception:
-                    continue
-        return data
-    except Exception:
-        return {}
+        return "error", {"reason": "supervision failed: %s" % exc}
+    if timed_out:
+        return "error", {"reason": "probe deadline exceeded"}
+    if not ok:
+        return "error", {"reason": (error or "probe failed")[:300]}
+    if not isinstance(data, dict):
+        return "error", {"reason": "probe result malformed"}
+    return "ok", data
 
 
 def run_probe_queue(conn):
@@ -454,13 +313,49 @@ def run_probe_queue(conn):
                 pass
             done += 1
             continue
+        # N08: durable probe lease around the installation touch. The
+        # atomic acquire fails when a mutation lease is held, closing
+        # the check-then-act race between this probe and reservation.
+        lease_id = None
+        if op in CONTENDING_OPS:
+            try:
+                from ..leases import acquire_probe_lease, release_lease
+                lease_id = acquire_probe_lease(
+                    conn, tool_id, "dispatcher-%d" % os.getpid())
+            except Exception:
+                lease_id = None
+            if not lease_id:
+                try:
+                    finish_probe(conn, req_id, "deferred", {})
+                except Exception:
+                    pass
+                done += 1
+                continue
         try:
-            status, payload = _execute_probe_op(tool_id, op)
+            status, payload = _execute_probe_op(tool_id, op, req_id)
         except Exception as exc:
             status, payload = "error", {"reason": str(exc)[:300]}
+        finally:
+            if lease_id:
+                try:
+                    from ..leases import release_lease as _release
+                    _release(conn, lease_id)
+                except Exception:
+                    pass
         try:
-            finish_probe(conn, req_id, status,
-                         _sanitize_payload(payload))
+            clean = _sanitize_payload(payload)
+        except Exception:
+            # N12: payload that cannot be sanitized is never persisted
+            # raw; the probe reports an evidence failure instead.
+            try:
+                finish_probe(conn, req_id, "error",
+                             {"reason": "evidence_sanitization_failed"})
+            except Exception:
+                pass
+            done += 1
+            continue
+        try:
+            finish_probe(conn, req_id, status, clean)
         except Exception:
             pass
         done += 1
@@ -508,7 +403,13 @@ def _reconcile_row(conn, row):
     receipt_data = {}  # type: Dict[str, Any]
     ok, data, _reason = _load_receipt_bound(job_id)
     if ok and isinstance(data, dict):
-        bound, _why = check_binding(data, job, job_id)
+        try:
+            plan = conn.execute("SELECT * FROM plans WHERE id=?",
+                                (job.get("plan_id", ""),)).fetchone()
+            plan_row = dict(plan) if plan is not None else None
+        except Exception:
+            plan_row = None
+        bound, _why = check_binding(data, job, plan_row, job_id)
         if bound:
             receipt_valid = True
             receipt_data = data
@@ -571,7 +472,8 @@ def _reconcile_row(conn, row):
                     "error_detail": "dispatcher reconcile: %s" % detail[:400],
                     "recovery_required": 1 if needs_recovery else 0,
                     "unresolved": 0},
-            event="interrupted", event_detail=detail[:500])
+            event="interrupted", event_detail=detail[:500],
+            release_mutation=True)
     except TxError as exc:
         _event(conn, job_id, "reconcile_guard", str(exc)[:300])
         return "skipped"
@@ -678,6 +580,20 @@ def main():
     # type: () -> None
     global _lock_fh
     _lock_fh = _singleton_lock()  # held for the whole process life (R03)
+    # N09: canonical user-bus environment for --user calls (systemd-run,
+    # systemctl --user) and owner probes. Linger starts the manager; these
+    # variables connect to it without any interactive login. Dispatcher
+    # probes and runner phases therefore share one bus contract.
+    try:
+        from ..owner_env import systemd_user_bus
+        for _k, _v in (systemd_user_bus() or {}).items():
+            try:
+                if _v and not os.environ.get(_k):
+                    os.environ[_k] = str(_v)
+            except Exception:
+                continue
+    except Exception:
+        pass
     try:
         from ..readiness import ReadinessError, validate_startup
         validate_startup("worker", settings)
@@ -693,6 +609,11 @@ def main():
         try:
             expire_stale_accepted(conn)
             run_probe_queue(conn)
+            try:
+                from ..leases import reclaim_expired_probes
+                reclaim_expired_probes(conn)
+            except Exception:
+                pass
             dispatch_once(conn)
             reconcile_claimed_jobs(conn)
             _maybe_retain(conn)

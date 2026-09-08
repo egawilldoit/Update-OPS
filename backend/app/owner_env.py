@@ -205,3 +205,91 @@ def env_fingerprint(env):
         return hashlib.sha256(raw).hexdigest()
     except Exception:
         return ""
+
+
+# -- canonical transient launch contract (one source, N-wave-3 cleanup) ----
+# Dispatcher, templates, docs, and tests derive from these values. Any
+# divergence is a defect: exactly one mechanism launches job runners.
+
+TRANSIENT_RUNNER_PROPERTIES = (
+    ("KillMode", "control-group"),
+    ("Restart", "no"),
+)
+
+TRANSIENT_SETENV_KEYS = (
+    "EGA_CONFIG_FILE",
+    "EGA_ATTEMPT_NONCE",
+    "EGA_RELEASE_ROOT",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+)
+
+RUNNER_MODULE_ARGV = ["-m", "backend.app.worker.runner"]
+
+
+def build_transient_cmd(unit, working_dir, env, python, job_id, nonce):
+    # type: (str, str, Dict[str, str], str, str, str) -> List[str]
+    """Exact systemd-run --user argv for one job runner (single source).
+
+    user manager only, --collect, canonical unit, resolved working dir,
+    allow-listed --setenv, KillMode=control-group, Restart=no, then the
+    release interpreter running the runner module with job+nonce.
+    """
+    if not unit or not job_id or not nonce:
+        raise ValueError("unit, job_id, and nonce are required")
+    cmd = ["systemd-run", "--user", "--collect", "--unit=%s" % unit,
+           "--working-directory=%s" % working_dir]
+    for key in TRANSIENT_SETENV_KEYS:
+        try:
+            value = (env or {}).get(key, "")
+        except Exception:
+            value = ""
+        if value:
+            cmd.append("--setenv=%s=%s" % (key, value))
+    for prop, val in TRANSIENT_RUNNER_PROPERTIES:
+        cmd.append("--property=%s=%s" % (prop, val))
+    cmd += [python, "-m", "backend.app.worker.runner", job_id, nonce]
+    return cmd
+
+
+def transient_scope_name(job_hex, phase):
+    # type: (str, str) -> str
+    """Per-phase scope unit inside the job unit (R06/N10)."""
+    stem = str(job_hex or "").replace("-", "")
+    return "ega-update-job-%s-%s.scope" % (stem, phase)
+
+
+def canonical_fingerprint(settings=None, inventory=None, release_path=""):
+    # type: (object, object, str) -> str
+    """Environment fingerprint comparable across processes (N09).
+
+    Computed from CANONICAL values (resolved release, configured
+    Node paths, config identity) — never raw environ — so the
+    dispatcher, phase worker, and runner all agree. Bound into plans;
+    execution rechecks it before mutation.
+    """
+    import hashlib
+    import json
+
+    try:
+        from .inventory import config_identity
+        config_hash = config_identity(settings, inventory)
+    except Exception:
+        config_hash = ""
+    try:
+        paths = resolved_paths(settings, inventory)
+        node = {k: paths.get(k, "") for k in
+                ("node_path", "npm_path", "npx_path")}
+    except Exception:
+        node = {}
+    try:
+        narrowed = {"release": release_path or "", "node": node,
+                    "config_hash": config_hash}
+        raw = json.dumps(narrowed, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+    except Exception:
+        return ""

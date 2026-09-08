@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Dict
+from typing import Any, Dict, List, Tuple
 
 LIVE = "live"
 STARTING = "starting"
@@ -19,22 +19,21 @@ CONFIRMED_STOPPED = "confirmed_stopped"
 UNKNOWN = "unknown"
 
 _SHOW_PROPS = ("Id,ActiveState,SubState,MainPID,ControlGroup,"
-               "FragmentPath,Result,ExecMainStatus")
+               "FragmentPath,Result,ExecMainStatus,LoadState")
 
 
-def _show(unit, timeout_s=10):
-    # type: (str, float) -> Dict[str, object]
+def _show(unit, timeout_s=10, user=True):
+    # type: (str, float, bool) -> Dict[str, object]
     """Bounded read-only show. Never raises; ok=False on any failure."""
+    base = ["systemctl"] + (["--user"] if user else []) + \
+        ["show", unit, "-p", _SHOW_PROPS]
     try:
         proc = subprocess.run(
-            ["systemctl", "--user", "show", unit, "-p", _SHOW_PROPS],
+            base,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=max(1.0, float(timeout_s)), shell=False)
     except Exception:
         return {"ok": False}
-    if proc.returncode != 0:
-        return {"ok": False,
-                "stderr": (proc.stderr or "")[:300]}
     props = {}  # type: Dict[str, str]
     try:
         for line in (proc.stdout or "").splitlines():
@@ -43,6 +42,13 @@ def _show(unit, timeout_s=10):
                 props[key.strip()] = value.strip()
     except Exception:
         return {"ok": False}
+    if proc.returncode != 0:
+        # A collected transient unit is positively reported as
+        # LoadState=not-found; anything else is a failed query (unknown).
+        if str(props.get("LoadState", "")) == "not-found":
+            return {"ok": True, "props": props, "removed": True}
+        return {"ok": False,
+                "stderr": (proc.stderr or "")[:300]}
     return {"ok": True, "props": props}
 
 
@@ -96,7 +102,22 @@ def _cgroup_empty(cgroup):
 
 def query_unit(unit, timeout_s=10):
     # type: (str, float) -> Dict[str, object]
-    """Classify unit execution state. Pure read-only inspection."""
+    """Classify unit execution state (user manager). Pure read-only."""
+    return _classify(unit, _show(unit, timeout_s=timeout_s))
+
+
+def query_unit_system(unit, timeout_s=10):
+    # type: (str, float) -> Dict[str, object]
+    """Classify unit execution state (system manager). Read-only.
+
+    Used for delegated system-scoped services (e.g. Hermes gateways).
+    Same five-state contract as query_unit.
+    """
+    return _classify(unit, _show(unit, timeout_s=timeout_s, user=False))
+
+
+def _classify(unit, shown):
+    # type: (str, Dict[str, object]) -> Dict[str, object]
     info = {
         "state": UNKNOWN, "unit": unit or "", "active_state": "",
         "sub_state": "", "main_pid": 0, "cgroup": "",
@@ -105,10 +126,12 @@ def query_unit(unit, timeout_s=10):
     if not unit:
         info["detail"] = "no unit recorded"
         return info
-    shown = _show(unit, timeout_s=timeout_s)
-    if not shown.get("ok"):
+    # shown is the bounded manager evidence fetched by the caller on the
+    # correct bus (user vs system); never re-fetch here (N07: the unit
+    # state must come from exactly one consistent snapshot).
+    if not isinstance(shown, dict) or not shown.get("ok"):
         info["detail"] = "show failed: %s" % str(
-            shown.get("stderr", "bus query failed"))[:200]
+            (shown or {}).get("stderr", "bus query failed"))[:200]
         return info
     props = shown.get("props", {})  # type: ignore[assignment]
     active = str(props.get("ActiveState", ""))
@@ -119,6 +142,15 @@ def query_unit(unit, timeout_s=10):
         main_pid = 0
     cgroup = str(props.get("ControlGroup", "") or "")
     shown_id = str(props.get("Id", "") or "")
+    load_early = str(props.get("LoadState", "") or "")
+    info["load_state"] = load_early
+    if load_early == "not-found":
+        # Positive removal proof from the manager (N07): a collected
+        # transient unit is definitively gone. Identity cannot match a
+        # removed unit, so this check precedes the identity gate.
+        info["state"] = CONFIRMED_STOPPED
+        info["detail"] = "manager reports LoadState=not-found (collected)"
+        return info
     info["active_state"] = active
     info["sub_state"] = sub
     info["main_pid"] = main_pid
@@ -154,6 +186,10 @@ def query_unit(unit, timeout_s=10):
         info["state"] = STOPPING
         return info
     if active in ("inactive", "failed"):
+        # N07: only POSITIVE proof yields confirmed_stopped. MainPID==0
+        # alone never decides; unreadable cgroups never decide.
+        load = str(props.get("LoadState", "") or "")
+        info["load_state"] = load
         empty = _cgroup_empty(cgroup)
         alive = _pid_alive(main_pid)
         if alive:
@@ -166,10 +202,21 @@ def query_unit(unit, timeout_s=10):
             info["detail"] = "manager reports %s but cgroup has members" % (
                 active,)
             return info
-        # Cgroup gone/uninspectable + MainPID dead + manager inactive:
-        # confirmed stopped for a transient unit. (empty True also here.)
-        info["state"] = CONFIRMED_STOPPED
-        info["detail"] = "manager=%s sub=%s" % (active, sub)
+        if load == "not-found":
+            # The manager positively reports the transient unit removed.
+            info["state"] = CONFIRMED_STOPPED
+            info["detail"] = "manager=%s load=not-found" % active
+            return info
+        if empty is True:
+            # Cgroup exists and is provably empty + MainPID dead.
+            info["state"] = CONFIRMED_STOPPED
+            info["detail"] = "manager=%s sub=%s cgroup-empty" % (active, sub)
+            return info
+        # Cgroup missing/unreadable without removal proof, or any other
+        # ambiguity: unknown. Never infer stopped.
+        info["state"] = UNKNOWN
+        info["detail"] = "manager=%s but cgroup %r unprovable " \
+            "(load=%s); holding" % (active, cgroup, load)
         return info
     info["detail"] = "unrecognized ActiveState: %r" % active
     info["state"] = UNKNOWN
@@ -184,3 +231,39 @@ def is_live(info):
 def is_confirmed_stopped(info):
     # type: (Dict[str, object]) -> bool
     return info.get("state") == CONFIRMED_STOPPED
+
+
+def list_job_units(prefix="ega-update-job-", timeout_s=10):
+    # type: (str, float) -> Tuple[list, str]
+    """List transient job units known to the user manager (N01).
+
+    Returns ([{unit, active_state, sub_state}...], error). error is ""
+    on success; any bus/query failure yields ([], reason) so callers
+    treat quiescence as unproven (never infer from missing rows).
+    """
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "list-units",
+             "%s*" % prefix, "--all", "--no-legend", "--no-pager"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=max(1.0, float(timeout_s)), shell=False)
+    except Exception as exc:
+        return [], "list-units failed: %s" % exc
+    if proc.returncode != 0:
+        return [], "list-units exit=%d: %s" % (
+            proc.returncode, (proc.stderr or "")[:200])
+    out = []
+    try:
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name = parts[0]
+            if prefix not in name:
+                continue
+            out.append({"unit": name, "active_state": parts[2]
+                        if len(parts) > 2 else "",
+                        "sub_state": parts[3] if len(parts) > 3 else ""})
+    except Exception as exc:
+        return [], "list-units unparseable: %s" % exc
+    return out, ""

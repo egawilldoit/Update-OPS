@@ -66,11 +66,11 @@ EXIT_INTERRUPTED = 6
 
 
 # -- supervision: scopes owned by the runner, killed as cgroups --------------
-# Phase work runs inside per-phase scope units (executor phase_context);
-# the runner (coordinator, in the parent job unit) kills scopes — never its
-# own unit. Reparented children stay in the scope cgroup, so scope-kill +
-# quiescence verify (units.query_unit) is proof; PPID scans are not used
-# for termination (R06).
+# Phase work runs in supervised worker processes inside per-phase scope
+# units (phase_run.run_supervised_phase); the runner (coordinator, in the
+# parent job unit) kills scopes — never its own unit. Reparented children
+# stay in the scope cgroup, so scope-kill + quiescence verify
+# (units.query_unit) is proof; PPID scans are not used for termination.
 
 
 def _job_processes_alive(job_id):
@@ -377,12 +377,6 @@ class Runner(object):
         self._release_path = ""
         self._before_commit = ""
         self._after_commit = ""
-        # Live-line digest window for tail-summary dedup (R09).
-        try:
-            import collections as _collections
-            self._seen_live = _collections.deque(maxlen=4000)
-        except Exception:
-            self._seen_live = []  # type: ignore[assignment]
 
     # -- setup ----------------------------------------------------------
 
@@ -394,11 +388,14 @@ class Runner(object):
 
     def _connect(self):
         # type: () -> None
-        from ..db import connect, migrate
+        # N04: execution NEVER migrates. Startup validates only; the
+        # controlled deploy procedure owns migration. Mismatch fails early
+        # before any mutation or tool touch.
+        from ..db import connect, validate_schema
 
         settings = self._settings()
         self.conn = connect(settings.db_path)
-        migrate(self.conn)
+        validate_schema(self.conn)
 
     def _load_rows(self):
         # type: () -> Tuple[bool, str]
@@ -627,6 +624,21 @@ class Runner(object):
         if planned_hash and planned_hash != current_hash:
             return False, "config_changed", \
                 "configuration changed since plan; fresh plan required"
+        # N09: preview==apply environment parity, rechecked pre-mutation.
+        try:
+            from ..owner_env import canonical_fingerprint
+            current_env = canonical_fingerprint(
+                self._settings(), None, current_release)
+        except Exception:
+            current_env = ""
+        if not current_env:
+            return False, "unavailable", \
+                "environment identity unprovable"
+        planned_env = str(self.plan_row.get("env_fingerprint", "") or "")
+        if planned_env and planned_env != current_env:
+            return False, "config_changed", \
+                "owner environment changed since plan (preview/apply " \
+                "parity broken); fresh plan required"
         return True, "", ""
 
     def _build_plan(self):
@@ -766,10 +778,25 @@ class Runner(object):
 
     # -- preflight ---------------------------------------------------------
 
-    def _preflight(self, plan):
-        # type: (Any) -> Tuple[bool, str, str]
-        """Return (ok, error_code, detail). No tool mutation here."""
+    def _preflight(self, plan, bundle):
+        # type: (Any, Dict[str, Any]) -> Tuple[bool, str, str]
+        """Policy over a supervised collection bundle. No tool mutation.
+
+        bundle (from the preflight phase worker): inspection/activity/
+        footprint dicts. Fresh data may INVALIDATE the plan; it never
+        refills plan fields. DB writes stay caller-side.
+        """
         assert self.conn is not None and self.plan_row is not None
+        bundle = bundle if isinstance(bundle, dict) else {}
+        inspection = bundle.get("inspection", {})
+        activity = bundle.get("activity", {})
+        footprint = bundle.get("footprint", {})
+        if not isinstance(inspection, dict):
+            inspection = {}
+        if not isinstance(activity, dict):
+            activity = {}
+        if not isinstance(footprint, dict):
+            footprint = {}
         # 1. Plan freshness: stale plans require a fresh plan.
         try:
             expires = self.plan_row.get("expires_at", "")
@@ -781,40 +808,38 @@ class Runner(object):
         if self.adapter is None or not getattr(self.adapter, "enabled", True):
             return False, "install_method_unsupported", \
                 "adapter for %s is disabled" % self.tool_id
-        try:
-            inspection = self.adapter.inspect()
-        except Exception as exc:
-            return False, "unavailable", "inspect probe failed: %s" % str(exc)[:300]
+        if bundle.get("__error__"):
+            return False, "unavailable", \
+                "preflight collection failed: %s" % str(
+                    bundle.get("__error__"))[:300]
+        if not inspection:
+            return False, "unavailable", \
+                "inspect probe failed: %s" % str(
+                    bundle.get("inspection_error", "no data"))[:300]
         # 3. Fingerprint: changed installation needs a fresh plan.
         expected_fp = self.plan_row.get("fingerprint", "")
-        if expected_fp and inspection.fingerprint != expected_fp:
+        fresh_fp = str(inspection.get("fingerprint", "") or "")
+        if expected_fp and fresh_fp != expected_fp:
             return False, "fingerprint_changed", \
                 "installation changed since plan; fresh plan required"
+        self._last_inspection_fingerprint = fresh_fp
+        # H-02: fresh preflight version persisted caller-side.
         try:
-            self._last_inspection_fingerprint = str(
-                getattr(inspection, "fingerprint", "") or "")
-        except Exception:
-            self._last_inspection_fingerprint = ""
-        # H-02: capture the fresh preflight inspect version for the
-        # main thread to persist (this method may run under a phase
-        # deadline thread; DB writes stay on the caller thread).
-        try:
-            fresh_before = getattr(inspection, "version", "") or ""
+            fresh_before = str(inspection.get("version", "") or "")
             if fresh_before and fresh_before != self.before_version:
                 self._fresh_before = fresh_before
         except Exception:
             pass
         # 4. Activity incl. recorded ack.
-        try:
-            activity = self.adapter.activity()
-        except Exception as exc:
-            return False, "ack_required", "activity probe failed: %s" % str(exc)[:300]
         ack = (self.job or {}).get("ack", "")
-        if activity.state == "busy":
-            return False, "activity_blocked", activity.evidence[:500]
-        if activity.state == "unknown" and not ack:
+        activity_state = str(activity.get("state", "unknown") or "unknown")
+        activity_evidence = str(activity.get("evidence", "") or "")
+        if activity_state == "busy":
+            return False, "activity_blocked", activity_evidence[:500]
+        if activity_state == "unknown" and not ack:
             return False, "ack_required", \
-                "unknown activity requires plan-specific owner ack: %s" % activity.evidence[:400]
+                "unknown activity requires plan-specific owner ack: %s" \
+                % activity_evidence[:400]
         # 5. Disk: plan budgets + MEASURED footprint on every affected
         # filesystem (R28). Fixed invented sizes never prove safety;
         # unknown estimates block. Reserve + floor apply at every gate.
@@ -829,11 +854,11 @@ class Runner(object):
                                   1 * 1024 * 1024 * 1024))
         except (TypeError, ValueError):
             reserve = 1024 * 1024 * 1024
-        try:
-            footprint = self.adapter.measure_footprint(plan)
-        except Exception as exc:
+        if isinstance(footprint.get("__error__"), str) and \
+                "__error__" in footprint and len(footprint) == 1:
             return False, "disk_blocked", \
-                "footprint probe failed: %s" % str(exc)[:300]
+                "footprint probe failed: %s" % str(
+                    footprint.get("__error__"))[:300]
         need, per_fs, unknown = self._space_need(plan, footprint, floor,
                                                  reserve)
         if unknown:
@@ -848,14 +873,20 @@ class Runner(object):
         if not disk_ok:
             return False, "disk_blocked", disk_detail[:500]
         # 6. Source cleanliness (git tools; dirty/unreadable blocks).
-        if self.tool_id == "hermes" and inspection.source_clean != "clean":
-            return False, "git_dirty", inspection.source_detail[:500]
+        if self.tool_id == "hermes" and \
+                str(inspection.get("source_clean", "")) != "clean":
+            return False, "git_dirty", str(
+                inspection.get("source_detail", ""))[:500]
         # 7. Install-method support.
-        kind = getattr(inspection, "install_kind", "")
-        if (not getattr(inspection, "executable", "")) or kind in ("", "unknown"):
+        kind = str(inspection.get("install_kind", "") or "")
+        if (not str(inspection.get("executable", "") or "")) or \
+                kind in ("", "unknown"):
             return False, "install_method_unsupported", \
-                "unsupported installation: kind=%s %s" % (kind, inspection.source_detail[:200])
-        # 8. Backup capability (read-only signals; the backup itself runs next).
+                "unsupported installation: kind=%s %s" % (
+                    kind, str(inspection.get("source_detail", ""))[:200])
+        # 8. Backup capability (read-only signals; the backup itself runs
+        # next). Steps come from the immutable plan row, never a fresh
+        # reconstruction.
         backup_dir = getattr(settings, "backup_dir", "/var/lib/ega-update/backups")
         if not os.path.isdir(backup_dir):
             try:
@@ -865,210 +896,153 @@ class Runner(object):
                     "backup dir unavailable: %s" % exc
         if not os.access(backup_dir, os.W_OK):
             return False, "backup_unsupported", "backup dir not writable"
-        if not getattr(fresh, "steps", None):
-            detail = getattr(fresh, "restart_impact", "") or "planning blocked"
-            code = "backup_unsupported" if "backup" in detail.lower() else "stale_plan"
+        try:
+            steps = list((self.plan_row or {}).get("_steps_list", []) or [])
+        except Exception:
+            steps = []
+        if not steps:
+            try:
+                import json as _json
+                steps = list(_json.loads(
+                    (self.plan_row or {}).get("steps_json", "[]") or "[]"))
+            except Exception:
+                steps = []
+        if not steps:
+            detail = str((self.plan_row or {}).get("restart_impact", "")
+                         or "planning blocked")
+            code = "backup_unsupported" if "backup" in detail.lower() \
+                else "stale_plan"
             return False, code, detail[:500]
-        if self.tool_id == "hermes" and "BLOCKED" in (getattr(fresh, "restart_impact", "") or ""):
+        if self.tool_id == "hermes" and "BLOCKED" in str(
+                (self.plan_row or {}).get("restart_impact", "") or ""):
             return False, "install_method_unsupported", \
-                getattr(fresh, "restart_impact", "")[:500]
+                str((self.plan_row or {}).get("restart_impact", ""))[:500]
         return True, "", ""
 
     # -- phases --------------------------------------------------------------
 
-    def _do_backup(self, timeout_s):
-        # type: (float) -> Tuple[bool, str, str]
+    # -- supervised phases (N10) ------------------------------------------
+
+    def _plan_dump(self, plan):
+        # type: (Any) -> Dict[str, Any]
+        """PlanResult -> plain dict for the phase payload (extras kept)."""
+        try:
+            if hasattr(plan, "model_dump"):
+                data = plan.model_dump()
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        try:
+            return dict(plan or {})
+        except Exception:
+            return {}
+
+    def _run_phase(self, phase, payload_extra, timeout_s, op=""):
+        # type: (str, Dict[str, Any], float, str) -> Tuple[bool, Dict[str, Any], str, bool]
+        """One supervised phase (N10): worker process in an owned scope.
+
+        Returns (ok, data, error, timed_out). Live stream lines flow to
+        the log while the worker runs. No worker Python survives a
+        declared timeout: it is an OS process in the killed cgroup.
+        """
+        from .phase_run import run_supervised_phase
+
+        settings = self._settings()
+        try:
+            log_dir = str(getattr(settings, "log_dir",
+                                  "/var/lib/ega-update/logs"))
+        except Exception:
+            log_dir = "/var/lib/ega-update/logs"
+        try:
+            out = run_supervised_phase(
+                self.tool_id, self.job_id, phase,
+                dict(payload_extra or {}), timeout_s, settings,
+                log_dir, self._live_on_line, op=op,
+                cancel_event=self._stop)
+        except Exception as exc:
+            return False, {}, "supervision failed: %s" % exc, False
+        try:
+            self._heartbeat()
+        except Exception:
+            pass
+        try:
+            if self.log is not None:
+                self.log.flush()
+        except Exception:
+            pass
+        return out
+
+    def _do_backup(self, plan, timeout_s):
+        # type: (Any, float) -> Tuple[bool, str, str]
         assert self.conn is not None
-        scope = self._scope_name("backup")
-        finished, value, status = self._call_in_thread(
-            lambda: self.adapter.backup(self.job_id), timeout_s,
-            scope_name=scope, phase="backup")
-        if status == "timeout":
-            self._hard_timeout_recovery(timeout_s, "backup deadline", scope)
-            return False, "timeout", \
+        ok, data, error, timed_out = self._run_phase(
+            "backup", {"plan": self._plan_dump(plan),
+                       "ack": bool((self.job or {}).get("ack", ""))},
+            timeout_s)
+        if timed_out:
+            self._timed_out = True
+            self._hard_timeout_recovery(timeout_s, "backup deadline")
+            # Backup never completed: killed mid-backup leaves ambiguous
+            # backup state -> interrupted with recovery (fail closed),
+            # never a plain blocked that invites immediate retry.
+            return False, "interrupted", \
                 "backup timed out; recovery_required set"
-        if status == "interrupted":
-            return False, "interrupted", "runner stopped during backup"
-        if status == "error":
+        if not ok:
+            if "interrupted" in (error or "") and self._stop.is_set():
+                return False, "interrupted", "runner stopped during backup"
             return False, "backup_failed", \
-                "backup raised: %s" % str(value)[:400]
-        result = value
-        if not result.supported:
-            reason = result.unsupported_reason or "backup unsupported"
-            code = "backup_unsupported" if "backup_unsupported" in reason else "backup_failed"
+                "backup failed: %s" % (error or "")[:400]
+        data = data if isinstance(data, dict) else {}
+        if not data.get("supported", False):
+            reason = str(data.get("unsupported_reason", "")
+                         or "backup unsupported")
+            code = "backup_unsupported" if "backup_unsupported" in reason \
+                else "backup_failed"
             if reason.startswith("backup_failed"):
                 code = "backup_failed"
             return False, code, reason[:500]
         try:
+            scope = data.get("scope", {})
+            if not isinstance(scope, dict):
+                scope = {}
             self.conn.execute(
                 "INSERT OR REPLACE INTO backups(id,job_id,path,scope,consistency,"
                 "size_bytes,completed_at) VALUES(?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), self.job_id, result.path,
-                 json.dumps(result.scope), result.consistency,
-                 int(result.size_bytes or 0), _now_iso()))
+                (str(uuid.uuid4()), self.job_id,
+                 str(data.get("path", "") or ""),
+                 json.dumps(scope),
+                 str(data.get("consistency", "") or ""),
+                 int(data.get("size_bytes", 0) or 0), _now_iso()))
             self.conn.commit()
         except Exception as exc:
             return False, "storage_failure", "backup record unwritable: %s" % str(exc)[:300]
-        self.backup_summary = "%s (%s)" % (result.path, result.consistency)
+        self.backup_summary = "%s (%s)" % (
+            str(data.get("path", "") or ""),
+            str(data.get("consistency", "") or ""))
         self._event("backup ok: %s" % self.backup_summary)
         return True, "", ""
 
-    def _scope_name(self, phase):
-        # type: (str) -> str
-        try:
-            from ..reconcile_core import unit_hex
-            stem = unit_hex(self.job_id)
-        except Exception:
-            stem = ""
-        if not stem:
-            return ""
-        return "ega-update-job-%s-%s.scope" % (stem, phase)
-
-    def _kill_scope(self, scope):
-        # type: (str) -> None
-        """Terminate a phase scope cgroup (coordinator survives: it runs
-        in the parent job unit, never inside the killed scope)."""
-        if not scope:
-            return
-        try:
-            from ..executor import run_stream
-        except Exception:
-            return
-        for sig in ("SIGTERM", "SIGKILL"):
-            try:
-                run_stream(["/usr/bin/systemctl", "--user", "kill",
-                            "--kill-whom=all", "--signal=%s" % sig, scope],
-                           timeout_s=15, scope_unit=None)
-            except Exception:
-                continue
-            try:
-                if self._scope_quiescent(scope):
-                    return
-            except Exception:
-                continue
-            time.sleep(2.0)
-
-    def _scope_quiescent(self, scope):
-        # type: (str) -> bool
-        """True when the scope unit is confirmed stopped with no members."""
-        try:
-            from .. import units as _units
-            info = _units.query_unit(scope, timeout_s=5)
-            return str(info.get("state", "")) == "confirmed_stopped"
-        except Exception:
-            return False
-
     def _live_on_line(self, stream, line):
         # type: (str, str) -> None
-        """R09 live sink: executor lines land in the log within ~1s while
-        the process still runs. Records a content digest so the adapter's
-        post-hoc tail summaries do not duplicate the same bytes."""
-        try:
-            import hashlib as _hashlib
-            digest = _hashlib.sha1(
-                line.encode("utf-8", errors="replace")).hexdigest()
-            try:
-                self._seen_live.append(digest)
-            except Exception:
-                pass
-        except Exception:
-            pass
+        """R09 live sink: supervised worker lines land in the log while
+        the phase process still runs (drained from its stream file)."""
         self.emit(stream, line)
 
-    def _phase_sink(self, stream, text):
-        # type: (str, str) -> None
-        """Adapter _emit sink: drops bytes already streamed live (bounded
-        tail summaries), keeps novel status lines. Content is never lost:
-        dropped lines are byte-identical to lines already persisted."""
-        try:
-            import hashlib as _hashlib
-            seen = set(self._seen_live)
-        except Exception:
-            seen = set()
-            _hashlib = None  # type: ignore[assignment]
-        try:
-            parts = str(text or "").split("\n")
-        except Exception:
-            return
-        for line in parts:
-            try:
-                digest = _hashlib.sha1(
-                    line.encode("utf-8", errors="replace")).hexdigest() \
-                    if _hashlib is not None else None
-            except Exception:
-                digest = None
-            if digest is not None and digest in seen:
-                continue
-            self.emit(stream, line)
-
-    def _call_in_thread(self, fn, timeout_s, scope_name="", phase=""):
-        # type: (Any, float, str, str) -> Tuple[bool, Any, str]
-        """Run fn in a thread with a real monotonic deadline (R06).
-
-        The phase runs inside executor.phase_context(scope, cancel): every
-        adapter subprocess inherits containment + cancellation, so a
-        deadline stops WORK (not just reporting). On timeout the scope
-        cgroup is killed and quiescence verified before recovery.
-        Returns (finished, value_or_exc, status ok|timeout|error|
-        interrupted).
-        """
-        from ..executor import phase_context
-
-        box = {}  # type: Dict[str, Any]
-        cancel = threading.Event()
-
-        def _target():
-            try:
-                with phase_context(scope_name or None, cancel,
-                                   self._live_on_line):
-                    box["value"] = fn()
-            except BaseException as exc:  # noqa: BLE001 - surface crashes
-                box["error"] = exc
-
-        thread = threading.Thread(target=_target, daemon=True)
-        thread.start()
-        deadline = time.monotonic() + max(1.0, float(timeout_s))
-        while thread.is_alive():
-            if self._stop.is_set() or self._cancel.is_set():
-                cancel.set()
-                if scope_name:
-                    self._kill_scope(scope_name)
-                thread.join(timeout=30)
-                return False, None, "interrupted"
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                cancel.set()
-                if scope_name:
-                    self._kill_scope(scope_name)
-                # Bounded join: the thread may linger only if adapter code
-                # ignores cancellation between commands; all its
-                # subprocesses are already terminated via scope+cancel.
-                thread.join(timeout=30)
-                return False, None, "timeout"
-            thread.join(min(1.0, remaining))
-            self._heartbeat()
-            if self.log is not None:
-                self.log.flush()
-        if "error" in box:
-            return False, box["error"], "error"
-        return True, box.get("value"), "ok"
-
-    def _hard_timeout_recovery(self, timeout_s, reason, scope_name=""):
+    def _hard_timeout_recovery(self, timeout_s, reason):
         # type: (float, str, str) -> None
-        """Runner-owned hard-timeout path (R06): the phase scope cgroup is
-        already killed by _call_in_thread; here verify quiescence, inspect
-        delegated service states from the plan, run bounded read-only
-        recovery checks, and leave recovery_required set. The coordinator
-        (this process, in the parent job unit) is never killed: it must
-        persist the outcome. Callers terminalize failed/interrupted."""
+        """Post-timeout recovery (N10): the phase scope is already killed
+        and proven empty by run_supervised_phase before this runs. Here:
+        verify no execution-marked survivors, inspect delegated service
+        states from the plan, run ONE bounded supervised recovery verify.
+        The coordinator (this process, in the parent job unit) is never
+        killed: it must persist the outcome. Callers terminalize with
+        recovery_required whenever completion is not fully proved."""
         self._timed_out = True
-        self._event("hard timeout (%s) after %ds; phase scope %s killed;"
-                    " verifying quiescence"
-                    % (reason, int(timeout_s), scope_name or "n/a"))
+        self._event("hard timeout (%s) after %ds; phase scope killed by"
+                    " coordinator; verifying quiescence"
+                    % (reason, int(timeout_s)))
         try:
-            if scope_name and not self._scope_quiescent(scope_name):
-                self._event("timeout verify: scope %s not quiescent;"
-                            " treating as unresolved" % scope_name)
             leftovers = _job_processes_alive(self.job_id)
             if leftovers:
                 self._event("timeout verify: %d job processes still carry"
@@ -1104,79 +1078,108 @@ class Runner(object):
             except Exception:
                 self._event("delegated service %s: state unreadable;"
                             " recovery stays required" % svc)
-        # Bounded recovery checks: probe installation without mutating.
+        # Bounded recovery checks in a fresh supervised scope: probe
+        # installation without mutating.
         try:
-            recovery = self._call_in_thread(
-                lambda: self.adapter.verify(),
-                min(120.0, timeout_s / 4.0 or 120.0),
-                scope_name=self._scope_name("recover"),
-                phase="recover")
-            if recovery[0] and recovery[1] is not None:
-                self._record_checks(recovery[1])
-                self.after_version = getattr(
-                    recovery[1], "version", "") or self.after_version
+            ok, data, _err, _to = self._supervised_verify(
+                min(120.0, timeout_s / 4.0 or 120.0))
+            if ok and isinstance(data, dict):
+                self._record_checks_dict(data)
+                if str(data.get("version", "") or ""):
+                    self.after_version = str(data.get("version", ""))
         except Exception:
             pass
         self._event("timeout recovery: possible partial installation;"
                     " recovery_required set")
 
+    def _supervised_verify(self, timeout_s):
+        # type: (float) -> Tuple[bool, Dict[str, Any], str, bool]
+        """Verify phase in a supervised worker (N10). Returns
+        (ok, data, error, timed_out) with data as plain dicts."""
+        try:
+            required = list(self._required_checks(
+                getattr(self, "_plan_obj", None)))
+        except Exception:
+            required = []
+        try:
+            plan_dump = self._plan_dump(getattr(self, "_plan_obj", None))
+        except Exception:
+            plan_dump = {}
+        return self._run_phase(
+            "verify", {"plan": plan_dump, "required_checks": required},
+            timeout_s)
+
     def _do_execute(self, plan, timeout_s):
         # type: (Any, float) -> Any
-        # Single timeout owner: the runner deadline is the adapter plan step
-        # timeout. Adapters run their mutating call with step_timeout +
-        # registry.MUTATION_TIMEOUT_MARGIN_S so this deadline always fires
-        # first; any adapter timeout report funnels here too. The mutation
-        # runs inside the updating scope cgroup (plan.scope_unit) so
-        # reparented children stay killable (R06).
+        # Single timeout owner: the coordinator deadline is the plan step
+        # timeout. The mutation runs in a supervised worker process inside
+        # the updating scope cgroup, so reparented children stay killable
+        # and no timed-out Python continues (N10). Adapter timeout reports
+        # funnel into the same hard path.
         try:
-            plan.scope_unit = self._scope_name("updating")
+            plan_dump = self._plan_dump(plan)
         except Exception:
-            pass
-        scope = self._scope_name("updating")
+            plan_dump = {}
         activity_ack = bool((self.job or {}).get("ack", ""))
-        finished, value, status = self._call_in_thread(
-            lambda: self.adapter.execute(plan, self.job_id, activity_ack=activity_ack),
-            timeout_s, scope_name=scope, phase="updating")
-        if status == "timeout":
-            self._hard_timeout_recovery(timeout_s, "runner deadline", scope)
+        ok, data, error, timed_out = self._run_phase(
+            "execute", {"plan": plan_dump, "ack": activity_ack},
+            timeout_s)
+        if not ok and self._stop.is_set() and not timed_out:
+            # Signal path only (genuine timeouts set timed_out): the
+            # supervised phase already killed its scope on cancel.
             return None
-        if status == "interrupted":
+        if timed_out:
+            if self._stop.is_set():
+                # Signal coincided with (or caused) the deadline: report
+                # interrupted, never timeout-success confusion. Recovery
+                # is still required either way.
+                return None
+            self._timed_out = True
+            self._hard_timeout_recovery(timeout_s, "coordinator deadline")
             return None
-        if status == "error":
-            raise value
-        if _is_timeout_result(value):
-            self._hard_timeout_recovery(timeout_s, "adapter timeout report",
-                                        scope)
+        if not ok:
+            if self._stop.is_set():
+                return None
+            # Worker-level failure (no result): treat as interrupted with
+            # recovery unless the payload proves otherwise.
+            self._event("execute worker failed: %s" % (error or "")[:300])
+            return {"state": "interrupted", "error_code": "interrupted",
+                    "error_detail": "execute worker failed: %s"
+                    % (error or "")[:300],
+                    "exit_code": 6, "timed_out": False,
+                    "before_version": "", "after_version": ""}
+        data = data if isinstance(data, dict) else {}
+        if data.get("timed_out") or \
+                str(data.get("error_code", "") or "") == "timeout":
+            self._timed_out = True
+            self._hard_timeout_recovery(
+                timeout_s, "adapter timeout report")
             return None
-        return value
+        return data
 
     def _do_verify(self, timeout_s, required_checks=None):
         # type: (float, object) -> Any
-        scope = self._scope_name("verifying")
-        finished, value, status = self._call_in_thread(
-            lambda: self._adapter_verify(required_checks), timeout_s,
-            scope_name=scope, phase="verifying")
-        if status == "timeout":
+        try:
+            plan_dump = self._plan_dump(getattr(self, "_plan_obj", None))
+        except Exception:
+            plan_dump = {}
+        try:
+            required = list(required_checks or [])
+        except Exception:
+            required = []
+        ok, data, error, timed_out = self._run_phase(
+            "verify", {"plan": plan_dump, "required_checks": required},
+            timeout_s)
+        if timed_out:
+            self._timed_out = True
             self._event("verify timed out after %ds" % int(timeout_s))
             return None
-        if status == "interrupted":
-            return None
-        if status == "error":
-            raise value
-        return value
-
-    def _adapter_verify(self, required_checks=None):
-        # type: (object) -> Any
-        """Verify with plan manifest when the adapter supports it (R15/R24:
-        missing required diagnostics fail instead of silently dropping)."""
-        try:
-            return self.adapter.verify(
-                plan=getattr(self, "_plan_obj", None),
-                required_checks=list(required_checks or []))
-        except TypeError:
-            return self.adapter.verify()
-        except Exception:
-            raise
+        if not ok:
+            if self._stop.is_set():
+                return None
+            raise RuntimeError("verify worker failed: %s"
+                               % (error or "")[:300])
+        return data if isinstance(data, dict) else {}
 
     def _secrets_for_evidence(self):
         # type: () -> tuple
@@ -1197,67 +1200,100 @@ class Runner(object):
             self._evidence_failed = True
             return "[redaction failed]"
 
-    def _record_checks(self, verify_result):
-        # type: (Any) -> None
-        # R11: every check summary is sanitized before SQLite persistence
-        # (a daemon response reflected here must never persist credentials).
+    def _record_checks_dict(self, data):
+        # type: (Dict[str, Any]) -> None
+        """Persist supervised verify checks (plain dicts, R11/N12).
+
+        Every name/summary is sanitized before SQLite persistence. A
+        sanitizer failure sets the sticky evidence flag (fail closed).
+        """
         try:
             from ..sanitize import sanitize_text
             _secrets = tuple(self._secrets_for_evidence())
         except Exception:
-            sanitize_text = None  # type: ignore[assignment]
-            _secrets = ()
+            self._evidence_failed = True
+            return
         self.checks = []
-        for item in getattr(verify_result, "checks", []) or []:
+        try:
+            items = data.get("checks", []) or []
+        except Exception:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             try:
-                name = str(getattr(item, "name", ""))[:200]
+                name = sanitize_text(
+                    str(item.get("name", "")), _secrets)[:200]
             except Exception:
-                name = ""
+                self._evidence_failed = True
+                continue
             try:
-                result = str(getattr(item, "result", "unknown"))
+                result = str(item.get("result", "unknown"))
             except Exception:
                 result = "unknown"
             if result not in ("pass", "fail", "unknown",
                               "not_applicable"):
                 result = "unknown"
             try:
-                mandatory = bool(getattr(item, "mandatory", True))
+                mandatory = bool(item.get("mandatory", True))
             except Exception:
                 mandatory = True
             try:
-                summary = str(getattr(item, "summary", ""))
+                summary = sanitize_text(
+                    str(item.get("summary", "")), _secrets)[:1000]
             except Exception:
-                summary = ""
-            if sanitize_text is not None:
-                try:
-                    name = sanitize_text(name, _secrets)[:200]
-                    summary = sanitize_text(summary, _secrets)[:1000]
-                except Exception:
-                    self._evidence_failed = True
-                    name, summary = "[redaction failed]", ""
-            else:
                 self._evidence_failed = True
-                name, summary = "[redaction failed]", ""
                 continue
-            entry = {
-                "name": name,
-                "result": result,
-                "mandatory": mandatory,
-                "summary": summary,
-            }
-            self.checks.append(entry)
+            self.checks.append({
+                "name": name, "result": result,
+                "mandatory": mandatory, "summary": summary,
+            })
+        try:
+            assert self.conn is not None
+            from ..schemas import utcnow_iso
+            now = utcnow_iso()
+        except Exception:
+            now = ""
+        if not now:
+            self._evidence_failed = True
+            return
         try:
             assert self.conn is not None
             for entry in self.checks:
                 self.conn.execute(
                     "INSERT INTO checks(tool_id,job_id,name,result,mandatory,summary,created_at)"
                     " VALUES(?,?,?,?,?,?,?)",
-                    (self.tool_id, self.job_id, entry["name"], entry["result"],
-                     1 if entry["mandatory"] else 0, entry["summary"], _now_iso()))
+                    (self.tool_id, self.job_id, entry["name"],
+                     entry["result"], 1 if entry["mandatory"] else 0,
+                     entry["summary"], now))
             self.conn.commit()
         except Exception as exc:
             self._evidence_failed = True
             self._event("check persistence failed: %s" % str(exc)[:300])
+
+    def _record_checks(self, verify_result):
+        # type: (Any) -> None
+        """Legacy object-shaped entry; normalizes to dicts (N10)."""
+        try:
+            if hasattr(verify_result, "model_dump"):
+                data = verify_result.model_dump()
+            elif isinstance(verify_result, dict):
+                data = verify_result
+            else:
+                data = {"checks": [
+                    {"name": getattr(item, "name", ""),
+                     "result": getattr(item, "result", "unknown"),
+                     "mandatory": getattr(item, "mandatory", True),
+                     "summary": getattr(item, "summary", "")}
+                    for item in (getattr(verify_result, "checks", [])
+                                 or [])]}
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        self._record_checks_dict(data)
 
     # -- receipts + finalize ---------------------------------------------------
 
@@ -1449,7 +1485,8 @@ class Runner(object):
                 update=update, event=state,
                 event_detail=("%s %s" % (
                     error_code, recovery_disposition))[:500],
-                checks=[], tool_id=self.tool_id)
+                checks=[], tool_id=self.tool_id,
+                release_mutation=True)
             self._known_state = state
         except TxError as exc:
             # Receipt is already durable; reconciliation repairs the row.
@@ -1632,12 +1669,10 @@ class Runner(object):
             self._event("env blocked: %s %s" % (env_code, env_detail))
             return self._finish("blocked", EXIT_BLOCKED, env_code,
                                 env_detail)
+        # Disabled adapters never mutate. (Adapter evidence sinks are
+        # owned by the supervised phase worker; the coordinator only
+        # tails the sanitized stream file.)
         try:
-            # Adapter evidence sink: drops bytes already streamed live,
-            # keeps novel status lines (R09, no content loss/duplication).
-            self.adapter._emit = self._phase_sink  # type: ignore[attr-defined]
-        except Exception:
-            pass
         self._event("runner start tool=%s job=%s" % (self.tool_id, self.job_id))
 
         # Preflight runs before any mutation; DB failure here blocks.
@@ -1657,30 +1692,35 @@ class Runner(object):
             except (TypeError, ValueError):
                 timeouts[key] = default
         self._fresh_before = ""
-        # Preflight itself runs under the plan preflight deadline in its
-        # own scope (R06): every phase gets a real monotonic deadline.
-        _pre_scope = self._scope_name("preflight")
-        _finished, _pre, _pre_status = self._call_in_thread(
-            lambda: self._preflight(plan), float(timeouts["preflight"]),
-            scope_name=_pre_scope, phase="preflight")
-        if _pre_status == "timeout":
+        # Preflight collection runs in a supervised worker (N10) under
+        # the plan preflight deadline; policy decides caller-side.
+        _pre_ok, _pre_bundle, _pre_err, _pre_to = self._run_phase(
+            "preflight", {"plan": self._plan_dump(plan)},
+            float(timeouts["preflight"]))
+        if _pre_to:
+            if self._stop.is_set():
+                return self._finish(
+                    "interrupted", EXIT_INTERRUPTED, "interrupted",
+                    "runner stopped in preflight", recovery_required=False)
             self._hard_timeout_recovery(
                 float(timeouts.get("preflight", 120)),
-                "preflight deadline", _pre_scope)
+                "preflight deadline")
             return self._finish("blocked", EXIT_BLOCKED, "timeout",
                                 "preflight timed out; retry with fresh plan")
-        if _pre_status == "interrupted":
-            return self._finish("interrupted", EXIT_INTERRUPTED,
-                                "interrupted", "runner stopped in preflight",
-                                recovery_required=False)
-        if _pre_status == "error":
+        if not _pre_ok:
+            if self._stop.is_set():
+                return self._finish(
+                    "interrupted", EXIT_INTERRUPTED, "interrupted",
+                    "runner stopped in preflight", recovery_required=False)
             return self._finish("blocked", EXIT_BLOCKED, "unavailable",
-                                "preflight probe crashed: %s" % str(_pre)[:300])
+                                "preflight collection failed: %s"
+                                % (_pre_err or "")[:300])
         try:
-            pre_ok, pre_code, pre_detail = _pre
-        except Exception:
+            pre_ok, pre_code, pre_detail = self._preflight(
+                plan, _pre_bundle)
+        except Exception as exc:
             return self._finish("blocked", EXIT_BLOCKED, "unavailable",
-                                "preflight result unreadable")
+                                "preflight policy crashed: %s" % str(exc)[:300])
         if not pre_ok:
             self._event("preflight blocked: %s %s" % (pre_code, pre_detail))
             return self._finish("blocked", EXIT_BLOCKED, pre_code, pre_detail)
@@ -1711,12 +1751,16 @@ class Runner(object):
                                 "backup record unwritable: %s" % str(exc)[:300])
         try:
             backup_ok, backup_code, backup_detail = self._do_backup(
-                float(timeouts["backup"]))
+                plan, float(timeouts["backup"]))
         except Exception as exc:
             return self._finish("blocked", EXIT_BLOCKED, "backup_failed",
                                 "backup crashed: %s" % str(exc)[:300])
         if not backup_ok:
             self._event("backup blocked: %s %s" % (backup_code, backup_detail))
+            if backup_code == "interrupted":
+                return self._finish(
+                    "interrupted", EXIT_INTERRUPTED, "interrupted",
+                    backup_detail, recovery_required=True)
             return self._finish("blocked", EXIT_BLOCKED, backup_code, backup_detail)
         if self._stop.is_set():
             return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
@@ -1755,9 +1799,10 @@ class Runner(object):
                                 "execute crashed: %s" % str(exc)[:300],
                                 recovery_required=True)
         if self._stop.is_set() and exec_result is None and not self._timed_out:
-            self._kill_scope(self._scope_name("updating"))
+            # Signal during mutation: the supervised phase already killed
+            # its scope on cancel; terminalize interrupted with recovery.
             return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
-                                "signal during mutation; updater scope killed",
+                                "signal during mutation; phase scope killed",
                                 recovery_required=True)
         if exec_result is None:
             if self._timed_out:
@@ -1767,18 +1812,23 @@ class Runner(object):
             return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
                                 "runner stopped during mutation",
                                 recovery_required=True)
-        self.after_version = getattr(exec_result, "after_version", "") or ""
-        exec_state = getattr(exec_result, "state", "")
-        exec_code = getattr(exec_result, "error_code", "")
-        exec_detail = getattr(exec_result, "error_detail", "")
+        if not isinstance(exec_result, dict):
+            return self._finish("interrupted", EXIT_INTERRUPTED,
+                                "interrupted",
+                                "execute returned no result",
+                                recovery_required=True)
+        self.after_version = str(exec_result.get("after_version", "") or "")
+        exec_state = str(exec_result.get("state", "") or "")
+        exec_code = str(exec_result.get("error_code", "") or "")
+        exec_detail = str(exec_result.get("error_detail", "") or "")
         try:
-            self.installer_exit = int(
-                getattr(exec_result, "exit_code", 0) or 0)
+            self.installer_exit = int(exec_result.get("exit_code", 0) or 0)
         except (TypeError, ValueError):
             self.installer_exit = 0
         self.install_outcome = str(exec_state or "")[:200]
         self._event("execute done state=%s error=%s before=%s after=%s" % (
-            exec_state, exec_code, getattr(exec_result, "before_version", ""),
+            exec_state, exec_code,
+            str(exec_result.get("before_version", "") or ""),
             self.after_version))
         if exec_state == "blocked":
             code = exec_code or "install_method_unsupported"
@@ -1791,11 +1841,13 @@ class Runner(object):
         elif exec_state not in ("succeeded",):
             self._event("install failed; running bounded recovery checks")
             try:
-                recovery = self._do_verify(
-                    min(120.0, float(timeouts["verifying"])),
-                    self._required_checks(plan))
-                if recovery is not None:
-                    self._record_checks(recovery)
+                rec_ok, rec_data, _rec_err, _rec_to = self._run_phase(
+                    "verify",
+                    {"plan": self._plan_dump(plan),
+                     "required_checks": self._required_checks(plan)},
+                    min(120.0, float(timeouts["verifying"])))
+                if rec_ok and isinstance(rec_data, dict):
+                    self._record_checks_dict(rec_data)
             except Exception:
                 pass
             return self._finish("failed", EXIT_INSTALL_FAILED,
@@ -1824,16 +1876,29 @@ class Runner(object):
                                     "signal during verify", recovery_required=True)
             return self._finish("health_failed", EXIT_VERIFY_FAILED, "health_failed",
                                 "required verification missing; never success without it")
-        self._record_checks(verify_result)
-        self.after_version = getattr(verify_result, "version", "") or self.after_version
-        mandatory_bad = [c for c in (getattr(verify_result, "checks", []) or [])
-                         if getattr(c, "mandatory", True) and getattr(c, "result", "") != "pass"]
-        missing_version = not (getattr(verify_result, "version", "") or "")
-        if not getattr(verify_result, "passed", False) or mandatory_bad or missing_version:
-            detail = getattr(verify_result, "error_detail", "") or \
+        if not isinstance(verify_result, dict):
+            return self._finish("health_failed", EXIT_VERIFY_FAILED,
+                                "health_failed",
+                                "verification result malformed")
+        self._record_checks_dict(verify_result)
+        if str(verify_result.get("version", "") or ""):
+            self.after_version = str(verify_result.get("version", ""))
+        try:
+            raw_checks = verify_result.get("checks", []) or []
+            if not isinstance(raw_checks, list):
+                raw_checks = []
+        except Exception:
+            raw_checks = []
+        mandatory_bad = [
+            c for c in raw_checks if isinstance(c, dict)
+            and c.get("mandatory", True) and c.get("result", "") != "pass"]
+        missing_version = not str(verify_result.get("version", "") or "")
+        if not verify_result.get("passed", False) or mandatory_bad or missing_version:
+            detail = str(verify_result.get("error_detail", "") or "") or \
                 "mandatory checks: %s" % ", ".join(
-                    "%s=%s" % (getattr(c, "name", "?"), getattr(c, "result", "?"))
-                    for c in mandatory_bad)[:500]
+                    "%s=%s" % (c.get("name", "?"), c.get("result", "?"))
+                    for c in mandatory_bad
+                    if isinstance(c, dict))[:500]
             return self._finish("health_failed", EXIT_VERIFY_FAILED, "health_failed",
                                 detail[:1000])
         # P0-06 central exact-target: exact plans must land exactly on target,
@@ -1863,9 +1928,13 @@ class Runner(object):
         except Exception:
             return []
 
-    def _recheck_space(self, plan):
-        # type: (Any) -> Tuple[bool, str, str]
-        """R28: re-hold the space budget after backup consumed space."""
+    def _recheck_space(self, plan, timeout_s=120.0):
+        # type: (Any, float) -> Tuple[bool, str, str]
+        """R28: re-hold the space budget after backup consumed space.
+
+        Footprint collection runs supervised (N10): filesystem walks must
+        never execute unbounded in the coordinator.
+        """
         try:
             settings = self._settings()
             floor = int(getattr(settings, "disk_floor_bytes",
@@ -1875,10 +1944,24 @@ class Runner(object):
         except (TypeError, ValueError):
             floor, reserve = 3 * 1024 * 1024 * 1024, 1024 * 1024 * 1024
         try:
-            footprint = self.adapter.measure_footprint(plan)
+            ok, bundle, error, timed_out = self._run_phase(
+                "preflight", {"plan": self._plan_dump(plan)},
+                max(30.0, float(timeout_s or 120.0)))
         except Exception as exc:
             return False, "disk_blocked", \
                 "footprint recheck failed: %s" % str(exc)[:300]
+        if timed_out:
+            self._hard_timeout_recovery(
+                max(30.0, float(timeout_s or 120.0)),
+                "space recheck deadline")
+            return False, "disk_blocked", \
+                "footprint recheck timed out; recovery_required set"
+        if not ok or not isinstance(bundle, dict):
+            return False, "disk_blocked", \
+                "footprint recheck failed: %s" % (error or "")[:300]
+        footprint = bundle.get("footprint", {})
+        if not isinstance(footprint, dict):
+            footprint = {}
         need, per_fs, unknown = self._space_need(plan, footprint, floor,
                                                  reserve)
         if unknown:

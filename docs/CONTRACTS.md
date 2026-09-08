@@ -31,8 +31,13 @@ Terminal alternatives: `blocked`, `failed`, `health_failed`, `interrupted`.
 Single active slot enforced by constant-expression partial unique index
 (`ON jobs((1)) WHERE state IN NONTERMINAL`).
 `recovery_required` flag blocks new jobs independently of terminal state.
-One-shot execution: `jobs.dispatch_nonce` claimed atomically via
-`jobs.claim_with_nonce`; runner argv is `runner <job-id> <nonce>` and refuses
+One admission path: `admission.admit()` (replay-first; gates; atomic
+job INSERT + plan used_at + mutation lease + event). One-shot execution:
+`jobs.dispatch_nonce` claimed atomically with unit+release+deadline
+(single-statement predicate); runner consumes `attempt_claimed` before
+opening logs. `execution_leases` arbitrate probes vs mutation
+(`leases.py`); mutation leases never time-expire, probe leases are
+bounded and reclaimable. Runner argv is `runner <job-id> <nonce>` and refuses
 mismatches with exit 6 before any mutation.
 
 Steps mirror states plus `not_applicable` only when the adapter declares it in `plan()`

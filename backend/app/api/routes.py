@@ -15,8 +15,8 @@
   /tools/{id}/plans run read-only adapter probes (inspect/discover/activity/
   plan) outside any DB transaction and persist via a short UPDATE/INSERT
   afterwards; they never install, download, or restart.
-- POST /jobs delegates single-slot reservation + idempotency to
-  jobs.reserve_job.
+- POST /jobs delegates to the shared admission service
+  (backend/app/admission.py: replay-first, gates, atomic reserve).
 """
 from __future__ import annotations
 
@@ -214,6 +214,16 @@ def _known_secrets():
         return ()
 
 
+def _safe_detail(text, limit=200):
+    # type: (object, int) -> str
+    """R11: exception-derived API detail is sanitized, never raw."""
+    try:
+        from ..sanitize import sanitize_text
+        return sanitize_text(str(text or ""), _known_secrets())[:limit]
+    except Exception:
+        return "unavailable"
+
+
 def _load_adapter(tool_id):
     # type: (str) -> Any
     """Lazily resolve the adapter for a tool id (no probes at import).
@@ -261,7 +271,7 @@ async def _owner_probe(tool_id, op, timeout_s=25.0):
         return await asyncio.to_thread(
             request_owner_probe, tool_id, op, timeout_s, "api")
     except Exception as exc:
-        return "error", {"reason": "probe wait crashed: %s" % exc}
+        return "error", {"reason": "probe wait crashed: %s" % _safe_detail(exc, 200)}
 
 
 def _ok(payload):
@@ -1063,7 +1073,7 @@ async def post_tool_plan(tool_id: str, request: Request):
     except Exception as exc:
         return deps.error_envelope(
             503, "unavailable",
-            "could not parse plan: %s" % str(exc)[:200],
+            "could not parse plan: %s" % _safe_detail(exc),
             "tool_id=%s" % tool_id[:32])
     if activity_state not in ("idle", "busy", "unknown"):
         activity_state = "unknown"
@@ -1153,8 +1163,20 @@ async def post_tool_plan(tool_id: str, request: Request):
     except Exception as exc:
         return deps.error_envelope(
             503, "unavailable",
-            "release unresolvable: %s" % str(exc)[:200], "")
-    if not _config_hash or not _release_path:
+            "release unresolvable: %s" % _safe_detail(exc), "")
+    # N09: canonical owner-environment fingerprint bound into the plan;
+    # execution rechecks it before mutation (preview==apply parity).
+    try:
+        from ..owner_env import canonical_fingerprint
+        _env_fp = canonical_fingerprint(
+            settings, None, _release_path) or ""
+    except Exception:
+        try:
+            from backend.app.owner_env import canonical_fingerprint as _cf  # type: ignore[no-redef]
+            _env_fp = _cf(settings, None, _release_path) or ""
+        except Exception:
+            _env_fp = ""
+    if not _config_hash or not _release_path or not _env_fp:
         return deps.error_envelope(
             503, "unavailable",
             "configuration identity unprovable; retry", "")
@@ -1203,11 +1225,11 @@ async def post_tool_plan(tool_id: str, request: Request):
             _planned.get("restart_detail", "") or "",
             activity_state, activity_ts, activity_evidence,
             required_space, _config_hash, _release_path,
-            now.isoformat(), expires.isoformat(), _artifact)
+            now.isoformat(), expires.isoformat(), _artifact, _env_fp)
     except Exception as exc:
         return deps.error_envelope(
             503, "unavailable",
-            "could not assemble plan: %s" % str(exc)[:200], "")
+            "could not assemble plan: %s" % _safe_detail(exc), "")
     plan_id = str(_row.get("id", ""))
     # Short write transaction only; probes above already finished.
     conn = _db()
@@ -1247,6 +1269,7 @@ async def post_tool_plan(tool_id: str, request: Request):
         "plan_version": 2,
         "config_hash": _config_hash,
         "release_path": _release_path,
+        "env_fingerprint": _env_fp,
         "plan_hash": str(_row.get("plan_hash", "")),
         "artifact": dict(_artifact),
         "single_use": True,
@@ -1305,7 +1328,6 @@ async def post_job(request: Request):
     if not isinstance(ack, bool):
         return deps.error_envelope(
             422, "invalid_request", "activity_ack must be boolean", "")
-    digest = jobs_lib.request_hash(plan_id, ack)
     conn = _db()
     try:
         # Safe sweep of never-claimed reservations (accepted + past claim
@@ -1314,35 +1336,8 @@ async def post_job(request: Request):
             jobs_lib.expire_stale_accepted(conn)
         except Exception:
             pass
-        existing = jobs_lib.find_replay(conn, subject or "", idem_key)
-        if existing is not None:
-            if (dict(existing).get("request_hash", "") or "") == digest:
-                view = _job_view(existing)
-                view["backup_summary"] = _backup_summary(
-                    conn, str(dict(existing).get("id", "")))
-                view["replayed"] = True
-                return _ok(view)
-            return deps.error_envelope(
-                409, "conflict",
-                "Idempotency-Key already used with different payload",
-                "")
-        # Genuinely new reservation: drain gate first (reads unaffected).
-        if _drained():
-            return deps.error_envelope(
-                503, "maintenance",
-                "console is drained for maintenance; new jobs are refused",
-                "")
-        # Worker readiness gate (R17): never accept work the worker cannot
-        # be proven ready to claim (heartbeat fresh <=20s).
-        try:
-            _hb = jobs_lib.read_dispatcher_heartbeat(
-                settings.state_dir, max_age_s=20)
-        except Exception:
-            _hb = {}
-        if not _hb:
-            return deps.error_envelope(
-                503, "worker_unavailable",
-                "worker not ready; job not accepted", "")
+        # Read-only plan identification for probe targeting (no gates;
+        # admission re-validates everything authoritatively inside tx).
         try:
             from ..plans import (PlanNotFound, PlanInvalid, load_plan)
         except Exception:
@@ -1353,116 +1348,111 @@ async def post_job(request: Request):
                 return deps.error_envelope(
                     503, "unavailable", "plan store unavailable", "")
         try:
-            plan_d = load_plan(conn, plan_id)
+            _plan_probe = load_plan(conn, plan_id)
         except PlanNotFound:
             return deps.error_envelope(
                 404, "not_found", "unknown plan", "")
         except PlanInvalid as exc:
             return deps.error_envelope(
-                409, "stale_plan", "plan invalid: %s" % str(exc)[:200],
+                409, "stale_plan", "plan invalid: %s" % _safe_detail(exc),
                 "plan_id=%s" % plan_id[:8])
-        tool_id = plan_d.get("tool_id", "") or ""
-        if tool_id == "claude":
+        except Exception:
+            return deps.error_envelope(
+                503, "unavailable", "plan store unavailable", "")
+        _tool_probe = str(_plan_probe.get("tool_id", "") or "")
+        if _tool_probe == "claude":
             return deps.error_envelope(
                 410, "install_method_unsupported",
                 "claude adapter is disabled", "")
-        # Plan subject binding (explicit one-owner policy).
-        if (plan_d.get("subject", "") or "") != (subject or ""):
-            return deps.error_envelope(
-                422, "invalid_request",
-                "plan subject mismatch; create a fresh plan", "")
-        # One-use policy (explicit): a plan that already produced a job
-        # cannot produce another; retries need a fresh preview.
-        if plan_d.get("used_at", ""):
-            return deps.error_envelope(
-                409, "stale_plan",
-                "plan already used (single-use); create a fresh plan",
-                "plan_id=%s" % plan_id[:8])
-        # Expiry: plans live settings.plan_ttl_s; stale -> 409.
-        exp = _parse_iso(plan_d.get("expires_at", "") or "")
-        now = datetime.now(timezone.utc)
-        if exp is None or exp <= now:
-            return deps.error_envelope(
-                409, "stale_plan", "plan expired; create a fresh plan",
-                "plan_id=%s" % plan_id[:8])
-        # Fresh authoritative revalidation (R15): owner inspect
-        # fingerprint + config/release binding, not the dashboard cache.
+        # Fresh authoritative owner evidence (bounded, off-loop) for the
+        # shared admission service. Probes never mutate.
         _fp_status, _fp_payload = await _owner_probe(
-            tool_id, "inspect", 20.0)
+            _tool_probe, "inspect", 20.0)
         if _fp_status != "ok":
             return deps.error_envelope(
                 503, "unavailable",
                 "installation revalidation unavailable; retry", "")
         _fresh_fp = str(_fp_payload.get("fingerprint", "") or "")
-        if _fresh_fp and _fresh_fp != (plan_d.get("fingerprint", "") or ""):
-            return deps.error_envelope(
-                409, "fingerprint_changed",
-                "installation changed since plan; create a fresh plan",
-                "tool_id=%s" % tool_id[:32])
+        # Config/release/env identities are compared inside the shared
+        # admission service (pure local reads at its boundary).
+        # One shared admission service (N14/N15): replay-first, gates,
+        # atomic reserve + plan-consume + mutation lease. API and CLI
+        # call the identical function with owner-gathered evidence.
         try:
-            from ..inventory import config_identity
-            from ..owner_env import resolve_release
-            _cur_hash = config_identity(settings)
-            _cur_release = resolve_release()
+            from ..admission import admit
         except Exception:
-            _cur_hash, _cur_release = "", ""
-        if not _cur_hash or not _cur_release:
-            return deps.error_envelope(
-                503, "unavailable",
-                "configuration identity unprovable; retry", "")
-        if _cur_hash != (plan_d.get("config_hash", "") or "") or \
-                _cur_release != (plan_d.get("release_path", "") or ""):
-            return deps.error_envelope(
-                409, "config_changed",
-                "configuration changed since plan; create a fresh plan",
-                "tool_id=%s" % tool_id[:32])
-        # Activity gate: busy blocks; unknown requires recorded ack.
-        activity = plan_d.get("activity_state", "unknown") or "unknown"
-        if activity == "busy":
-            evidence = (plan_d.get("activity_evidence", "") or "")[:300]
-            return deps.error_envelope(
-                409, "activity_blocked",
-                "tool reports active work; update blocked", evidence)
-        if activity == "unknown" and not ack:
-            return deps.error_envelope(
-                409, "ack_required",
-                "unknown activity requires explicit acknowledgment",
-                "tool_id=%s" % tool_id[:32])
-        # Single-slot reservation + idempotency in one short transaction.
+            try:
+                from backend.app.admission import admit  # type: ignore[no-redef]
+            except Exception:
+                return deps.error_envelope(
+                    503, "unavailable", "admission unavailable", "")
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            job_id, created_new, err_code = jobs_lib.reserve_job(
-                conn, tool_id, plan_id, subject or "", idem_key, ack)
-            if err_code:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                if err_code == "recovery_required":
-                    return deps.error_envelope(
-                        409, "recovery_required",
-                        "recovery required; SSH reconcile must clear first",
-                        "")
-                if err_code == "conflict":
-                    return deps.error_envelope(
-                        409, "conflict",
-                        "Idempotency-Key already used with different payload",
-                        "")
+            _hb = jobs_lib.read_dispatcher_heartbeat(
+                settings.state_dir, max_age_s=20)
+        except Exception:
+            _hb = {}
+        job_id, created_new, err_code = admit(
+            conn, subject or "", idem_key, plan_id, ack,
+            _fresh_fp, bool(_hb), _drained())
+        if err_code:
+            if err_code == "conflict":
+                return deps.error_envelope(
+                    409, "conflict",
+                    "Idempotency-Key already used with different payload",
+                    "")
+            if err_code == "not_found":
+                return deps.error_envelope(
+                    404, "not_found", "unknown plan", "")
+            if err_code == "maintenance":
+                return deps.error_envelope(
+                    503, "maintenance",
+                    "console is drained for maintenance; new jobs refused",
+                    "")
+            if err_code == "worker_unavailable":
+                return deps.error_envelope(
+                    503, "worker_unavailable",
+                    "worker not ready; job not accepted", "")
+            if err_code == "recovery_required":
+                return deps.error_envelope(
+                    409, "recovery_required",
+                    "recovery required; SSH reconcile must clear first",
+                    "")
+            if err_code == "fingerprint_changed":
+                return deps.error_envelope(
+                    409, "fingerprint_changed",
+                    "installation changed since plan; create a fresh plan",
+                    "tool_id=%s" % _tool_probe[:32])
+            if err_code == "config_changed":
+                return deps.error_envelope(
+                    409, "config_changed",
+                    "configuration changed since plan; create a fresh plan",
+                    "tool_id=%s" % _tool_probe[:32])
+            if err_code == "activity_blocked":
+                return deps.error_envelope(
+                    409, "activity_blocked",
+                    "tool reports active work; update blocked", "")
+            if err_code == "ack_required":
+                return deps.error_envelope(
+                    409, "ack_required",
+                    "unknown activity requires explicit acknowledgment",
+                    "tool_id=%s" % _tool_probe[:32])
+            if err_code == "disabled":
+                return deps.error_envelope(
+                    410, "install_method_unsupported",
+                    "adapter disabled", "")
+            if err_code == "invalid_request":
+                return deps.error_envelope(
+                    422, "invalid_request",
+                    "plan not admissible; create a fresh plan", "")
+            if err_code == "stale_plan":
+                return deps.error_envelope(
+                    409, "stale_plan",
+                    "plan expired/used/invalid; create a fresh plan",
+                    "plan_id=%s" % plan_id[:8])
+            if err_code == "busy":
                 return deps.error_envelope(
                     409, "busy",
                     "another update is already active", "")
-            if created_new:
-                try:
-                    conn.execute("UPDATE plans SET used_at=? WHERE id=?",
-                                 (utcnow_iso(), plan_id))
-                except Exception:
-                    pass
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             return deps.error_envelope(
                 503, "unavailable", "could not reserve job", "")
         row = conn.execute("SELECT * FROM jobs WHERE id=?",

@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 TAIL_KEEP_BYTES = 32 * 1024
 LINE_KEEP_BYTES = 64 * 1024
@@ -60,83 +60,17 @@ class ExecResult(object):
 
 
 _ambient_cancel = ContextVar("ega_ambient_cancel", default=None)  # type: Any
-_ambient_scope = ContextVar("ega_ambient_scope", default=None)  # type: Any
-_ambient_on_line = ContextVar("ega_ambient_on_line", default=None)  # type: Any
 
 
 def ambient_cancel():
     # type: () -> Optional[threading.Event]
+    """Ambient cancel for embedded use. run_stream honors it when no
+    explicit cancel_event is passed. The runner passes explicit events;
+    nothing in this repo sets the ambient one (extension point)."""
     try:
         return _ambient_cancel.get()
     except Exception:
         return None
-
-
-def ambient_on_line():
-    # type: () -> Optional[Callable]
-    try:
-        return _ambient_on_line.get()
-    except Exception:
-        return None
-
-
-class _PhaseCtx(object):
-    def __init__(self, scope=None, cancel=None, on_line=None):
-        # type: (object, object, object) -> None
-        self.scope = scope
-        self.cancel = cancel
-        self.on_line = on_line
-        self._t1 = None
-        self._t2 = None
-        self._t3 = None
-
-    def __enter__(self):
-        # type: () -> threading.Event
-        try:
-            self._t1 = _ambient_scope.set(self.scope)
-        except Exception:
-            self._t1 = None
-        ev = self.cancel
-        if ev is None:
-            ev = threading.Event()
-        try:
-            self._t2 = _ambient_cancel.set(ev)
-        except Exception:
-            self._t2 = None
-        try:
-            self._t3 = _ambient_on_line.set(self.on_line)
-        except Exception:
-            self._t3 = None
-        return ev
-
-    def __exit__(self, *exc):
-        # type: (...) -> bool
-        try:
-            if self._t3 is not None:
-                _ambient_on_line.reset(self._t3)
-        except Exception:
-            pass
-        try:
-            if self._t2 is not None:
-                _ambient_cancel.reset(self._t2)
-        except Exception:
-            pass
-        try:
-            if self._t1 is not None:
-                _ambient_scope.reset(self._t1)
-        except Exception:
-            pass
-        return False
-
-
-def phase_context(scope_unit=None, cancel_event=None, on_line=None):
-    # type: (object, object, object) -> _PhaseCtx
-    """Ambient scope + cancel + live line sink for run_stream (R06/R09).
-
-    The runner wraps each phase so adapter commands inherit containment,
-    cancellation, AND live streaming without signature changes.
-    """
-    return _PhaseCtx(scope_unit, cancel_event, on_line)
 
 
 def _check_argv(argv):
@@ -193,20 +127,10 @@ def run_stream(argv, timeout_s=60, cwd=None, env=None, scope_unit=None,
         cap = int(cap_bytes)
     except (TypeError, ValueError):
         cap = DEFAULT_CAP_BYTES
-    if scope_unit is None:
-        try:
-            scope_unit = _ambient_scope.get()
-        except Exception:
-            scope_unit = None
     cancel = cancel_event
     if cancel is None:
         cancel = ambient_cancel()
-    if on_line is None:
-        # R09 live path: phases publish a sink; direct callers get none.
-        try:
-            on_line = ambient_on_line()
-        except Exception:
-            pass
+    # on_line None means no live sink (caller drains tails instead).
 
     def _cancelled_now():
         # type: () -> bool

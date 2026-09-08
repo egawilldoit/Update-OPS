@@ -29,11 +29,18 @@
 # release dir (cd "$RELEASE_DIR") under the release venv binary
 # ("$RELEASE_DIR/venv/bin/python"), with EGA_CONFIG_FILE exported for ALL
 # invocations including quiescence. State paths (state/db/log/backup/drain)
-# are parsed from config via python -c JSON, never hardcoded. No
+# are parsed from config via config_cli (backend/app/config_cli.py), never
+# hardcoded and never inline python fragments. No
 # heredoc-python blocks. pip uses --require-hashes with NO fallback (R35):
 # a hashless requirements file blocks with a message instead of installing
 # unverified code.
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Release checkout validator (N17): the tarball is NEVER trusted for its
+# own validation code. Archive inspection runs from the operator's
+# checkout copy before any root extraction.
+VALIDATE_ARCHIVE="$SCRIPT_DIR/../etc/validate-archive.py"
 
 COMMIT=""
 TARBALL=""
@@ -90,17 +97,23 @@ if [ -f "$STATE/state.db" ]; then
   EXISTING_DEPLOY=1
 fi
 
-# Config value helper (R32): parse state paths from JSON via python3 -c,
-# never hardcoded. Uses the staged config when /etc is not yet populated.
+# Config value helper (N16/R32): exactly one parser —
+# `python -m backend.app.config_cli` from the staged release
+# (PYTHONPATH; stdlib-only so it runs before the venv exists).
+# Fresh installs (no config file yet) fall back to documented defaults;
+# an EXISTING but unparsable config is a hard failure, never silent.
 cfg_value() {
-  local file="$1"
-  local key="$2"
-  local fallback="$3"
-  python3 -c 'import json,sys; f=sys.argv[1]; k=sys.argv[2]; d=sys.argv[3]; try:
-    data=json.load(open(f,encoding="utf-8"))
-    except Exception: print(d); raise SystemExit(0)
- v=data.get(k,""); print(v if isinstance(v,str) and v else d)' \
-    "$file" "$key" "$fallback" 2>/dev/null || printf '%s' "$fallback"
+  local key="$1"
+  local fallback="$2"
+  local out=""
+  if out="$(PYTHONPATH="$RELEASE_DIR" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli get --require "$key" 2>/dev/null)"; then
+    printf '%s' "$out"
+  elif [ -f "$ETC/config.json" ]; then
+    echo "[install] REFUSING: config parse failed for required key $key" >&2
+    fail_keep_drain "config parse failed for $key"
+  else
+    printf '%s' "$fallback"
+  fi
 }
 
 fail_keep_drain() {
@@ -129,6 +142,15 @@ if [ -e "$RELEASE_DIR" ]; then
   exit 1
 fi
 mkdir -p "$RELEASE_DIR"
+# N17: validate EVERY archive member (traversal/links/devices/modes +
+# expected top-levels) BEFORE any root extraction, using the checkout's
+# validator — never code from the unvalidated tarball.
+if python3 "$VALIDATE_ARCHIVE" --archive "$TARBALL" --dest "$RELEASE_DIR"; then
+  echo "[install] archive validation ok"
+else
+  echo "[install] REFUSING: archive validation blocked" >&2
+  exit 1
+fi
 tar -xzf "$TARBALL" -C "$RELEASE_DIR"
 chown -R root:root "$RELEASE_DIR"
 chmod -R a-w "$RELEASE_DIR" || true
@@ -201,10 +223,10 @@ fi
 # including quiescence/status/validator/migrate/readiness.
 export EGA_CONFIG_FILE="$ETC/config.json"
 
-# Resolve state paths from config (R32: never hardcoded for backup/drain).
-EFFECTIVE_STATE="$(cfg_value "$ETC/config.json" state_dir "$STATE")"
-EFFECTIVE_DB="$(cfg_value "$ETC/config.json" db_path "$EFFECTIVE_STATE/state.db")"
-EFFECTIVE_BACKUPS="$(cfg_value "$ETC/config.json" backup_dir "$EFFECTIVE_STATE/backups")"
+# Resolve state paths from config (N16/R32: never hardcoded for backup/drain).
+EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")"
+EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
+EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
 DRAIN="$EFFECTIVE_STATE/drain"
 echo "[install] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB backups=$EFFECTIVE_BACKUPS"
 
@@ -256,17 +278,11 @@ if [ "$EXISTING_DEPLOY" = "1" ]; then
     QUIESCED=0
     for _i in $(seq 1 24); do
       cd "$RELEASE_DIR"
-      if EGA_CONFIG_FILE="$ETC/config.json" "$CURRENT_LINK/venv/bin/python" -m backend.app.cli status --wait-secs 5 >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
-        if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-install-status.json")); raise SystemExit(0 if (not d.get("active_job") and not d.get("unresolved_runners")) else 1)' 2>/dev/null; then
-          QUIESCED=1
-          break
-        fi
-        if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-install-status.json")); raise SystemExit(0 if d.get("unresolved_runners") else 1)' 2>/dev/null; then
-          echo "[install] unresolved runners present — reconcile first (drain kept)" >&2
-          fail_keep_drain "unresolved runners present"
-        fi
+      if EGA_CONFIG_FILE="$ETC/config.json" "$CURRENT_LINK/venv/bin/python" -m backend.app.cli status --require-quiescent >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
+        QUIESCED=1
+        break
       fi
-      echo "[install] active job still present, waiting 5s ($_i/24)..."
+      echo "[install] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-install-status.json detail.reasons..."
       sleep 5
     done
     if [ "$QUIESCED" = "1" ]; then
@@ -326,15 +342,16 @@ fi
 if [ "$EXISTING_DEPLOY" = "1" ] && [ -f "$EFFECTIVE_DB" ]; then
   TS="$(date -u +%Y%m%dT%H%M%SZ)"
   cd "$RELEASE_DIR"
-  EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'import sqlite3,sys; src, dst = sys.argv[1], sys.argv[2]; s = sqlite3.connect(src, timeout=10.0); d = sqlite3.connect(dst, timeout=10.0); s.backup(d); s.close(); d.close(); print("backup ok:", dst)' "$EFFECTIVE_DB" "$EFFECTIVE_BACKUPS/state-preinstall-$TS.db" \
+  EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.db backup "$EFFECTIVE_DB" "$EFFECTIVE_BACKUPS/state-preinstall-$TS.db" \
     || fail_keep_drain "pre-install DB backup failed"
   chmod 0600 "$EFFECTIVE_BACKUPS"/state-preinstall-*.db
   chown "$API_USER":"$API_USER" "$EFFECTIVE_BACKUPS"/state-preinstall-*.db || true
 fi
 
-# 6b. Migrate via the release venv with CWD at the release root (R32).
+# 6b. Migrate via the release module entrypoint (N04: only the controlled
+# deploy procedure migrates; services validate only). CWD at release root.
 cd "$RELEASE_DIR"
-if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.db import connect, migrate; from backend.app.config import load_settings; s = load_settings(); conn = connect(s.db_path); migrate(conn); print("migrate ok:", s.db_path)'; then
+if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.db migrate; then
   echo "[install] migrate ok"
 else
   fail_keep_drain "migration failed (drain kept; see RUNBOOK migration-recovery)"
@@ -343,7 +360,7 @@ fi
 # read/write state.db/WAL/SHM; 0660 keeps it restricted to the two accounts.
 # Secrets stay 0600 root:API_USER (unchanged, see §3).
 cd "$RELEASE_DIR"
-DB_PATH="$(EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.config import load_settings; print(load_settings().db_path)' 2>/dev/null || printf '%s' "$EFFECTIVE_DB")"
+DB_PATH="$(EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli get --require db_path 2>/dev/null || printf '%s' "$EFFECTIVE_DB")"
 for dbf in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"; do
   if [ -e "$dbf" ]; then chown "$API_USER:ega-update" "$dbf" || true; chmod 0660 "$dbf" || true; fi
 done
@@ -352,8 +369,9 @@ done
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK" || fail_keep_drain "cannot flip current symlink"
 
 # 7b. Port drop-in (R35): render the effective listen port from config so
-# the unit never diverges from config defaults.
-EFFECTIVE_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("listen_port",8771))' "$ETC/config.json" 2>/dev/null || printf '8771')"
+# the unit never diverges from config defaults. config_cli fails closed;
+# an unparsable port blocks here instead of rendering a wrong default.
+EFFECTIVE_PORT="$(EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli get --require listen_port 2>/dev/null)" || fail_keep_drain "listen_port unparsable in $ETC/config.json"
 mkdir -p /etc/systemd/system/ega-update-api.service.d
 printf '[Service]\nEnvironment=EGA_LISTEN_PORT=%s\n' "$EFFECTIVE_PORT" > /etc/systemd/system/ega-update-api.service.d/10-port.conf
 chmod 0644 /etc/systemd/system/ega-update-api.service.d/10-port.conf
@@ -390,11 +408,9 @@ for _i in $(seq 1 12); do
   HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EFFECTIVE_PORT/api/v1/health" 2>/dev/null || printf '000')"
   if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "200" ]; then
     cd "$RELEASE_DIR"
-    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --wait-secs 5 >/tmp/ega-install-ready.json 2>/dev/null; then
-      if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-install-ready.json")); raise SystemExit(0 if d.get("worker_alive") else 1)' 2>/dev/null; then
-        READY=1
-        break
-      fi
+    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --require-ready >/tmp/ega-install-ready.json 2>/dev/null; then
+      READY=1
+      break
     fi
   fi
   echo "[install] readiness pending (http=$HTTP_CODE, $_i/12)..."
@@ -426,7 +442,7 @@ echo "[check] localhost binding:"
 (ss -ltnp 2>/dev/null | grep -E "127\\.0\\.0\\.1:$EFFECTIVE_PORT" \
   || echo "WARN: nothing on 127.0.0.1:$EFFECTIVE_PORT — check EGA_LISTEN_PORT and api.env")
 cd "$RELEASE_DIR"
-LISTEN_HOST="$(EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.config import load_settings; print(load_settings().listen_host)' 2>/dev/null || printf '?')"
+LISTEN_HOST="$(EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli get --require listen_host 2>/dev/null)" || fail_keep_drain "listen_host unparsable in $ETC/config.json"
 if [ "$LISTEN_HOST" = "127.0.0.1" ]; then
   :
 else
@@ -435,11 +451,21 @@ else
 fi
 echo "[check] Access JWT config present:"
 cd "$RELEASE_DIR"
-if EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.config import load_settings; s = load_settings(); missing = [k for k in ("team_domain", "audience", "public_origin") if not getattr(s, k)]; raise SystemExit("REFUSING: incomplete Access config, missing: %s" % (missing or ["owner_emails/csrf_secret"])) if (missing or not s.owner_emails or not s.csrf_secret) else print("Access config ok:", s.team_domain, s.audience, s.public_origin)'; then
-  :
-else
-  fail_keep_drain "Access config incomplete"
-fi
+ACCESS_CHECK="$(EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli json 2>/dev/null)" || fail_keep_drain "Access config unreadable"
+for _k in team_domain audience public_origin; do
+  case "$ACCESS_CHECK" in
+    *"\"$_k\": \"\""*|*"\"$_k\": \"CHANGEME"*)
+      fail_keep_drain "Access config incomplete: $_k placeholder/missing" ;;
+  esac
+done
+for _k in owner_emails csrf_secret; do
+  _v="$(EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli get "$_k" 2>/dev/null)" || fail_keep_drain "Access config unreadable: $_k"
+  case "$_v" in
+    ""|"CHANGEME"*)
+      fail_keep_drain "Access config incomplete: $_k placeholder/missing" ;;
+  esac
+done
+echo "[check] Access config ok"
 
 # 10. Conflicting updaterSchedule handling — RECORD-ONLY by default.
 #     Detect cron entries, systemd timers, and tool self-update flags that

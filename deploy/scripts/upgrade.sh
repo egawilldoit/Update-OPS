@@ -25,9 +25,16 @@
 # Python rule (R32): every python invocation runs with CWD at the release
 # dir (cd "$RELEASE_DIR") under the release venv binary, with
 # EGA_CONFIG_FILE exported for ALL invocations including quiescence. State
-# paths are parsed from config via python -c JSON, never hardcoded. No
+# paths are parsed from config via config_cli (backend/app/config_cli.py),
+# never hardcoded and never inline python fragments. No
 # heredoc-python. pip uses --require-hashes with NO fallback (R35).
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Release checkout validator (N17): the tarball is NEVER trusted for its
+# own validation code. Archive inspection runs from the operator's
+# checkout copy before any root extraction.
+VALIDATE_ARCHIVE="$SCRIPT_DIR/../etc/validate-archive.py"
 
 COMMIT=""
 TARBALL=""
@@ -87,21 +94,38 @@ fi
 # quiescence/status/validator/migrate/readiness.
 export EGA_CONFIG_FILE="$ETC/config.json"
 
-cfg_value() {
-  local file="$1"
-  local key="$2"
-  local fallback="$3"
-  python3 -c 'import json,sys; f=sys.argv[1]; k=sys.argv[2]; d=sys.argv[3]; try:
-    data=json.load(open(f,encoding="utf-8"))
-    except Exception: print(d); raise SystemExit(0)
- v=data.get(k,""); print(v if isinstance(v,str) and v else d)' \
-    "$file" "$key" "$fallback" 2>/dev/null || printf '%s' "$fallback"
+# Config values come ONLY from config_cli (N16): the release venv
+# interpreter once staged, else system python3 over the staged tree
+# (PYTHONPATH; config parser is stdlib-only). Existing config must parse;
+# there are no silent fallbacks for an existing-but-broken config.
+cfg_cli() {
+  if [ -x "$RELEASE_DIR/venv/bin/python" ]; then
+    EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli "$@"
+  else
+    PYTHONPATH="$RELEASE_DIR" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli "$@"
+  fi
 }
 
-EFFECTIVE_STATE="$(cfg_value "$ETC/config.json" state_dir "$STATE")"
-EFFECTIVE_DB="$(cfg_value "$ETC/config.json" db_path "$EFFECTIVE_STATE/state.db")"
-EFFECTIVE_BACKUPS="$(cfg_value "$ETC/config.json" backup_dir "$EFFECTIVE_STATE/backups")"
-EFFECTIVE_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("listen_port",8771))' "$ETC/config.json" 2>/dev/null || printf '8771')"
+cfg_value() {
+  local key="$1"
+  local fallback="$2"
+  local out=""
+  if out="$(cfg_cli get --require "$key" 2>/dev/null)"; then
+    printf '%s' "$out"
+  elif [ -f "$ETC/config.json" ]; then
+    # fail() is defined below; this path runs before it exists, so exit
+    # directly (same fail-closed outcome, drain already or absent).
+    echo "[upgrade] REFUSING: config parse failed for required key $key" >&2
+    exit 1
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")"
+EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
+EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
+EFFECTIVE_PORT="$(cfg_value listen_port "8771")"
 DRAIN="$EFFECTIVE_STATE/drain"
 DRAIN_CREATED_BY_US=0
 WAS_API=0
@@ -151,41 +175,33 @@ else
   echo "[upgrade] drain created at $DRAIN (new plans/jobs refused)"
 fi
 
-# (2) Quiescence via cli status (R33): the CLI proves no active job and no
-# unresolved runners. Bounded 120s, fail closed. CWD is the release staging
-# area once available, else the current release; EGA_CONFIG_FILE exported.
+# (2) Quiescence via canonical cli status (N01/R33): `status
+# --require-quiescent` exits 0 ONLY when proven quiescent (worker alive,
+# no active/unresolved/recovery work, no live/unknown runner units, no
+# active delegated operations, drain present). Deployment relies on the
+# process exit — shell JSON parsing of quiescence is forbidden. Bounded
+# 120s, fail closed. CWD is the current release; EGA_CONFIG_FILE exported.
 echo "[upgrade] waiting for quiescence via cli status (bounded 120s)..."
 STATUS_PY="$CURRENT_LINK/venv/bin/python"
 STATUS_CWD="$PREV_RELEASE"
-if [ -z "$STATUS_CWD" ] || [ -x "$STATUS_PY" ]; then
+if [ -n "$PREV_RELEASE" ] && [ -x "$STATUS_PY" ]; then
   :
 else
-  STATUS_PY="python3"
-  STATUS_CWD="/tmp"
+  # No runnable current release: quiescence cannot be proven from its
+  # CLI, and an ambient interpreter must never stand in (R32). Refuse
+  # closed with drain kept instead of waiting out a doomed loop.
+  echo "[upgrade] REFUSING: no runnable current release for the quiescence gate (drain kept)" >&2
+  exit 1
 fi
 QUIESCED=0
 for _i in $(seq 1 24); do
   cd "$STATUS_CWD" 2>/dev/null || cd /tmp
-  if EGA_CONFIG_FILE="$ETC/config.json" "$STATUS_PY" -m backend.app.cli status --wait-secs 5 >/tmp/ega-upgrade-status.json 2>/tmp/ega-upgrade-status.err; then
-    if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-upgrade-status.json")); raise SystemExit(0 if (not d.get("active_job") and not d.get("unresolved_runners")) else 1)' 2>/dev/null; then
-      QUIESCED=1
-      break
-    fi
-    if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-upgrade-status.json")); raise SystemExit(0 if d.get("unresolved_runners") else 1)' 2>/dev/null; then
-      echo "[upgrade] unresolved runners present — run reconcile first (drain kept)" >&2
-      fail "unresolved runners present"
-    fi
-    if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-upgrade-status.json")); raise SystemExit(0 if d.get("active_job") else 1)' 2>/dev/null; then
-      echo "[upgrade] active job still present, waiting 5s ($_i/24)..."
-      sleep 5
-    else
-      echo "[upgrade] active job still present, waiting 5s ($_i/24)..."
-      sleep 5
-    fi
-  else
-    echo "[upgrade] status gate unavailable, waiting 5s ($_i/24)..."
-    sleep 5
+  if EGA_CONFIG_FILE="$ETC/config.json" "$STATUS_PY" -m backend.app.cli status --require-quiescent >/tmp/ega-upgrade-status.json 2>/tmp/ega-upgrade-status.err; then
+    QUIESCED=1
+    break
   fi
+  echo "[upgrade] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-upgrade-status.json detail.reasons..."
+  sleep 5
 done
 if [ "$QUIESCED" = "1" ]; then
   echo "[upgrade] quiesced: cli status proves no active job, no unresolved runners"
@@ -205,21 +221,29 @@ if systemctl is-active --quiet ega-update-worker 2>/dev/null; then
 fi
 echo "[upgrade] stopped: api and worker proven inactive"
 
-# (4) Consistent DB backup (SQLite backup API — never bare cp of a live DB).
-# State paths come from config (R32). Writers are stopped above.
+# (4) Consistent DB backup (SQLite backup API via the release db tool —
+# never bare cp of a live DB, never inline python). Writers stopped above.
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 PREV_VENV="$CURRENT_LINK/venv/bin/python"
 cd "$PREV_RELEASE" 2>/dev/null || cd /tmp
-EGA_CONFIG_FILE="$ETC/config.json" "$PREV_VENV" -c 'import sqlite3,sys; src, dst = sys.argv[1], sys.argv[2]; s = sqlite3.connect(src, timeout=10.0); d = sqlite3.connect(dst, timeout=10.0); s.backup(d); s.close(); d.close(); print("backup ok:", dst)' "$EFFECTIVE_DB" "$EFFECTIVE_BACKUPS/state-preupgrade-$TS.db" \
+EGA_CONFIG_FILE="$ETC/config.json" "$PREV_VENV" -m backend.app.db backup "$EFFECTIVE_DB" "$EFFECTIVE_BACKUPS/state-preupgrade-$TS.db" \
   || fail "pre-upgrade DB backup failed"
 chmod 0600 "$EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"
-SCHEMA_BEFORE="$(cd "$PREV_RELEASE" 2>/dev/null && EGA_CONFIG_FILE="$ETC/config.json" "$PREV_VENV" -c 'import sqlite3; print(sqlite3.connect(sys.argv[1]).execute("SELECT value FROM schema_meta WHERE key=\x27version\x27").fetchone())' "$EFFECTIVE_DB" 2>/dev/null || printf 'unknown')"
-echo "[upgrade] schema before: $SCHEMA_BEFORE; backup: $EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"
+chown "$API_USER":"$API_USER" "$EFFECTIVE_BACKUPS/state-preupgrade-$TS.db" || true
+chmod 0600 "$EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"
+echo "[upgrade] backup: $EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"
 
 # (5) Stage the new release dir (immutable, root-owned), write MANIFEST via
 # sha256sum, install venv with --require-hashes (NO fallback), then validate.
 if [ -e "$RELEASE_DIR" ]; then fail "release dir exists: $RELEASE_DIR"; fi
 mkdir -p "$RELEASE_DIR" || fail "cannot create $RELEASE_DIR"
+# N17: validate EVERY archive member BEFORE any root extraction, using
+# the checkout's validator — never code from the unvalidated tarball.
+if python3 "$VALIDATE_ARCHIVE" --archive "$TARBALL" --dest "$RELEASE_DIR"; then
+  echo "[upgrade] archive validation ok"
+else
+  fail "archive validation blocked"
+fi
 tar -xzf "$TARBALL" -C "$RELEASE_DIR" || fail "tarball extraction failed"
 chown -R root:root "$RELEASE_DIR"
 # Build output mapping: frontend/vite.config.ts outDir is
@@ -252,9 +276,10 @@ else
   fail "stage validation blocked (drain kept; prior release still linked)"
 fi
 
-# (6) Migrate against the preserved DB via the NEW release venv (CWD set).
+# (6) Migrate via the release module entrypoint (N04: only the controlled
+# deploy procedure migrates; services validate only). CWD at release root.
 cd "$RELEASE_DIR"
-if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.db import connect, migrate; from backend.app.config import load_settings; s = load_settings(); conn = connect(s.db_path); v = migrate(conn); print("migrate ok, schema version:", v)'; then
+if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.db migrate; then
   echo "[upgrade] migrate ok"
 else
   fail "migration failed (see migration-recovery in RUNBOOK; drain kept)"
@@ -263,8 +288,9 @@ fi
 # (7) Atomic symlink switch — only after stage+validate+migrate.
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK" || fail "cannot flip current symlink"
 
-# (8) Install units (+ R35 port drop-in rendered from config).
-EFFECTIVE_PORT_NOW="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("listen_port",8771))' "$ETC/config.json" 2>/dev/null || printf '8771')"
+# (8) Install units (+ R35 port drop-in rendered from config via
+# config_cli — an unparsable port blocks instead of a wrong default).
+EFFECTIVE_PORT_NOW="$(cfg_cli get --require listen_port 2>/dev/null)" || fail "listen_port unparsable in $ETC/config.json"
 mkdir -p /etc/systemd/system/ega-update-api.service.d
 printf '[Service]\nEnvironment=EGA_LISTEN_PORT=%s\n' "$EFFECTIVE_PORT_NOW" > /etc/systemd/system/ega-update-api.service.d/10-port.conf || fail "port drop-in write failed"
 chmod 0644 /etc/systemd/system/ega-update-api.service.d/10-port.conf
@@ -289,11 +315,9 @@ for _i in $(seq 1 12); do
   HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EFFECTIVE_PORT_NOW/api/v1/health" 2>/dev/null || printf '000')"
   if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "200" ]; then
     cd "$RELEASE_DIR"
-    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --wait-secs 5 >/tmp/ega-upgrade-ready.json 2>/dev/null; then
-      if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-upgrade-ready.json")); raise SystemExit(0 if d.get("worker_alive") else 1)' 2>/dev/null; then
-        READY=1
-        break
-      fi
+    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --require-ready >/tmp/ega-upgrade-ready.json 2>/dev/null; then
+      READY=1
+      break
     fi
   fi
   echo "[upgrade] readiness pending (http=$HTTP_CODE, $_i/12)..."
@@ -327,7 +351,7 @@ else
 fi
 echo ""
 echo "ROLLBACK (console code only — never auto-restores tool data):"
-echo "  If the new release's schema version == $SCHEMA_BEFORE (compatible):"
+echo "  If the validator --check-compat passes for the prior release:"
 echo "    sudo ln -sfn $PREV_RELEASE $CURRENT_LINK && sudo systemctl restart ega-update-api ega-update-worker"
 echo "  Else (schema changed / migrate failed): follow the migration-recovery"
 echo "  procedure in docs/RUNBOOK.md — restore $EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"

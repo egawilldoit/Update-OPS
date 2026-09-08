@@ -24,6 +24,9 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
 
 from backend.app import db as db_lib
 from backend.app import executor as executor_lib
@@ -35,6 +38,12 @@ from backend.app import reconcile_core as rc_lib
 from backend.app import sanitize as sanitize_lib
 from backend.app import tx as tx_lib
 from backend.app import units as units_lib
+from backend.app.admission import admit as admit_lib
+
+import support as support_lib
+from backend.app.admission import admit as admit_lib
+
+import support as support_lib
 
 
 def _fresh_db(tmp_path, name="s.db"):
@@ -232,21 +241,25 @@ def test_units_confirmed_stopped_needs_dead_pid_and_empty_cgroup(
 
 # -- transactions ----------------------------------------------------------
 
+def _v2row(conn, fp="fp", subject="s"):
+    # type: (...) -> dict
+    return support_lib.v2_plan_row(
+        conn, uuid.uuid4().hex, subject=subject, fingerprint=fp)
+
+
+def _admit(conn, subject, key, plan_id, ack, fp):
+    # type: (...) -> str
+    support_lib.test_release_root()
+    job_id, created, err = admit_lib(conn, subject, key, plan_id, ack,
+                                     fp, True, False)
+    assert err == "" and created and job_id, err
+    return job_id
+
+
 def test_tx_guard_and_atomic_terminal(tmp_path):
     conn = _fresh_db(tmp_path)
-    row = plans_lib.build_plan_row(
-        "hermes", "s", "i", "fp", "1.0.0", "exact", "c", [], {}, [],
-        {}, {}, [], [], {}, {}, ["preflight"], {}, "n", "", "idle",
-        "2026-09-08T00:00:00+00:00", "", 1, "h", "/r",
-        "2026-09-08T00:00:00+00:00", "2026-09-08T01:00:00+00:00")
-    conn.execute("BEGIN IMMEDIATE")
-    plans_lib.insert_plan(conn, row)
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    jid, created, err = jobs_lib.reserve_job(
-        conn, "hermes", row["id"], "s", "k-tx-1", False)
-    assert err == ""
-    conn.commit()
+    row = _v2row(conn)
+    jid = _admit(conn, "s", "k-tx-1", row["id"], False, "fp")
     # Guard mismatch writes nothing.
     with pytest.raises(tx_lib.TxGuardError):
         tx_lib.transition_tx(conn, jid, "updating", expect_states=["bogus"])
@@ -280,19 +293,8 @@ def test_tx_guard_and_atomic_terminal(tmp_path):
 
 def test_claim_deadline_enforced(tmp_path):
     conn = _fresh_db(tmp_path)
-    row = plans_lib.build_plan_row(
-        "hermes", "s", "i", "fp", "1.0.0", "exact", "c", [], {}, [],
-        {}, {}, [], [], {}, {}, ["preflight"], {}, "n", "", "idle",
-        "2026-09-08T00:00:00+00:00", "", 1, "h", "/r",
-        "2026-09-08T00:00:00+00:00", "2026-09-08T01:00:00+00:00")
-    conn.execute("BEGIN IMMEDIATE")
-    plans_lib.insert_plan(conn, row)
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    jid, _, err = jobs_lib.reserve_job(
-        conn, "hermes", row["id"], "s", "k-dl-1", False)
-    assert err == ""
-    conn.commit()
+    row = _v2row(conn)
+    jid = _admit(conn, "s", "k-dl-1", row["id"], False, "fp")
     # Force the deadline into the past: claim must refuse.
     conn.execute("UPDATE jobs SET claim_deadline='2000-01-01T00:00:00+00:00'"
                  " WHERE id=?", (jid,))
@@ -308,19 +310,8 @@ def test_claim_deadline_enforced(tmp_path):
 
 def test_consume_attempt_single_use(tmp_path):
     conn = _fresh_db(tmp_path)
-    row = plans_lib.build_plan_row(
-        "hermes", "s", "i", "fp", "1.0.0", "exact", "c", [], {}, [],
-        {}, {}, [], [], {}, {}, ["preflight"], {}, "n", "", "idle",
-        "2026-09-08T00:00:00+00:00", "", 1, "h", "/r",
-        "2026-09-08T00:00:00+00:00", "2026-09-08T01:00:00+00:00")
-    conn.execute("BEGIN IMMEDIATE")
-    plans_lib.insert_plan(conn, row)
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    jid, _, err = jobs_lib.reserve_job(
-        conn, "hermes", row["id"], "s", "k-ca-1", False)
-    assert err == ""
-    conn.commit()
+    row = _v2row(conn)
+    jid = _admit(conn, "s", "k-ca-1", row["id"], False, "fp")
     assert jobs_lib.claim_with_nonce(conn, jid, "nonce-1") is True
     assert jobs_lib.consume_attempt(conn, jid, "nonce-1") is True
     assert jobs_lib.consume_attempt(conn, jid, "nonce-1") is False
@@ -330,19 +321,8 @@ def test_consume_attempt_single_use(tmp_path):
 
 def test_find_replay_precedes_admission(tmp_path):
     conn = _fresh_db(tmp_path)
-    row = plans_lib.build_plan_row(
-        "hermes", "s", "i", "fp", "1.0.0", "exact", "c", [], {}, [],
-        {}, {}, [], [], {}, {}, ["preflight"], {}, "n", "", "idle",
-        "2026-09-08T00:00:00+00:00", "", 1, "h", "/r",
-        "2026-09-08T00:00:00+00:00", "2026-09-08T01:00:00+00:00")
-    conn.execute("BEGIN IMMEDIATE")
-    plans_lib.insert_plan(conn, row)
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    jid, _, err = jobs_lib.reserve_job(
-        conn, "hermes", row["id"], "s", "k-replay-1", True)
-    assert err == ""
-    conn.commit()
+    row = _v2row(conn)
+    jid = _admit(conn, "s", "k-replay-1", row["id"], True, "fp")
     digest = jobs_lib.request_hash(row["id"], True)
     found = jobs_lib.find_replay(conn, "s", "k-replay-1")
     assert found is not None and found["id"] == jid
@@ -401,10 +381,10 @@ def test_config_identity_stable_and_sensitive(tmp_path):
 def test_migrate_fresh_rerun_and_newer_rejected(tmp_path):
     path = str(tmp_path / "m.db")
     conn = db_lib.connect(path)
-    assert db_lib.migrate(conn) == 3
-    assert db_lib.validate_schema(conn) == 3
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    assert db_lib.validate_schema(conn) == db_lib.CODE_VERSION
     # Rerun is idempotent.
-    assert db_lib.migrate(conn) == 3
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
     conn.close()
     # Newer-than-code schema is rejected, never served.
     conn2 = db_lib.connect(path)
@@ -419,7 +399,7 @@ def test_migrate_fresh_rerun_and_newer_rejected(tmp_path):
     conn2.close()
 
 
-def test_migrate_001_to_003_upgrade(tmp_path):
+def test_migrate_001_to_current_upgrade(tmp_path):
     src = os.path.join(_REPO_ROOT, "backend", "migrations",
                        "001_init.sql")
     path = str(tmp_path / "old.db")
@@ -427,8 +407,8 @@ def test_migrate_001_to_003_upgrade(tmp_path):
     with open(src, "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
     conn.commit()
-    # Legacy v1 base (no ledger): migrate infers + applies 002/003.
-    assert db_lib.migrate(conn) == 3
+    # Legacy v1 base (no ledger): migrate infers + applies 002/003/004.
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
     cols = {r["name"] for r in
             conn.execute("PRAGMA table_info(jobs)").fetchall()}
     assert "attempt_claimed" in cols and "final_log_seq" in cols

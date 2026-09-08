@@ -19,6 +19,12 @@ from typing import Any, Dict, List, Optional
 TERMINAL_STATES = ("succeeded", "blocked", "failed", "health_failed",
                    "interrupted")
 
+# Evidence columns sanitized at this boundary (N13), even if a caller
+# forgot: externally derived text must never reach SQLite raw.
+_SANITIZED_UPDATE_KEYS = ("error_detail", "error_code", "before_version",
+                          "after_version", "install_outcome", "heartbeat",
+                          "runner_unit", "canonical_unit", "release_path")
+
 
 class TxError(Exception):
     """Base state-transition failure."""
@@ -43,7 +49,8 @@ def _columns(conn):
 
 def transition_tx(conn, job_id, to_state, step="", expect_states=None,
                   expect_nonce="", update=None, event=None,
-                  event_detail="", checks=None, tool_id=""):
+                  event_detail="", checks=None, tool_id="",
+                  release_mutation=False):
     # type: (...) -> Dict[str, Any]
     """Atomic guarded transition. Returns the new job row as a dict.
 
@@ -51,6 +58,9 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
     the real jobs columns; unknown columns raise TxGuardError).
     checks: list of {name, result, mandatory, summary} inserted atomically.
     event: event_type string (default: to_state).
+    release_mutation: release the job's mutation lease in the SAME
+    transaction (terminalization paths must pass True so the slot and
+    the lease can never disagree).
     """
     from .schemas import utcnow_iso
 
@@ -58,6 +68,23 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
         raise TxGuardError("job_id and to_state are required")
     expect = tuple(expect_states or ())
     extra = dict(update or {})
+    # N13: boundary sanitization with the single known-secret source.
+    # Sanitizer failure fails the whole transaction closed (no partial
+    # raw evidence write). Sanitization is idempotent, so pre-sanitized
+    # callers are unaffected.
+    try:
+        from .config import load_secret_values, settings
+        from .sanitize import sanitize_text
+        _secrets = load_secret_values(settings)
+    except Exception as exc:
+        raise TxError("secret source unavailable: %s" % exc)
+    try:
+        event_detail = sanitize_text(event_detail or "", _secrets)
+        for key in _SANITIZED_UPDATE_KEYS:
+            if key in extra and isinstance(extra[key], str):
+                extra[key] = sanitize_text(extra[key], _secrets)
+    except Exception as exc:
+        raise TxError("evidence sanitization failed: %s" % exc)
     now = utcnow_iso()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -106,7 +133,15 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
         for item in checks or []:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name", ""))[:200]
+            try:
+                name = sanitize_text(
+                    str(item.get("name", "")), _secrets)[:200]
+                summary = sanitize_text(
+                    str(item.get("summary", "")), _secrets)[:1000]
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                raise TxError(
+                    "check evidence sanitization failed: %s" % exc)
             result = str(item.get("result", "unknown"))
             if result not in ("pass", "fail", "unknown",
                               "not_applicable"):
@@ -115,12 +150,21 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
                 mandatory = 1 if item.get("mandatory", True) else 0
             except Exception:
                 mandatory = 1
-            summary = str(item.get("summary", ""))[:1000]
             conn.execute(
                 "INSERT INTO checks(tool_id,job_id,name,result,mandatory,"
                 "summary,created_at) VALUES(?,?,?,?,?,?,?)",
                 (tool_id or current.get("tool_id", ""), job_id, name,
                  result, mandatory, summary, now))
+        if release_mutation:
+            # Same-transaction lease release: the admission slot and the
+            # mutation lease can never disagree (N08/N15).
+            try:
+                conn.execute(
+                    "UPDATE execution_leases SET released_at=? WHERE"
+                    " kind='mutation' AND job_id=? AND released_at=''",
+                    (now, job_id))
+            except Exception:
+                pass
         try:
             conn.execute("COMMIT")
         except Exception as exc:

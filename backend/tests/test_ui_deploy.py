@@ -520,8 +520,15 @@ def test_install_upgrade_ordering():
         assert "40" in text and "0-9a-f" in text, name
         assert "MANIFEST" in text and "sha256sum" in text, name
         assert "validate-release.py" in text, name
-        # R32: state paths parsed from config via python -c JSON.
-        assert "state_dir" in text and "python3 -c" in text, name
+        # N16: state paths come ONLY from config_cli (no inline python
+        # config parsers); quiescence relies on exit codes, not parsing.
+        assert "config_cli get" in text, name
+        assert "python3 -c 'import json" not in text, name
+        assert "python -c 'import json" not in text, name
+        assert "status --require-quiescent" in text or \
+            "status --require-ready" in text, name
+        # N17: archive validated before root extraction.
+        assert "validate-archive.py" in text, name
         # R33: drain-before-stop ordering.
         drain_pos = text.find("drain")
         stop_pos = text.find("systemctl stop")

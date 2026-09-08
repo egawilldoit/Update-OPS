@@ -1,7 +1,7 @@
 """Offline unit tests for Update-OPS V1 console (never needs network).
 
 Covers review findings without executing servers, builds, or probes:
-- concurrent single-slot reservation via jobs.reserve_job (threads + temp SQLite)
+- concurrent single-slot admission via admission.admit (threads + temp SQLite)
 - idempotent replay vs 409 conflict (same key/same payload vs different payload)
 - JWT rejection: forged / expired / wrong-audience + owner allow-list
   (import-guarded when PyJWT is missing)
@@ -32,11 +32,17 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
 
 from backend.app import db as db_lib
 from backend.app import jobs as jobs_lib
 from backend.app import redaction as redaction_lib
 from backend.app import auth as auth_lib
+from backend.app.admission import admit as admit_lib
+
+import support as support_lib
 
 try:
     import jwt as pyjwt  # type: ignore
@@ -61,56 +67,35 @@ def _make_db(path):
 def _insert_plan(conn, plan_id, tool_id="hermes", fingerprint="fp-test-1",
                  target="9.9.9", expires_future=True):
     # type: (...) -> None
-    from backend.app.schemas import utcnow_iso
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(seconds=600) if expires_future else \
-        now - timedelta(seconds=600)
-    conn.execute(
-        "INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
-    conn.execute(
-        "INSERT INTO plans(id,tool_id,subject,created_at,expires_at,"
-        "fingerprint,target,target_mode,channel,services,backup_scope,"
-        "activity_state,activity_evidence,used_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (plan_id, tool_id, "owner@example.invalid", now.isoformat(),
-         exp.isoformat(), fingerprint, target, "exact", "test-channel",
-         json.dumps([]), json.dumps({}), "idle", "idle evidence", ""))
-    conn.commit()
+    # v2 immutable plans via the shared helper (single admission path).
+    support_lib.v2_plan_row(conn, plan_id, tool_id=tool_id,
+                            fingerprint=fingerprint, target=target,
+                            expires_future=expires_future)
 
 
 def _reserve_in_tx(db_path, tool_id, plan_id, subject, idem_key, ack, out, idx):
     # type: (...) -> None
-    """One reservation attempt in its own connection + short transaction."""
+    """One admission attempt in its own connection (no tx held by caller;
+    admission owns its transaction)."""
+    support_lib.test_release_root()
     conn = db_lib.connect(db_path)
     try:
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            plan = conn.execute("SELECT fingerprint FROM plans WHERE id=?",
+                                (plan_id,)).fetchone()
+            fp = str(dict(plan).get("fingerprint", "")) if plan else ""
         except Exception as exc:
-            out[idx] = ("error", "", False, "begin_failed:%s" % exc)
+            out[idx] = ("error", "", False, "plan_read:%s" % exc)
             return
         try:
-            job_id, created, err = jobs_lib.reserve_job(
-                conn, tool_id, plan_id, subject, idem_key, ack)
+            job_id, created, err = admit_lib(
+                conn, subject, idem_key, plan_id, ack, fp, True, False)
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             out[idx] = ("error", "", False, "raise:%s" % exc)
             return
         if err:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             out[idx] = ("err", "", False, err)
         else:
-            try:
-                conn.commit()
-            except Exception as exc:
-                out[idx] = ("error", "", False, "commit_failed:%s" % exc)
-                return
             out[idx] = ("ok", job_id, created, "")
     finally:
         try:
@@ -198,38 +183,22 @@ def test_idempotent_replay_vs_conflict(tmp_path):
     _insert_plan(conn, pid_b, fingerprint="fp-b", target="2.0.0")
     subject = "owner@example.invalid"
     key = "idem-123"
-    conn.execute("BEGIN IMMEDIATE")
-    job_a, created_a, err_a = jobs_lib.reserve_job(
-        conn, "hermes", pid_a, subject, key, False)
+    support_lib.test_release_root()
+    job_a, created_a, err_a = admit_lib(
+        conn, subject, key, pid_a, False, "fp-a", True, False)
     assert err_a == "" and created_a is True and job_a
-    conn.commit()
     # Same key + same payload replays the original job.
-    conn.execute("BEGIN IMMEDIATE")
-    job_replay, created_replay, err_replay = jobs_lib.reserve_job(
-        conn, "hermes", pid_a, subject, key, False)
-    try:
-        conn.rollback()
-    except Exception:
-        pass
+    job_replay, created_replay, err_replay = admit_lib(
+        conn, subject, key, pid_a, False, "fp-a", True, False)
     assert err_replay == "" and created_replay is False
     assert job_replay == job_a
     # Same key + different payload (different plan) is a 409 conflict.
-    conn.execute("BEGIN IMMEDIATE")
-    _job_c, _created_c, err_c = jobs_lib.reserve_job(
-        conn, "hermes", pid_b, subject, key, False)
-    try:
-        conn.rollback()
-    except Exception:
-        pass
+    _job_c, _created_c, err_c = admit_lib(
+        conn, subject, key, pid_b, False, "fp-b", True, False)
     assert err_c == "conflict"
     # Same key + different ack is also a conflict (ack is part of the hash).
-    conn.execute("BEGIN IMMEDIATE")
-    _job_d, _created_d, err_d = jobs_lib.reserve_job(
-        conn, "hermes", pid_a, subject, key, True)
-    try:
-        conn.rollback()
-    except Exception:
-        pass
+    _job_d, _created_d, err_d = admit_lib(
+        conn, subject, key, pid_a, True, "fp-a", True, False)
     assert err_d == "conflict"
     conn.close()
 
@@ -426,11 +395,11 @@ def test_job_transition_timestamps(tmp_path):
     conn = _make_db(db_path)
     pid = str(uuid.uuid4())
     _insert_plan(conn, pid)
-    conn.execute("BEGIN IMMEDIATE")
-    job_id, created, err = jobs_lib.reserve_job(
-        conn, "hermes", pid, "owner@example.invalid", "k-1", False)
+    support_lib.test_release_root()
+    job_id, created, err = admit_lib(
+        conn, "owner@example.invalid", "k-1", pid, False, "fp-test-1",
+        True, False)
     assert err == "" and created
-    conn.commit()
     row = conn.execute(
         "SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     assert row["created_at"]

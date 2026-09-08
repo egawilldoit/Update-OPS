@@ -32,12 +32,18 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
 
 from backend.app import db as db_lib
 from backend.app import jobs as jobs_lib
+from backend.app.admission import admit as admit_lib
 from backend.app.api import deps as deps_lib
 from backend.app.api import routes as routes_lib
 from backend.app.config import settings as settings_lib
+
+import support as support_lib
 
 
 # ---------------------------------------------------------------------------
@@ -581,25 +587,14 @@ def test_discovery_coalesce_cache_hit_force_and_active_gate(
     before = dict(fake.calls)
     conn = db_lib.connect(db_path)
     try:
-        plan_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
-        exp = (now + timedelta(seconds=600)).isoformat()
-        conn.execute("INSERT OR IGNORE INTO tools(id) VALUES('hermes')")
-        conn.execute(
-            "INSERT INTO plans(id,tool_id,subject,created_at,expires_at,"
-            "fingerprint,target,target_mode,channel,services,backup_scope,"
-            "activity_state,activity_evidence,used_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (plan_id, "hermes", "owner@example.invalid", now.isoformat(),
-             exp, "fp-x", "9.9.9", "exact", "c", json.dumps([]),
-             json.dumps({}), "idle", "", ""))
-        conn.commit()
-        conn.execute("BEGIN IMMEDIATE")
-        _jid, _created, _err = jobs_lib.reserve_job(
-            conn, "hermes", plan_id, "owner@example.invalid",
-            "coalesce-key-1", False)
-        assert _err == ""
-        conn.commit()
+        support_lib.test_release_root()
+        _prow = support_lib.v2_plan_row(
+            conn, str(uuid.uuid4()), subject="owner@example.invalid",
+            fingerprint="fp-x", activity_state="idle")
+        _jid, _created, _err = admit_lib(
+            conn, "owner@example.invalid", "coalesce-key-1",
+            _prow["id"], False, "fp-x", True, False)
+        assert _err == "", _err
     finally:
         conn.close()
     gated = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))

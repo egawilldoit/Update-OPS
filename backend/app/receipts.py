@@ -48,18 +48,42 @@ def _known_secrets():
 
 def _redact_str(value):
     # type: (object) -> object
+    # N12: receipt generation fails rather than persisting raw values.
     if not isinstance(value, str) or not value:
         return value
-    try:
-        from .sanitize import sanitize_text
+    from .sanitize import sanitize_text
+    return sanitize_text(value, _known_secrets())
 
-        return sanitize_text(value, _known_secrets())
-    except Exception:
+
+def _strict_int(value, field):
+    # type: (object, str) -> int
+    """Strict integer parsing (N02): zero is valid, missing/null/malformed
+    raise ValueError. Never `int(value or -1)` — that corrupts real zeros
+    and masks absent fields. Success fails closed on malformed input."""
+    if value is None:
+        raise ValueError("%s missing" % field)
+    if isinstance(value, bool):
+        raise ValueError("%s must be an integer" % field)
+    if isinstance(value, int):
         return value
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("%s must be an integer" % field)
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("%s missing" % field)
+        try:
+            return int(text, 10)
+        except ValueError:
+            raise ValueError("%s malformed: %r" % (field, value[:50]))
+    raise ValueError("%s has unsupported type" % field)
 
 
 def _parse_ts(raw):
     # type: (object) -> Any
+    """Parse an ISO-8601 timestamp (accepting trailing Z). None when bad."""
     if not isinstance(raw, str) or not raw.strip():
         return None
     text = raw.strip()
@@ -192,8 +216,12 @@ def validate_receipt(data):
         if not isinstance(data.get("after_version", ""), str) or \
                 not data.get("after_version", ""):
             return False, "after_version required for succeeded"
-        if int(data.get("installer_exit", -1) or -1) != 0:
-            return False, "succeeded requires installer_exit == 0"
+        try:
+            if _strict_int(data.get("installer_exit"), "installer_exit") \
+                    != 0:
+                return False, "succeeded requires installer_exit == 0"
+        except ValueError as exc:
+            return False, "succeeded: %s" % exc
         if not data.get("evidence_durable", False):
             return False, "succeeded requires evidence_durable"
         if data.get("target_mode") == "exact" and \
@@ -219,9 +247,16 @@ def validate_receipt(data):
     return True, ""
 
 
-def check_binding(data, job_row, filename_job_id=""):
-    # type: (Dict[str, Any], Dict[str, Any], str) -> Tuple[bool, str]
-    """Verify receipt == DB row == selecting filename == attempt."""
+def check_binding(data, job_row, plan_row=None, filename_job_id=""):
+    # type: (Dict[str, Any], Dict[str, Any], object, str) -> Tuple[bool, str]
+    """Verify receipt == filename == DB job == immutable plan (N03).
+
+    Binds: filename job ID, receipt job ID, DB job ID, tool ID, plan ID,
+    attempt nonce, plan hash, immutable release path, target, target
+    mode, and the expected mandatory-check manifest. A receipt cannot
+    weaken the plan (mandatory=true must stay true and passing for
+    success). plan_row None (missing plan) fails closed.
+    """
     try:
         rid = str(data.get("job_id", ""))
         if filename_job_id and rid != str(filename_job_id):
@@ -237,6 +272,57 @@ def check_binding(data, job_row, filename_job_id=""):
         if not stored_nonce or \
                 str(data.get("attempt_nonce", "")) != stored_nonce:
             return False, "receipt attempt does not match DB row"
+        if not isinstance(plan_row, dict) or not plan_row:
+            return False, "immutable plan row unavailable"
+        if str(data.get("plan_hash", "")) != \
+                str(plan_row.get("plan_hash", "") or "") or \
+                not plan_row.get("plan_hash"):
+            return False, "receipt plan hash does not match plan row"
+        if str(data.get("release_path", "")) != \
+                str(plan_row.get("release_path", "") or "") or \
+                not plan_row.get("release_path"):
+            return False, "receipt release does not match plan row"
+        if str(data.get("target", "")) != \
+                str(plan_row.get("target", "") or ""):
+            return False, "receipt target does not match plan row"
+        if str(data.get("target_mode", "")) != \
+                str(plan_row.get("target_mode", "") or ""):
+            return False, "receipt target mode does not match plan row"
+        try:
+            import json as _json
+            plan_required = list(_json.loads(
+                plan_row.get("required_checks_json", "[]") or "[]"))
+        except Exception:
+            return False, "plan check manifest unreadable"
+        receipt_expected = data.get("expected_checks", [])
+        if not isinstance(receipt_expected, list):
+            return False, "receipt check manifest malformed"
+        for name in plan_required:
+            if str(name) not in [str(x) for x in receipt_expected]:
+                return False, \
+                    "receipt drops plan-required check: %s" % str(name)[:100]
+        if str(data.get("state", "")) == "succeeded":
+            by_name = {}
+            for item in data.get("checks", []) or []:
+                if isinstance(item, dict) and item.get("name"):
+                    by_name[str(item.get("name"))] = item
+            for name in plan_required:
+                match = by_name.get(str(name))
+                if match is None:
+                    return False, \
+                        "plan-required check missing: %s" % str(name)[:100]
+                if not match.get("mandatory", False):
+                    return False, \
+                        "plan-required check weakened to non-mandatory: %s" \
+                        % str(name)[:100]
+                if match.get("result") != "pass":
+                    return False, \
+                        "plan-required check not passing: %s" % str(name)[:100]
+        if str(data.get("state", "")) == "succeeded":
+            if str(data.get("cleanup_status", "") or "") != "resolved":
+                return False, "cleanup not resolved"
+            if not data.get("evidence_durable", False):
+                return False, "evidence not durable"
     except Exception as exc:
         return False, "binding check crashed: %s" % exc
     return True, ""
@@ -303,7 +389,13 @@ def apply_receipt(conn, data, filename_job_id=""):
     if row is None:
         raise ValueError("unknown job: %s" % job_id)
     job = dict(row)
-    bound, why = check_binding(data, job, filename_job_id or job_id)
+    try:
+        plan = conn.execute("SELECT * FROM plans WHERE id=?",
+                            (job.get("plan_id", ""),)).fetchone()
+        plan_row = dict(plan) if plan is not None else None
+    except Exception:
+        plan_row = None
+    bound, why = check_binding(data, job, plan_row, filename_job_id or job_id)
     if not bound:
         raise ValueError("unbound receipt: %s" % why)
     state = str(data.get("state", ""))
@@ -333,13 +425,14 @@ def apply_receipt(conn, data, filename_job_id=""):
         if existing_names >= receipt_names:
             return state
     try:
-        exit_code = int(data.get("exit_code", 0))
-    except (TypeError, ValueError):
-        exit_code = 0
+        exit_code = _strict_int(data.get("exit_code", 0), "exit_code")
+    except ValueError as exc:
+        raise ValueError("invalid receipt: %s" % exc)
     try:
-        installer_exit = int(data.get("installer_exit", 0))
-    except (TypeError, ValueError):
-        installer_exit = 0
+        installer_exit = _strict_int(
+            data.get("installer_exit", 0), "installer_exit")
+    except ValueError as exc:
+        raise ValueError("invalid receipt: %s" % exc)
     update = {
         "after_version": str(data.get("after_version", "") or ""),
         "exit_code": exit_code,
@@ -364,7 +457,8 @@ def apply_receipt(conn, data, filename_job_id=""):
             event="receipt_applied",
             event_detail=str(data.get("ts", ""))[:200],
             checks=checks,
-            tool_id=str(data.get("tool_id", "")))
+            tool_id=str(data.get("tool_id", "")),
+            release_mutation=True)
     except TxError as exc:
         raise ValueError("receipt apply failed: %s" % exc)
     return str(new_row.get("state", state))

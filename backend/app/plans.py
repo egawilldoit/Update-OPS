@@ -43,7 +43,8 @@ def canonical_plan_hash(plan):
             "target", "target_mode", "channel", "services", "launch",
             "state_homes", "backup_scope", "backup_policy",
             "required_probes", "required_checks", "budgets", "space_fs",
-            "steps", "deadlines", "config_hash", "release_path")
+            "steps", "deadlines", "config_hash", "release_path",
+            "env_fingerprint")
     narrowed = {k: plan.get(k) for k in keys}
     return hashlib.sha256(_canon(narrowed).encode("utf-8")).hexdigest()
 
@@ -55,7 +56,8 @@ def build_plan_row(tool_id, subject, install_identity, fingerprint,
                    steps, deadlines, restart_impact, restart_detail,
                    activity_state, activity_ts, activity_evidence,
                    required_space_bytes, config_hash, release_path,
-                   created_at, expires_at, artifact=None):
+                   created_at, expires_at, artifact=None,
+                   env_fingerprint=""):
     # type: (...) -> Dict[str, Any]
     """Assemble the full plan row dict (caller INSERTs it)."""
     row = {
@@ -90,6 +92,7 @@ def build_plan_row(tool_id, subject, install_identity, fingerprint,
         "required_space_bytes": int(required_space_bytes or 0),
         "required_checks_json": _canon(list(required_checks or [])),
         "restart_impact": str(restart_impact or "")[:2000],
+        "env_fingerprint": str(env_fingerprint or ""),
     }
     row["plan_hash"] = canonical_plan_hash({
         "tool_id": row["tool_id"], "subject": row["subject"],
@@ -118,7 +121,8 @@ PLAN_INSERT_COLS = (
     "artifact_json,config_hash,plan_hash,launch_json,state_homes_json,"
     "backup_policy_json,required_probes_json,budgets_json,space_json,"
     "deadlines_json,restart_detail,activity_ts,release_path,"
-    "required_space_bytes,required_checks_json,restart_impact,steps_json"
+    "required_space_bytes,required_checks_json,restart_impact,steps_json,"
+    "env_fingerprint"
 )
 
 
@@ -145,7 +149,8 @@ def load_plan(conn, plan_id):
         raise PlanInvalid("unsupported plan_version %r; create a fresh plan"
                           % (plan.get("plan_version"),))
     for key in ("tool_id", "subject", "fingerprint", "target",
-                "target_mode", "plan_hash", "config_hash", "release_path"):
+                "target_mode", "plan_hash", "config_hash", "release_path",
+                "env_fingerprint"):
         if not plan.get(key):
             raise PlanInvalid("plan missing %s; create a fresh plan" % key)
     if plan.get("target_mode") not in ("exact", "native_latest"):
@@ -192,6 +197,7 @@ def _hash_view(plan):
         "deadlines": _loads(plan.get("deadlines_json"), {}),
         "config_hash": plan.get("config_hash", ""),
         "release_path": plan.get("release_path", ""),
+        "env_fingerprint": plan.get("env_fingerprint", ""),
     }
 
 

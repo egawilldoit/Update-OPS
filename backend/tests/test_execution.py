@@ -45,6 +45,9 @@ from backend.app.adapters import registry as registry_lib
 from backend.app.worker import dispatch as dispatch_lib
 from backend.app.worker import runner as runner_lib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import support as support_lib  # shared admission fixtures (N14)
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -68,35 +71,19 @@ def _make_db(path):
 def _insert_plan(conn, plan_id, tool_id="hermes", fingerprint="fp-test-1",
                  target="9.9.9", target_mode="exact", expires_future=True):
     # type: (...) -> None
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(seconds=600) if expires_future else \
-        now - timedelta(seconds=600)
-    conn.execute("INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
-    conn.execute(
-        "INSERT INTO plans(id,tool_id,subject,created_at,expires_at,"
-        "fingerprint,target,target_mode,channel,services,backup_scope,"
-        "activity_state,activity_evidence,used_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (plan_id, tool_id, "owner@example.invalid", now.isoformat(),
-         exp.isoformat(), fingerprint, target, target_mode, "test-channel",
-         json.dumps([]), json.dumps({}), "idle", "idle evidence", ""))
-    conn.commit()
+    support_lib.v2_plan_row(conn, plan_id, tool_id=tool_id,
+                            fingerprint=fingerprint, target=target,
+                            target_mode=target_mode,
+                            expires_future=expires_future)
 
 
 def _reserve(conn, tool_id="hermes", plan_id=None, subject="owner@example.invalid",
              idem_key=None, ack=False):
     # type: (...) -> str
-    if plan_id is None:
-        plan_id = str(uuid.uuid4())
-        _insert_plan(conn, plan_id, tool_id=tool_id)
-    if idem_key is None:
-        idem_key = "k-%s" % uuid.uuid4().hex[:8]
-    conn.execute("BEGIN IMMEDIATE")
-    job_id, created, err = jobs_lib.reserve_job(
-        conn, tool_id, plan_id, subject, idem_key, ack)
-    assert err == "" and created and job_id
-    conn.commit()
-    return job_id
+    # Single admission path (N14): all reservations go through admit().
+    return support_lib.admit_new(
+        conn, subject=subject, plan_id=plan_id, tool_id=tool_id,
+        fingerprint="fp-test-1", ack=ack, idem_key=idem_key)
 
 
 def _job_row(conn, job_id):
@@ -457,39 +444,42 @@ def test_is_timeout_result_matrix():
 
 
 def test_adapter_timeout_funnels_to_hard_timeout(monkeypatch):
-    calls = {"scope_kill": 0, "quiescent": 0}
+    from backend.app.worker import phase_run as phase_run_lib
+    calls = {"phases": [], "kills": 0, "quiescent": 0}
 
-    def _fake_kill_scope(self, scope):
-        calls["scope_kill"] += 1
+    def _fake_supervised(tool_id, job_id, phase, payload, timeout_s,
+                         settings, log_dir, emit, op="",
+                         cancel_event=None):
+        calls["phases"].append(phase)
+        if phase == "execute":
+            return False, {}, "phase deadline exceeded", True
+        if phase == "verify":
+            return True, {"version": "", "passed": False, "checks": [],
+                          "error_detail": "unavailable"}, "", False
+        raise AssertionError("unexpected phase %s" % phase)
 
-    def _fake_quiescent(self, scope):
-        calls["quiescent"] += 1
-        return True
-
-    monkeypatch.setattr(runner_lib.Runner, "_kill_scope", _fake_kill_scope)
-    monkeypatch.setattr(runner_lib.Runner, "_scope_quiescent",
-                        _fake_quiescent)
+    monkeypatch.setattr(phase_run_lib, "run_supervised_phase",
+                        _fake_supervised)
     monkeypatch.setattr(runner_lib, "_job_processes_alive", lambda j: [])
+    orig_hard = runner_lib.Runner._hard_timeout_recovery
 
-    class _TimeoutAdapter(object):
-        enabled = True
+    def _counting_hard(self, timeout_s, reason):
+        calls["kills"] += 1
+        # Skip delegated-service reads and recovery verify; assert the
+        # timeout flag path only.
+        self._timed_out = True
+        self._event("hard timeout (%s)" % reason)
 
-        def execute(self, plan, job_id, activity_ack=False):
-            return base_lib.ExecuteResult(
-                tool="hermes", exit_code=4, state="install_failed",
-                error_code="timeout", error_detail="timed out")
-
-        def verify(self):
-            return base_lib.VerifyResult(tool="hermes", version="",
-                                         checks=[], passed=False)
+    monkeypatch.setattr(runner_lib.Runner, "_hard_timeout_recovery",
+                        _counting_hard)
 
     r = runner_lib.Runner("job-timeout-1", "n")
     r.job = {"ack": ""}
-    r.adapter = _TimeoutAdapter()
     r.log = None
     out = r._do_execute(types.SimpleNamespace(), 30.0)
     assert out is None and r._timed_out is True
-    assert calls["scope_kill"] >= 1 and calls["quiescent"] >= 1
+    assert "execute" in calls["phases"]
+    assert calls["kills"] >= 1
 
 
 def test_finish_timeout_sets_recovery(tmp_path, monkeypatch):

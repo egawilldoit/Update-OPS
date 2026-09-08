@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import abc
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class InspectResult(BaseModel):
@@ -46,6 +46,11 @@ class ActivityResult(BaseModel):
 
 
 class PlanResult(BaseModel):
+    # extra="allow": explicitly attached procedure fields (daemon
+    # expectation, manual limitations, scope unit) survive validation so
+    # phase workers and runners see the identical contract (N10/R15).
+    model_config = ConfigDict(extra="allow")
+
     tool: str
     target: str = ""
     target_mode: str = "exact"

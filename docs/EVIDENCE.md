@@ -80,6 +80,19 @@ manual checklist below — no jsdom available). Tested commit for every row:
 2. `pytest backend/tests/test_ui_deploy.py` on the deploy host (seeded-DB retention matrix, wrapper/validator/ordering assertions).
 3. Live deploy rehearsal (maintenance protocol, validator gates, tunnel survival across API restart, frontend MC-01..MC-10) with environment recorded above.
 
+## Focused integration corrective addendum (N01–N18, main-agent pass)
+
+Previous baseline `2e0f898`. This pass: uncommitted at matrix-update
+time — exact resulting SHA recorded as `PENDING:final-sha` until the
+implementation commit lands (this marker is the explicit placeholder
+required before a SHA exists; the report carries the final SHA).
+Every row: `implemented-static`, result `NOT EXECUTED —
+IMPLEMENTATION PHASE`. No runtime PASS claimed. New regression
+artifact: `backend/tests/test_focused_corrective.py` (N01–N18 blocks)
+plus conversions of `test_execution.py`, `test_api_flows.py`,
+`test_update_console.py`, `test_core_corrective.py` to the shared
+admission service and receipts v2 binding.
+
 ## Main-agent core corrective addendum (senior review R01–R36, Gate A–C)
 
 Branch `feat/v1-implementation`, previous baseline `2e0f898`, this pass

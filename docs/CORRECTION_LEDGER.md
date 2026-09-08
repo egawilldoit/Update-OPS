@@ -52,3 +52,33 @@ Ownership: main agent owns shared schema/migrations/contracts/DB/worker/
 runner/supervisor/config/receipts/retention-hook/API-core; adapter contributor
 owns adapters/* + semver.py; UI/deploy contributor owns frontend/*,
 scripts/*, systemd/*, deploy/*, retention.py, docs/RUNBOOK.md, docs/EVIDENCE.md.
+
+# Focused integration corrections (N01–N18, this pass)
+
+Statuses: implemented-static only. No verified/accepted/passed.
+
+| ID | Root-cause fix | Files | Regression tests |
+| --- | --- | --- | --- |
+| N01 | Canonical quiescence schema (`quiescence.assess_quiescence`) + `status --require-quiescent/--require-ready` exit codes; scripts consume exits only | `quiescence.py`, `units.py` (list/enumerate), `cli.py`, `install.sh`, `upgrade.sh` | `test_focused_corrective.py` N01 block (6) |
+| N02 | `_strict_int` (zero valid; missing/null/malformed raise); success fail-closed | `receipts.py` | N02 block (3) |
+| N03 | Binding extended to plan row (hash/release/target/mode/manifest), mandatory-non-weakening, cleanup/evidence/version/exit/outcome checks; contradictions refuse | `receipts.py`, `dispatch.py`, `reconcile.py` | N03 block |
+| N04 | `migrate()` only via `db` module CLI (deploy) + tests; services validate only; allowed callers documented | `db.py`, `runner.py`, `dispatch.py`, `main.py`, scripts | N04 source test |
+| N05 | Column-aware applier, one explicit tx per migration, ledger last; rerun/resume safe | `db.py` | N05 block (3) |
+| N06 | `validate_schema` zero DDL/DML; absent ledger = pending | `db.py` | N06 block |
+| N07 | LoadState-gated stopped proof; not-found removal proof; MainPID-0/cgroup-unreadable never decide; duplicate `_prove_launch` removed | `units.py`, `dispatch.py` | N07 block (3) |
+| N08 | `execution_leases` (migration 004): atomic probe leases, non-expiring mutation leases, reclaim-only-probes; dispatcher + admission wired | `leases.py`, `004_leases_env.sql`, `dispatch.py`, `admission.py` | N08 block (2) |
+| N09 | Canonical env fingerprint bound into plans; dispatcher bus env at startup; NoNewPrivileges parity already present | `owner_env.py`, `plans.py`, `routes.py`, `runner.py`, `dispatch.py` | N09 block (2) |
+| N10 | `phase_run.py`: worker process per phase in owned scope; coordinator kills scope, proves empty; no thread supervision; dispatcher probes supervised too | `phase_run.py`, `runner.py`, `dispatch.py`, `base.py` (extra=allow) | N10 block (2, bus-gated) |
+| N11 | `run_fixed` fails closed (127, no fallback); subprocess inventory documented | `registry.py`, ledger | N11 block (2) |
+| N12 | Suppression markers / hard failure instead of raw: registry strict helper, receipts raise, dispatch error result, CLI fixed message | `registry.py`, `receipts.py`, `dispatch.py`, `cli.py` | N12 block (3) |
+| N13 | `tx.transition_tx` boundary sanitization (event/checks/evidence cols) → TxError fail-closed; API exc details sanitized | `tx.py`, `routes.py` | N13 block |
+| N14 | `admission.admit` shared by routes+CLI; replay-first incl. drain/recovery; `reserve_job` deleted | `admission.py`, `routes.py`, `cli.py`, `jobs.py`, tests | N14 block (4) |
+| N15 | Job INSERT + plan used_at + mutation lease + event in one tx; injected-failure rollback proven | `admission.py`, `tx.py` (lease release) | N15 block |
+| N16 | `config_cli get/json` single parser; scripts converted; typo keys fail | `config_cli.py`, `install.sh`, `upgrade.sh` | N16 block (2) |
+| N17 | `validate-archive.py` member inspection; pre-extraction gates in both scripts; checkout validator (never tarball code) | `validate-archive.py`, `install.sh`, `upgrade.sh` | N17 block (5) |
+| N18 | This section + EVIDENCE addendum with PENDING:final-sha marker | ledger, `docs/EVIDENCE.md` | N18 block |
+
+Cleanup disposition:
+- duplicate `_prove_launch`: removed (single implementation kept).
+- transient unit/documentation parity: `owner_env.build_transient_cmd` (+ scope names) is the single source; both templates match (KillMode/Restart/env/wd/interpreter/job+nonce); dispatch delegates; RUNBOOK already full-UUID.
+- atomic claim deadline: single-statement predicate (`claim_deadline>now`, empty refuses); Python pre-read removed.

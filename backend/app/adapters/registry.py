@@ -23,7 +23,6 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 from typing import Dict, List, Optional, Tuple
 
 TOOL_IDS = ("hermes", "opencode", "codex", "t3")
@@ -160,8 +159,8 @@ def _executor_run_stream(argv, timeout_s, cwd=None, env=None, scope_unit=None,
 
     Imported lazily inside run_fixed so monkeypatching
     backend.app.executor.run_stream in tests affects this path. Raises
-    ImportError/AttributeError when the main-agent executor is unavailable
-    so callers fall back to the bounded subprocess path (offline).
+    ImportError/AttributeError when the canonical executor is unavailable;
+    run_fixed then fails closed (exit 127, no unsupervised fallback).
     """
     import importlib as _importlib
 
@@ -187,9 +186,9 @@ def run_fixed(argv, timeout=60, cwd=None, scope_unit=None, env=None,
 
     env is an explicit dict or None (never os.environ passthrough).
     Never raises on nonzero exit; missing executable and timeouts are
-    reported (exit 127 / timed_out=True). Falls back to bounded
-    subprocess.run only when the executor module is unavailable
-    (main-agent pending); the delegated path is authoritative.
+    reported (exit 127 / timed_out=True). When the canonical executor is
+    unavailable the call fails closed (exit 127) — there is deliberately
+    no unsupervised subprocess fallback (N11).
     """
     argv = _check_argv(argv)
     try:
@@ -224,39 +223,14 @@ def run_fixed(argv, timeout=60, cwd=None, scope_unit=None, env=None,
             _err = ""
         return ProcResult(argv, _exit, _out, _err, timed_out=_timed)
     except (ImportError, AttributeError):
-        pass
+        # N11: no unsupervised fallback. When the canonical executor is
+        # unavailable the probe/mutation fails closed (exit 127) instead
+        # of silently changing supervision semantics via subprocess.run.
+        return ProcResult(
+            argv, 127, "",
+            "executor unavailable; refusing unsupervised execution")
     except Exception as exc:
         return ProcResult(argv, 127, "", "executor delegation failed: %s" % exc)
-    try:
-        proc = subprocess.run(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            timeout=_to,
-            shell=False,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        out = (exc.stdout or b"")[:_cap]
-        err = (exc.stderr or b"")[:_cap]
-        return ProcResult(
-            argv, 124,
-            out.decode("utf-8", errors="replace"),
-            err.decode("utf-8", errors="replace"),
-            timed_out=True,
-        )
-    except FileNotFoundError as exc:
-        return ProcResult(argv, 127, "", "missing executable: %s" % exc)
-    except OSError as exc:
-        return ProcResult(argv, 127, "", "spawn failed: %s" % exc)
-    out = (proc.stdout or b"")[:_cap]
-    err = (proc.stderr or b"")[:_cap]
-    return ProcResult(
-        argv, proc.returncode,
-        out.decode("utf-8", errors="replace"),
-        err.decode("utf-8", errors="replace"),
-    )
 
 
 def resolve_executable(path):
@@ -481,10 +455,9 @@ def sanitize_evidence(text, secrets=None):
     # type: (object, object) -> str
     """Sanitize EVERY persisted/returned string via sanitize.sanitize_text.
 
-    Frozen contract: backend/app/sanitize.py sanitize_text(s, secrets)->str.
-    Falls back to redaction.redact_text then str() when the sanitizer module
-    is unavailable (main-agent pending). Never raises; never returns raw
-    tool output unsanitized when the sanitizer exists.
+    Fail-closed (N12): any sanitizer failure returns a fixed suppression
+    marker — NEVER raw tool output. Callers needing hard failure (receipts,
+    transactions, CLI envelopes) use sanitize_evidence_strict instead.
     """
     try:
         import importlib as _importlib
@@ -495,31 +468,38 @@ def sanitize_evidence(text, secrets=None):
             try:
                 return str(_fn(str(text or ""), tuple(secrets or ())))  # type: ignore[arg-type]
             except TypeError:
-                try:
-                    return str(_fn(str(text or "")))
-                except Exception:
-                    pass
+                return str(_fn(str(text or "")))
     except Exception:
         pass
     try:
-        import importlib as _importlib2
+        from backend.app.sanitize import SUPPRESSED_MARKER as _marker
+        return _marker + " (sanitization failed)"
+    except Exception:
+        return "[suppressed: sanitization failed]"
 
-        _mod2 = _importlib2.import_module("backend.app.redaction")
-        _fn2 = getattr(_mod2, "redact_text", None)
-        if callable(_fn2):
-            try:
-                return str(_fn2(str(text or ""), tuple(secrets or ())))
-            except Exception:
-                try:
-                    return str(_fn2(str(text or "")))
-                except Exception:
-                    pass
-    except Exception:
+
+def sanitize_evidence_strict(text, secrets=None):
+    # type: (object, object) -> str
+    """Like sanitize_evidence but raises SanitizerError on failure (N12).
+
+    For receipts, transaction evidence, and CLI envelopes where a marker
+    is insufficient and the operation itself must fail.
+    """
+    import importlib as _importlib
+
+    _mod = _importlib.import_module("backend.app.sanitize")
+    _fn = getattr(_mod, "sanitize_text", None)
+    if not callable(_fn):
+        raise ImportError("sanitize.sanitize_text unavailable")
+    _err = getattr(_mod, "SanitizerError", Exception)
+    try:
+        return str(_fn(str(text or ""), tuple(secrets or ())))  # type: ignore[arg-type]
+    except TypeError:
         pass
     try:
-        return str(text or "")
-    except Exception:
-        return ""
+        return str(_fn(str(text or "")))
+    except Exception as exc:
+        raise _err("sanitize failed: %s" % exc)
 
 
 def get_tool_inventory(tool_id):

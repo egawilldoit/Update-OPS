@@ -56,11 +56,15 @@ def _utcnow():
 def _emit_envelope(tool, action, job_id="", state="", exit_mapped=0,
                    error_code="", detail=""):
     # type: (...) -> None
+    # N12: diagnostic detail that cannot be sanitized becomes a fixed
+    # safe message — never raw exception strings that may carry secrets.
+    # Shape is preserved (dicts stay dicts for the machine-readable
+    # quiescence schema); only the failure path collapses to a string.
     try:
         from .sanitize import sanitize_json
         detail = sanitize_json(detail, ())
     except Exception:
-        pass
+        detail = "detail withheld: sanitization failed"
     payload = {
         "schema_version": 1,
         "tool": tool or "",
@@ -196,11 +200,8 @@ def cmd_plan(args):
 def cmd_apply(args):
     # type: (object) -> int
     """Reserve + observe canonical dispatch. Never runs the runner."""
-    import sqlite3
-
     from . import jobs as _jobs
     from .db import connect
-    from . import plans as _plans
 
     try:
         settings = _load_settings()
@@ -225,76 +226,78 @@ def cmd_apply(args):
                        exit_mapped=EXIT_INTERRUPTED)
         return EXIT_INTERRUPTED
     try:
+        # One shared admission service (N14): identical semantics to the
+        # API path. Fresh owner evidence comes from the probe queue
+        # (dispatcher canonical env — never this SSH login environment).
+        from .admission import admit
+        from .owner_probes import await_probe, enqueue_probe
         try:
-            plan = _plans.load_plan(conn, plan_id)
-        except _plans.PlanNotFound:
-            _emit_envelope(args.tool, "apply", error_code="invalid_request",
-                           detail="unknown plan", exit_mapped=EXIT_INVALID)
-            return EXIT_INVALID
-        except _plans.PlanInvalid as exc:
-            _emit_envelope(args.tool, "apply", error_code="stale_plan",
-                           detail=str(exc)[:300],
-                           exit_mapped=EXIT_BLOCKED)
-            return EXIT_BLOCKED
-        tool_id = plan.get("tool_id", "")
-        if args.tool and args.tool != tool_id:
-            _emit_envelope(args.tool, "apply", error_code="invalid_request",
-                           detail="tool/plan mismatch",
-                           exit_mapped=EXIT_INVALID)
-            return EXIT_INVALID
-        subject = plan.get("subject", "") or ",".join(
-            getattr(settings, "owner_emails", []) or [])
-        # Idempotency first (R14): replay precedes admission conditions.
-        digest = _jobs.request_hash(plan_id, ack)
-        existing = _jobs.find_replay(conn, subject, key)
-        if existing is not None:
-            if (existing["request_hash"] or "") == digest:
-                job_id = existing["id"]
-                created_new = False
-            else:
-                _emit_envelope(tool_id, "apply", error_code="conflict",
-                               detail="key used with different payload",
-                               exit_mapped=EXIT_BLOCKED)
-                return EXIT_BLOCKED
-        else:
-            if _jobs.recovery_blocked(conn):
-                _emit_envelope(tool_id, "apply",
-                               error_code="recovery_required",
-                               detail="recovery required",
-                               exit_mapped=EXIT_BLOCKED)
-                return EXIT_BLOCKED
-            if _jobs.active_job(conn) is not None:
-                _emit_envelope(tool_id, "apply", error_code="busy",
-                               detail="another update is active",
-                               exit_mapped=EXIT_BLOCKED)
-                return EXIT_BLOCKED
+            subject = ",".join(
+                getattr(settings, "owner_emails", []) or [])
+            if not subject:
+                _prow = conn.execute(
+                    "SELECT subject FROM plans WHERE id=?",
+                    (plan_id,)).fetchone()
+                subject = str(dict(_prow).get("subject", "")) \
+                    if _prow else ""
+        except Exception:
+            subject = ""
+        try:
+            request_id = enqueue_probe(conn, subject, "", "inspect")
+        except Exception:
+            request_id = ""
+        _fp_status, _fp_payload = ("error", {})
+        _tool_probe = ""
+        if request_id:
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                job_id, created_new, err = _jobs.reserve_job(
-                    conn, tool_id, plan_id, subject, key, ack)
-                if err:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    _emit_envelope(tool_id, "apply", error_code=err,
-                                   detail="reservation refused",
-                                   exit_mapped=EXIT_BLOCKED)
-                    return EXIT_BLOCKED
-                conn.execute("UPDATE plans SET used_at=? WHERE id=?",
-                             (_utcnow(), plan_id))
-                conn.commit()
-            except Exception as exc:
+                plan_probe = conn.execute(
+                    "SELECT tool_id FROM plans WHERE id=?",
+                    (plan_id,)).fetchone()
+                _tool_probe = str(dict(plan_probe).get("tool_id", "")
+                                  ) if plan_probe else ""
+            except Exception:
+                _tool_probe = ""
+            if _tool_probe:
                 try:
-                    conn.rollback()
+                    conn.execute(
+                        "UPDATE probe_requests SET tool_id=? WHERE id=?",
+                        (_tool_probe, request_id))
+                    conn.commit()
                 except Exception:
                     pass
-                _emit_envelope(tool_id, "apply", error_code="unavailable",
-                               detail="reservation failed: %s" % exc,
-                               exit_mapped=EXIT_INTERRUPTED)
-                return EXIT_INTERRUPTED
+                _fp_status, _fp_payload = await_probe(
+                    conn, request_id, timeout_s=30.0)
+        if _fp_status != "ok":
+            _emit_envelope(args.tool, "apply", error_code="unavailable",
+                           detail="installation revalidation unavailable",
+                           exit_mapped=EXIT_INTERRUPTED)
+            return EXIT_INTERRUPTED
+        try:
+            _hb = _jobs.read_dispatcher_heartbeat(
+                getattr(settings, "state_dir", ""), max_age_s=20)
+        except Exception:
+            _hb = {}
+        try:
+            _drained = os.path.exists(os.path.join(
+                str(getattr(settings, "state_dir", "") or ""), "drain"))
+        except Exception:
+            _drained = False
+        job_id, created_new, err = admit(
+            conn, subject, key, plan_id, ack,
+            str(_fp_payload.get("fingerprint", "") or ""),
+            bool(_hb), bool(_drained))
+        if err:
+            _emit_envelope(args.tool or _tool_probe, "apply",
+                           error_code=err,
+                           detail="admission refused: %s" % err,
+                           exit_mapped=EXIT_BLOCKED
+                           if err not in ("invalid_request", "not_found")
+                           else EXIT_INVALID)
+            return EXIT_BLOCKED \
+                if err not in ("invalid_request", "not_found") \
+                else EXIT_INVALID
         if not created_new:
-            _emit_envelope(tool_id, "apply", job_id=job_id,
+            _emit_envelope(_tool_probe, "apply", job_id=job_id,
                            state="replayed", exit_mapped=EXIT_OK,
                            detail="idempotent replay")
             return EXIT_OK
@@ -309,7 +312,7 @@ def cmd_apply(args):
             except Exception:
                 row = None
             if row is None:
-                _emit_envelope(tool_id, "apply", job_id=job_id,
+                _emit_envelope(args.tool or _tool_probe, "apply", job_id=job_id,
                                state="unknown", error_code="unavailable",
                                detail="reservation lost",
                                exit_mapped=EXIT_INTERRUPTED)
@@ -318,14 +321,14 @@ def cmd_apply(args):
             if last_state in ("succeeded", "blocked", "failed",
                               "health_failed", "interrupted"):
                 code = STATE_TO_EXIT.get(last_state, EXIT_INTERRUPTED)
-                _emit_envelope(tool_id, "apply", job_id=job_id,
+                _emit_envelope(args.tool or _tool_probe, "apply", job_id=job_id,
                                state=last_state,
                                error_code=str(row["error_code"] or ""),
                                exit_mapped=code,
                                detail="canonical dispatch completed")
                 return code
             if deadline is not None and time.monotonic() >= deadline:
-                _emit_envelope(tool_id, "apply", job_id=job_id,
+                _emit_envelope(args.tool or _tool_probe, "apply", job_id=job_id,
                                state=last_state,
                                detail="wait budget exhausted; job continues"
                                       " under dispatcher",
@@ -341,9 +344,19 @@ def cmd_apply(args):
 
 def cmd_status(args):
     # type: (object) -> int
-    """Quiescence report for deploy scripts (R33). Read-only."""
+    """Quiescence report for deploy scripts (N01/R33). Read-only.
+
+    Canonical schema (see backend/app/quiescence.py — the ONLY shape
+    deploy scripts consume):
+      detail{worker_alive, active_job, unresolved_jobs, recovery_jobs,
+             unresolved_units, live_units, delegated_operations, drain,
+             quiescent, reasons}
+    --require-quiescent exits 0 only when proven quiescent, 3 otherwise,
+    so deployment relies on the process exit, not shell JSON parsing.
+    """
     from . import jobs as _jobs
     from .db import connect
+    from .quiescence import QUIESCENCE_SCHEMA_VERSION, assess_quiescence
 
     try:
         settings = _load_settings()
@@ -360,34 +373,41 @@ def cmd_status(args):
                        exit_mapped=EXIT_INTERRUPTED)
         return EXIT_INTERRUPTED
     try:
-        hb = _jobs.read_dispatcher_heartbeat(
-            getattr(settings, "state_dir", ""), max_age_s=20)
-        active = _jobs.active_job(conn)
-        drain = os.path.exists(os.path.join(
-            str(getattr(settings, "state_dir", "") or ""), "drain"))
-        unresolved = []
-        try:
-            rows = conn.execute(
-                "SELECT id FROM jobs WHERE unresolved=1").fetchall()
-            unresolved = [str(r["id"]) for r in rows]
-        except Exception:
-            pass
-        detail = {
-            "worker_alive": bool(hb),
-            "active_job": (dict(active).get("id", "") if active else ""),
-            "unresolved": unresolved,
-            "drain": bool(drain),
-            "quiescent": bool(hb) and active is None
-            and not unresolved,
-        }
-        _emit_envelope("", "status", state="ok", detail=detail,
-                       exit_mapped=EXIT_OK)
-        return EXIT_OK
+        assessment = assess_quiescence(conn, settings)
+    except Exception as exc:
+        _emit_envelope("", "status", error_code="unavailable",
+                       detail="quiescence assessment crashed: %s" % exc,
+                       exit_mapped=EXIT_INTERRUPTED)
+        return EXIT_INTERRUPTED
     finally:
         try:
             conn.close()
         except Exception:
             pass
+    assessment = dict(assessment)
+    assessment["schema_version"] = QUIESCENCE_SCHEMA_VERSION
+    quiescent = bool(assessment.get("quiescent", False))
+    if getattr(args, "require_quiescent", False):
+        if quiescent:
+            _emit_envelope("", "status", state="quiescent",
+                           detail=assessment, exit_mapped=EXIT_OK)
+            return EXIT_OK
+        _emit_envelope(
+            "", "status", state="blocked", error_code="not_quiescent",
+            detail=assessment, exit_mapped=EXIT_BLOCKED)
+        return EXIT_BLOCKED
+    if getattr(args, "require_ready", False):
+        if bool(assessment.get("worker_alive", False)):
+            _emit_envelope("", "status", state="ready",
+                           detail=assessment, exit_mapped=EXIT_OK)
+            return EXIT_OK
+        _emit_envelope(
+            "", "status", state="blocked", error_code="worker_not_ready",
+            detail=assessment, exit_mapped=EXIT_BLOCKED)
+        return EXIT_BLOCKED
+    _emit_envelope("", "status", state="ok", detail=assessment,
+                   exit_mapped=EXIT_OK)
+    return EXIT_OK
 
 
 def cmd_retention(args):
@@ -465,6 +485,10 @@ def build_parser():
     p.add_argument("--wait-secs", type=int, default=3600)
     p.set_defaults(func=cmd_apply)
     p = sub.add_parser("status")
+    p.add_argument("--require-quiescent", action="store_true",
+                   help="exit 0 only when quiescence is proven, else 3")
+    p.add_argument("--require-ready", action="store_true",
+                   help="exit 0 only when the worker is alive, else 3")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("retention")
     p.set_defaults(func=cmd_retention)

@@ -1,13 +1,11 @@
-"""Job reservation, idempotency, and recovery helpers. Python 3.10 compatible.
+"""Job helpers: idempotency lookup, claims, recovery queries (N14).
 
-Rules (SPEC §7-§8):
-- ``UNIQUE(subject, idempotency_key)``; same key + same payload returns the
-  original job; same key + different payload is 409.
-- At most one nonterminal update job via partial unique index
-  (``ux_jobs_single_active``); competing requests get 409 immediately, never wait.
-- ``recovery_required`` blocks new jobs until the SSH-only reconcile command
-  clears it after proving no updater remains. Never cleared by heartbeat age.
-- Terminal state alone does not clear a live runner or recovery block.
+The ONE canonical admission path is backend/app/admission.py admit()
+(reservation + plan consume + mutation lease in a single transaction).
+This module holds the small composable helpers admission and the worker
+use: request hashing, replay lookup, active/recovery queries, atomic
+nonce claim + attempt consume, safe expiry, heartbeats. There is no
+second reservation implementation here.
 """
 from __future__ import annotations
 
@@ -16,7 +14,6 @@ import hashlib
 import json
 import os
 import sqlite3
-import uuid
 from typing import Dict, Optional, Tuple
 
 from .schemas import utcnow_iso
@@ -43,62 +40,6 @@ def recovery_blocked(conn):
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM jobs WHERE recovery_required=1").fetchone()
     return bool(row and row["n"] > 0)
-
-
-def reserve_job(conn, tool_id, plan_id, subject, idem_key, ack):
-    # type: (sqlite3.Connection, str, str, str, str, bool) -> Tuple[str, bool, str]
-    """Returns (job_id, created_new, error_code). Empty error_code on success.
-
-    Caller must hold a short write transaction (IMMEDIATE) and commit/rollback
-    promptly; never hold across a subprocess.
-    """
-    if recovery_blocked(conn):
-        return "", False, "recovery_required"
-    digest = request_hash(plan_id, ack)
-    existing = conn.execute(
-        "SELECT * FROM jobs WHERE subject=? AND idempotency_key=?",
-        (subject, idem_key)).fetchone()
-    if existing is not None:
-        if existing["request_hash"] == digest:
-            return existing["id"], False, ""
-        return "", False, "conflict"
-    if active_job(conn) is not None:
-        return "", False, "busy"
-    job_id = str(uuid.uuid4())
-    now = utcnow_iso()
-    try:
-        from .config import settings as _settings
-        _window = float(getattr(_settings, "worker_claim_s", 10) or 10)
-    except Exception:
-        _window = 10.0
-    claim_deadline = _claim_deadline_from(now, _window)
-    plan = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
-    before = ""
-    if plan is not None:
-        tool = conn.execute("SELECT * FROM tools WHERE id=?",
-                            (plan["tool_id"],)).fetchone()
-        before = tool["observed_version"] if tool else ""
-    try:
-        conn.execute(
-            "INSERT INTO jobs(id,tool_id,plan_id,subject,idempotency_key,"
-            "request_hash,state,step,before_version,created_at,ack,"
-            "claim_deadline)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, tool_id, plan_id, subject, idem_key, digest,
-             "accepted", "accepted", before, now,
-             "ack" if ack else "", claim_deadline))
-        conn.execute(
-            "INSERT INTO events(job_id,created_at,event_type,detail)"
-            " VALUES(?,?,?,?)", (job_id, now, "accepted", "reserved"))
-    except sqlite3.IntegrityError:
-        # Lost a race: re-read to distinguish idempotent replay vs busy.
-        row = conn.execute(
-            "SELECT * FROM jobs WHERE subject=? AND idempotency_key=?",
-            (subject, idem_key)).fetchone()
-        if row is not None and row["request_hash"] == digest:
-            return row["id"], False, ""
-        return "", False, "busy"
-    return job_id, True, ""
 
 
 def transition(conn, job_id, to_state, step="", error_code="", error_detail="",
@@ -182,70 +123,58 @@ def _claim_deadline_from(created_at_iso, deadline_s):
         return ""
 
 
-def claim_with_nonce(conn, job_id, nonce, unit="", release_path="",
-                     claim_deadline_s=10):
+def claim_with_nonce(conn, job_id, nonce, unit="", release_path=""):
     # type: (...) -> bool
-    """Atomically claim an accepted job (R03/R17).
+    """Atomically claim an accepted job (R03/R17/N-wave-3).
 
-    Sets dispatch_nonce + canonical unit + release + preflight state in one
-    UPDATE guarded by state='accepted', unclaimed nonce, AND the claim
-    deadline (created_at/claim_deadline + window). A worker past its
-    deadline cannot claim; the row stays accepted for safe expiry.
+    ONE UPDATE statement enforces every predicate — no read/compare in
+    Python followed by a later unguarded write:
+      state='accepted' AND nonce empty-or-same AND attempt unclaimed AND
+      now <= stored claim_deadline.
+    claim_deadline is ISO-8601 +00:00 on both sides so the lexical
+    comparison orders correctly. Empty deadlines refuse (fail closed;
+    the safe-expiry path blocks such rows via created_at). Sets
+    dispatch_nonce + canonical unit + release + preflight atomically.
     Returns True only when this call performed the claim.
     """
     if not isinstance(nonce, str) or not nonce:
         return False
+    if not job_id:
+        return False
     if not unit:
-        unit = "ega-update-job-%s.service" % (job_id or "").replace("-", "")
-    now = utcnow_iso()
-    try:
-        row = conn.execute(
-            "SELECT created_at, claim_deadline, dispatch_nonce, state"
-            " FROM jobs WHERE id=?", (job_id,)).fetchone()
-    except Exception:
-        return False
-    if row is None:
-        return False
-    try:
-        state = row["state"]
-        stored = row["dispatch_nonce"] or ""
-    except Exception:
-        return False
-    if state != "accepted" or (stored not in ("", nonce)):
-        return False
-    try:
-        deadline_raw = row["claim_deadline"] or ""
-    except Exception:
-        deadline_raw = ""
-    if not deadline_raw:
         try:
-            created_raw = row["created_at"] or ""
+            unit = "ega-update-job-%s.service" % \
+                str(job_id).replace("-", "")
         except Exception:
-            created_raw = ""
-        try:
-            window = float(claim_deadline_s)
-        except (TypeError, ValueError):
-            window = 10.0
-        deadline_raw = _claim_deadline_from(created_raw, window)
-    if deadline_raw and deadline_raw <= now:
-        return False
+            return False
+    now = utcnow_iso()
     try:
         cur = conn.execute(
             "UPDATE jobs SET dispatch_nonce=?, state='preflight',"
             " step='preflight', started_at=?, heartbeat=?,"
             " runner_unit=?, canonical_unit=?, release_path=?"
             " WHERE id=? AND state='accepted'"
-            " AND (dispatch_nonce='' OR dispatch_nonce=?)",
+            " AND (dispatch_nonce='' OR dispatch_nonce IS NULL"
+            " OR dispatch_nonce=?)"
+            " AND attempt_claimed=0"
+            " AND claim_deadline<>'' AND claim_deadline>?",
             (nonce, now, now, unit, unit, release_path or "", job_id,
-             nonce))
+             nonce, now))
     except sqlite3.OperationalError:
         return False
     if cur.rowcount != 1:
         return False
-    conn.execute(
-        "INSERT INTO events(job_id,created_at,event_type,detail)"
-        " VALUES(?,?,?,?)", (job_id, now, "claimed", unit))
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO events(job_id,created_at,event_type,detail)"
+            " VALUES(?,?,?,?)", (job_id, now, "claimed", unit))
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
     return True
 
 
@@ -324,6 +253,17 @@ def expire_stale_accepted(conn, deadline_s=10):
                     "INSERT INTO events(job_id,created_at,event_type,detail)"
                     " VALUES(?,?,?,?)",
                     (job_id, now, "blocked", "worker_unavailable"))
+                # The unclaimed reservation held a mutation lease from
+                # admission: release it in the same commit so no ghost
+                # lease can wedge future admissions (N08).
+                try:
+                    conn.execute(
+                        "UPDATE execution_leases SET released_at=?"
+                        " WHERE kind='mutation' AND job_id=?"
+                        " AND released_at=''",
+                        (now, job_id))
+                except Exception:
+                    pass
         except Exception:
             continue
     if expired:
