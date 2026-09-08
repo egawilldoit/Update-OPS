@@ -443,7 +443,7 @@ def recovery_required_for_outcome(state, receipt=None,
                                     prior_state="",
                                     execution_quiescent=False):
     # type: (str, object, bool, bool, str, bool) -> Tuple[bool, str]
-    """One canonical reconciliation recovery decision (H05).
+    """One canonical reconciliation recovery decision (H05 final).
 
     Mutation occurrence alone NEVER implies recovery: a fully proven
     successful terminal outcome with full quiescence is resolved
@@ -452,8 +452,15 @@ def recovery_required_for_outcome(state, receipt=None,
     "may mutation have occurred"; THIS answers "is manual
     recovery/review required". Returns (required, reason).
 
+    Precedence (H05 final): a fully valid resolving success proof is
+    considered FIRST — historical unresolved/recovery markers may
+    block UNTIL authoritative resolution exists, but must not survive
+    a stronger successful proof. unresolved=True is evidence of past
+    uncertainty, not an irreversible recovery verdict.
+
     Policy (all callers — dispatcher, SSH, boot — share it):
-    - unresolved prior flag: True (prior uncertainty survives).
+    - fully proven success (below): False, even with unresolved=True.
+    - unresolved prior flag without resolving proof: True.
     - valid bound receipt with state=succeeded, disposition none,
       applied state=succeeded, execution proven quiescent: False.
       already_current is a success outcome (SUCCESS_OUTCOMES) under
@@ -478,8 +485,6 @@ def recovery_required_for_outcome(state, receipt=None,
         anchor = str(prior_state or current or "")
     except Exception:
         anchor = current
-    if bool(unresolved):
-        return True, "unresolved flag set; prior uncertainty survives"
     try:
         valid = bool(receipt_valid) and isinstance(receipt, dict)
     except Exception:
@@ -498,6 +503,10 @@ def recovery_required_for_outcome(state, receipt=None,
             mutated = bool(_shows(receipt))
         except Exception:
             mutated = False
+    # H05 final: resolving success is decided BEFORE historical
+    # uncertainty. A fully validated bound succeeded receipt plus
+    # independently proven execution quiescence resolves old
+    # unresolved/recovery markers; it never preserves them.
     if valid and rstate == "succeeded" and current == "succeeded":
         if disp != "none":
             return True, \
@@ -507,8 +516,9 @@ def recovery_required_for_outcome(state, receipt=None,
             return True, \
                 "success without proven execution quiescence"
         return False, \
-            "proven success: valid bound receipt, disposition none, " \
-            "execution quiescent"
+            "proven successful outcome resolves prior uncertainty"
+    if bool(unresolved):
+        return True, "historical uncertainty remains unresolved"
     if valid and rstate == "blocked" and current == "blocked" \
             and disp != "required":
         return False, "blocked before mutation; nothing to recover"

@@ -277,7 +277,14 @@ def main(argv=None):
     # Unit confirmed stopped from here on.
     if action == "apply-receipt" and receipt_view is not None:
         try:
-            applied = apply_receipt(conn, receipt_view, args.job_id)
+            # H05 final: resolved-success mode. This branch runs only
+            # after the same full quiescence proof as the dispatcher
+            # (unit + phase scopes + processes + delegated), so the
+            # apply clears historical unresolved/recovery markers
+            # atomically for a clean succeeded receipt. Manual
+            # --clear-recovery stays for ambiguous failure cases.
+            applied = apply_receipt(conn, receipt_view, args.job_id,
+                                    execution_quiescent=True)
             print("applied bound receipt: state=%s" % applied)
             state = applied
         except ValueError as exc:

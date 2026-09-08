@@ -1040,6 +1040,282 @@ def test_h05_success_releases_and_second_admits(tmp_path, monkeypatch):
     conn.close()
 
 
+# -- H05 final: proven success resolves historical uncertainty -----------------
+
+def _crash_row(conn, job_id, state="verifying"):
+    """Simulate a crash before terminal DB completion: uncertainty
+    flags set while the mutation lease is still held."""
+    conn.execute("UPDATE jobs SET state=?, step=?, unresolved=1,"
+                 " recovery_required=1 WHERE id=?",
+                 (state, state, job_id))
+    conn.commit()
+
+
+def _success_receipt_data(conn, job_id, plan_id, nonce, after="9.9.9"):
+    from backend.app import receipts as receipts_lib
+
+    plan = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                             (plan_id,)).fetchone())
+    return receipts_lib.build_receipt(
+        job_id, "hermes", "succeeded", "1.0.0", after, 0, "",
+        [{"name": "smoke", "result": "pass", "mandatory": True,
+          "summary": "ok"}], "2026-09-08T00:00:00+00:00",
+        plan_id=plan_id, plan_hash=plan["plan_hash"],
+        attempt_nonce=nonce, release_path=plan["release_path"],
+        target=after, target_mode=plan["target_mode"],
+        expected_checks=["smoke"],
+        installer_exit=0, install_outcome="succeeded",
+        actual_change=True, evidence_durable=True,
+        cleanup_status="resolved", recovery_disposition="none")
+
+
+def _job_flags(conn, job_id):
+    row = conn.execute("SELECT state, unresolved, recovery_required"
+                       " FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return (str(row["state"]), int(row["unresolved"] or 0),
+            int(row["recovery_required"] or 0))
+
+
+def test_h05f_proven_success_overrides_unresolved():
+    """Test 1: unresolved=True + fully proven success clears."""
+    from backend.app import reconcile_core as rc_lib
+
+    required, reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(), receipt_valid=True,
+        unresolved=True, prior_state="verifying",
+        execution_quiescent=True)
+    assert required is False, reason
+
+
+def test_h05f_unresolved_survives_without_resolving_receipt():
+    """Test 2: unresolved=True + no valid receipt still requires."""
+    from backend.app import reconcile_core as rc_lib
+
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "verifying", None, receipt_valid=False, unresolved=True,
+        prior_state="verifying", execution_quiescent=True)
+    assert required is True
+
+
+def test_h05f_unresolved_survives_unproven_execution():
+    """Test 3: unresolved=True + valid success but unproven
+    quiescence still requires."""
+    from backend.app import reconcile_core as rc_lib
+
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(), receipt_valid=True,
+        unresolved=True, prior_state="verifying",
+        execution_quiescent=False)
+    assert required is True
+
+
+def _apply_setup(tmp_path, monkeypatch, state="verifying",
+                 nonce="n-h05f"):
+    """Admitted + claimed job left in a crash state with a bound
+    success receipt built. Returns (conn, log_dir, jid, plan_id)."""
+    from backend.app import jobs as jobs_lib
+    from backend.app.config import settings as settings_lib
+
+    support_lib.use_test_secrets(monkeypatch, tmp_path)
+    log_dir = str(tmp_path / "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    monkeypatch.setattr(settings_lib, "log_dir", log_dir)
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = _admit(conn, row["id"], "k-h05f-%s" % nonce)
+    assert err == "" and created, err
+    assert jobs_lib.claim_with_nonce(conn, jid, nonce) is True
+    _crash_row(conn, jid, state)
+    data = _success_receipt_data(conn, jid, row["id"], nonce)
+    return conn, log_dir, jid, row["id"], data
+
+
+def test_h05f_apply_clears_both_flags(tmp_path, monkeypatch):
+    """Test 4a: reconciled-success apply persists succeeded/0/0
+    atomically for a crash row."""
+    from backend.app import receipts as receipts_lib
+
+    conn, _log_dir, jid, _pid, data = _apply_setup(
+        tmp_path, monkeypatch)
+    assert _job_flags(conn, jid) == ("verifying", 1, 1)
+    assert receipts_lib.apply_receipt(
+        conn, data, jid, execution_quiescent=True) == "succeeded"
+    assert _job_flags(conn, jid) == ("succeeded", 0, 0)
+    conn.close()
+
+
+def test_h05f_apply_clears_stale_terminal_flags(tmp_path, monkeypatch):
+    """Test 4b: a terminal succeeded row carrying stale flags is
+    rewritten once (same state) with the flags resolved."""
+    from backend.app import receipts as receipts_lib
+
+    conn, _log_dir, jid, _pid, data = _apply_setup(
+        tmp_path, monkeypatch, state="succeeded")
+    conn.execute("UPDATE jobs SET finished_at=? WHERE id=?",
+                 ("2026-09-08T00:00:00+00:00", jid))
+    conn.execute(
+        "INSERT INTO checks(tool_id,job_id,name,result,mandatory,"
+        "summary,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("hermes", jid, "smoke", "pass", 1, "ok",
+         "2026-09-08T00:00:00+00:00"))
+    conn.commit()
+    assert _job_flags(conn, jid) == ("succeeded", 1, 1)
+    assert receipts_lib.apply_receipt(
+        conn, data, jid, execution_quiescent=True) == "succeeded"
+    assert _job_flags(conn, jid) == ("succeeded", 0, 0)
+    conn.close()
+
+
+def test_h05f_legacy_apply_preserves_flags(tmp_path, monkeypatch):
+    """Generic receipt loads (no quiescence proof) never silently
+    clear execution uncertainty."""
+    from backend.app import receipts as receipts_lib
+
+    conn, _log_dir, jid, _pid, data = _apply_setup(
+        tmp_path, monkeypatch)
+    assert receipts_lib.apply_receipt(conn, data, jid) == "succeeded"
+    state, unresolved, recovery = _job_flags(conn, jid)
+    assert state == "succeeded"
+    assert (unresolved, recovery) == (1, 1)
+    conn.close()
+
+
+def test_h05f_failed_receipt_keeps_recovery(tmp_path, monkeypatch):
+    """Test 5: failed-after-mutation receipt never clears flags,
+    even in reconciled mode."""
+    from backend.app import receipts as receipts_lib
+
+    conn, _log_dir, jid, pid, _data = _apply_setup(
+        tmp_path, monkeypatch, nonce="n-h05f5")
+    plan = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                             (pid,)).fetchone())
+    failed = receipts_lib.build_receipt(
+        jid, "hermes", "failed", "1.0.0", "9.9.9", 1, "install_failed",
+        [{"name": "smoke", "result": "pass", "mandatory": True,
+          "summary": "ok"}], "2026-09-08T00:00:00+00:00",
+        plan_id=pid, plan_hash=plan["plan_hash"],
+        attempt_nonce="n-h05f5", release_path=plan["release_path"],
+        target="9.9.9", target_mode=plan["target_mode"],
+        expected_checks=["smoke"],
+        installer_exit=1, install_outcome="install_failed",
+        actual_change=True, evidence_durable=True,
+        cleanup_status="", recovery_disposition="required")
+    assert receipts_lib.apply_receipt(
+        conn, failed, jid, execution_quiescent=True) == "failed"
+    assert _job_flags(conn, jid) == ("failed", 1, 1)
+    conn.close()
+
+
+def test_h05f_invalid_receipt_clears_nothing(tmp_path, monkeypatch):
+    """Test 6: a success-looking receipt bound to the wrong plan is
+    refused; flags and lease are unchanged."""
+    from backend.app import receipts as receipts_lib
+
+    conn, _log_dir, jid, _pid, data = _apply_setup(
+        tmp_path, monkeypatch, nonce="n-h05f6")
+    tampered = dict(data)
+    tampered["plan_hash"] = "tampered"
+    try:
+        receipts_lib.apply_receipt(
+            conn, tampered, jid, execution_quiescent=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("tampered receipt applied")
+    assert _job_flags(conn, jid) == ("verifying", 1, 1)
+    assert _lease_held(conn, jid)
+    conn.close()
+
+
+def test_h05f_live_scope_holds_everything(tmp_path, monkeypatch):
+    """Test 7: valid receipt + live phase scope → no apply, flags
+    and ownership held."""
+    from backend.app import units as units_lib
+    from backend.app.worker import dispatch as dispatch_lib
+
+    conn, log_dir, jid, _pid, data = _apply_setup(
+        tmp_path, monkeypatch, nonce="n-h05f7")
+    _write_receipt(log_dir, jid, data)
+
+    def _fake(unit, timeout_s=10):
+        if str(unit or "").endswith(".scope"):
+            return {"state": "live", "unit": unit,
+                    "active_state": "active", "sub_state": "running",
+                    "main_pid": 1, "cgroup": "", "identity_ok": True,
+                    "detail": ""}
+        return {"state": "confirmed_stopped", "unit": unit,
+                "active_state": "inactive", "sub_state": "dead",
+                "main_pid": 0, "cgroup": "", "identity_ok": True,
+                "detail": ""}
+
+    monkeypatch.setattr(units_lib, "query_unit", _fake)
+    row = conn.execute("SELECT * FROM jobs WHERE id=?",
+                       (jid,)).fetchone()
+    assert dispatch_lib._reconcile_row(conn, row) == "unknown-held"
+    assert _job_flags(conn, jid) == ("verifying", 1, 1)
+    assert _lease_held(conn, jid)
+    # The receipt file is untouched: nothing applied it.
+    with open(os.path.join(log_dir, "%s.receipt.json" % jid), "r",
+              encoding="utf-8") as fh:
+        assert json.load(fh)["state"] == "succeeded"
+    conn.close()
+
+
+def test_h05f_active_delegated_service_holds(tmp_path, monkeypatch):
+    """Test 8: valid receipt + live delegated service → ownership
+    held, historical uncertainty not auto-resolved."""
+    from backend.app import units as units_lib
+    from backend.app.worker import dispatch as dispatch_lib
+
+    conn, log_dir, jid, pid, data = _apply_setup(
+        tmp_path, monkeypatch, nonce="n-h05f8")
+    conn.execute("UPDATE plans SET services=? WHERE id=?",
+                 (json.dumps(["system:fake-hermes.service"]), pid))
+    conn.commit()
+    _write_receipt(log_dir, jid, data)
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=10: {"state": "confirmed_stopped",
+                                    "unit": unit, "detail": ""})
+    monkeypatch.setattr(
+        units_lib, "query_unit_system",
+        lambda unit, timeout_s=10: {"state": "live", "unit": unit,
+                                    "active_state": "active",
+                                    "sub_state": "running",
+                                    "detail": ""})
+    row = conn.execute("SELECT * FROM jobs WHERE id=?",
+                       (jid,)).fetchone()
+    assert dispatch_lib._reconcile_row(conn, row) == "unknown-held"
+    assert _job_flags(conn, jid) == ("verifying", 1, 1)
+    assert _lease_held(conn, jid)
+    conn.close()
+
+
+def test_h05f_crash_after_success_then_second_job(tmp_path,
+                                                 monkeypatch):
+    """Critical E2E: crash flags + durable success receipt + full
+    H02/H03 quiescence → succeeded/0/0, lease released, JOB 2
+    admits on a fresh unique lease."""
+    from backend.app.worker import dispatch as dispatch_lib
+
+    conn, log_dir, jid1, _pid, data = _apply_setup(
+        tmp_path, monkeypatch, nonce="n-h05f9")
+    _write_receipt(log_dir, jid1, data)
+    _stopped_units(monkeypatch)
+    assert _job_flags(conn, jid1) == ("verifying", 1, 1)
+    assert _lease_held(conn, jid1)
+    acted = dispatch_lib.reconcile_claimed_jobs(conn)
+    assert acted == 1
+    assert _job_flags(conn, jid1) == ("succeeded", 0, 0)
+    assert not _lease_held(conn, jid1)
+    row2 = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid2, created2, err2 = _admit(conn, row2["id"], "k-h05f9-b")
+    assert err2 == "" and created2, err2
+    assert jid2 != jid1
+    assert _lease_held(conn, jid2)
+    conn.close()
+
+
 # -- H06 evidence-init blocks mutation -----------------------------------------
 
 def _boom_sanitizer(*args, **kwargs):

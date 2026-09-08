@@ -425,13 +425,26 @@ def shows_mutation(data):
     return False
 
 
-def apply_receipt(conn, data, filename_job_id=""):
-    # type: (sqlite3.Connection, Dict[str, Any], str) -> str
+def apply_receipt(conn, data, filename_job_id="",
+                  execution_quiescent=False):
+    # type: (sqlite3.Connection, Dict[str, Any], str, bool) -> str
     """Atomically apply a bound, valid receipt. Returns state.
 
     Raises ValueError on invalid/unbound receipts. Idempotent: re-applying
     the same receipt writes nothing new. Commit errors propagate as
     tx.TxCommitError (callers must NOT treat the gate as released).
+
+    H05 final — resolved-success mode: pass execution_quiescent=True
+    ONLY from reconciliation after full H02/H03 execution-quiescence
+    proof (unit + phase scopes + processes + delegated all proven).
+    Receipt validity proves OUTCOME, never that the updater stopped,
+    so a generic receipt load must never clear execution uncertainty.
+    In resolved-success mode a fully validated clean succeeded
+    receipt (disposition none) clears historical unresolved and
+    recovery_required markers atomically in the SAME transaction that
+    persists the terminal evidence — before ownership release. Every
+    other apply preserves existing flags (fail closed); a required
+    disposition still sets recovery.
     """
     from .tx import transition_tx, TxError
 
@@ -454,6 +467,17 @@ def apply_receipt(conn, data, filename_job_id=""):
     if not bound:
         raise ValueError("unbound receipt: %s" % why)
     state = str(data.get("state", ""))
+    try:
+        _disp = str(data.get("recovery_disposition", "") or "")
+    except Exception:
+        _disp = ""
+    # H05 final resolved-success gate (see docstring): receipt
+    # validity (proven above and below) plus caller-proven execution
+    # quiescence plus a clean succeeded outcome. Anything else keeps
+    # legacy flag preservation below.
+    resolved_success = bool(execution_quiescent) and \
+        state == "succeeded" and \
+        _disp in RECOVERY_RESOLVED_VALUES
     # Terminal resolved rows are history: only an unresolved row (or the
     # same state) may be rewritten by a receipt. A resolved terminal row
     # with a DIFFERENT proven outcome is a contradiction for manual
@@ -468,16 +492,25 @@ def apply_receipt(conn, data, filename_job_id=""):
         raise ValueError(
             "receipt contradicts resolved terminal state %s with %s"
             % (job.get("state", ""), state))
+    try:
+        _stale_flags = int(job.get("unresolved", 0) or 0) or \
+            int(job.get("recovery_required", 0) or 0)
+    except Exception:
+        _stale_flags = 1
     if job.get("state") == state and job.get("finished_at"):
         # Already terminal in the same state: ensure checks present, then
-        # return without duplicating history.
+        # return without duplicating history — UNLESS resolved-success
+        # mode must still clear stale historical flags (a terminal
+        # succeeded row carrying pre-fix unresolved/recovery markers is
+        # rewritten once, same state, with the flags resolved).
         existing = conn.execute(
             "SELECT name FROM checks WHERE job_id=?", (job_id,)).fetchall()
         existing_names = {str(r["name"]) for r in existing}
         receipt_names = {str(c.get("name", "")) for c in
                          (data.get("checks", []) or [])
                          if isinstance(c, dict)}
-        if existing_names >= receipt_names:
+        if existing_names >= receipt_names and not \
+                (resolved_success and _stale_flags):
             return state
     try:
         exit_code = _strict_int(data.get("exit_code", 0), "exit_code")
@@ -498,10 +531,18 @@ def apply_receipt(conn, data, filename_job_id=""):
         "error_detail": str(data.get("error_detail", "") or "")[:2000],
         "finished_at": str(data.get("ts", "") or
                            data.get("finished_at", "")),
-        "recovery_required": 1 if str(
-            data.get("recovery_disposition", "")) == "required" else
-        int(job.get("recovery_required", 0) or 0),
+        # H05 final: resolved-success mode clears both historical
+        # flags atomically with the terminal evidence (same
+        # transaction, before ownership release). Otherwise legacy:
+        # a required disposition sets recovery, else the existing
+        # flag survives; unresolved is left untouched.
+        "recovery_required": 0 if resolved_success else (
+            1 if str(
+                data.get("recovery_disposition", "")) == "required"
+            else int(job.get("recovery_required", 0) or 0)),
     }
+    if resolved_success:
+        update["unresolved"] = 0
     checks = []
     for item in data.get("checks", []) or []:
         if isinstance(item, dict):

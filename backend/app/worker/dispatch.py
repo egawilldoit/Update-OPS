@@ -484,7 +484,15 @@ def _reconcile_row(conn, row):
         return "unknown-held"
     if action == "apply-receipt":
         try:
-            applied = apply_receipt(conn, receipt_data, job_id)
+            # H05 final: resolved-success mode. decide() returned
+            # apply-receipt solely for fully proven execution
+            # quiescence (unit stopped + phase scopes stopped + no
+            # processes + delegated quiescent), so the apply itself
+            # clears historical unresolved/recovery markers
+            # atomically for a clean succeeded receipt — before the
+            # ownership release below. Anything else preserves flags.
+            applied = apply_receipt(conn, receipt_data, job_id,
+                                    execution_quiescent=True)
         except ValueError as exc:
             _event(conn, job_id, "reconcile_receipt_rejected",
                    str(exc)[:500])
