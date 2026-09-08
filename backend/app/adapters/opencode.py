@@ -623,7 +623,8 @@ class OpenCodeAdapter(Adapter):
         plan_obj = PlanResult(
             tool=self.tool_id, target=discovery.target, target_mode="exact",
             channel="stable", fingerprint=inspection.fingerprint,
-            services=[os.environ.get("EGA_OPENCODE_UNIT", "")] if server_on else [],
+            services=["user:%s" % os.environ.get("EGA_OPENCODE_UNIT", "")]
+            if server_on else [],
             backup_scope={
                 "covered": "opencode config + opencode.db via sqlite3 online backup API (online-consistent; EXCLUSIVE-lock failure blocks)",
                 "omitted": "13 GiB state dir wholesale, caches, plugins, alternate NVM npm install",

@@ -194,3 +194,144 @@ def test_h01_rollback_leaves_neither_job_nor_lease(tmp_path):
         "SELECT used_at FROM plans WHERE id=?",
         (row["id"],)).fetchone()["used_at"] == ""
     conn.close()
+
+
+# -- H02 scoped delegated-service references -----------------------------------
+
+def _plan_with_services(conn, services):
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    conn.execute("UPDATE plans SET services=? WHERE id=?",
+                 (json.dumps(services), row["id"]))
+    conn.commit()
+    return row
+
+
+class _FakeUnits(object):
+    """Fake systemd managers; records WHICH manager each unit hit."""
+
+    def __init__(self, user=None, system=None):
+        self.calls = []
+        self._user = user or {}
+        self._system = system or {}
+
+    def query_unit(self, unit, timeout_s=5):
+        self.calls.append(("user", unit))
+        return dict(self._user.get(
+            unit, {"state": "unknown", "detail": "not present"}))
+
+    def query_unit_system(self, unit, timeout_s=5):
+        self.calls.append(("system", unit))
+        return dict(self._system.get(
+            unit, {"state": "unknown", "detail": "not present"}))
+
+
+def _stopped():
+    return {"state": "confirmed_stopped", "detail": ""}
+
+
+def test_h02_parse_matrix():
+    from backend.app.reconcile_core import parse_service_ref as parse
+
+    assert parse("system:ega-update-runner@owner.service") == \
+        ("system", "ega-update-runner@owner.service")
+    assert parse("user:opencode.service") == ("user", "opencode.service")
+    # Legacy bare unit means user scope (console-managed user units).
+    assert parse("opencode.service") == ("user", "opencode.service")
+    assert parse("  user:foo.service  ") == ("user", "foo.service")
+    # Malformed: unknown scope, extra colons, empty unit, empty, paths.
+    assert parse("") == ("", "")
+    assert parse(None) == ("", "")
+    assert parse("bogus:x.service") == ("", "")
+    assert parse("a:b:c") == ("", "")
+    assert parse("system:") == ("", "")
+    assert parse(":foo.service") == ("", "")
+    assert parse("user:foo bar.service") == ("", "")
+    assert parse("user:../evil.service") == ("", "")
+    assert parse("user:") == ("", "")
+
+
+def test_h02_system_ref_queries_system_manager_only(tmp_path):
+    """A system-scoped ref hits ONLY the system manager: no
+    user-then-system fallback that could turn activity into
+    false not-found evidence."""
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    row = _plan_with_services(conn, ["system:runner.service"])
+    job = {"id": "job-h02-sys", "plan_id": row["id"]}
+    fake = _FakeUnits(user={"runner.service": {"state": "live",
+                                               "detail": "active"}},
+                      system={"runner.service": _stopped()})
+    quiescent, evidence, _reason = rc_lib.delegated_quiescence(
+        conn, job, units_mod=fake)
+    assert quiescent is True
+    assert ("user", "runner.service") not in fake.calls
+    assert ("system", "runner.service") in fake.calls
+    assert evidence[0]["scope"] == "system"
+    conn.close()
+
+
+def test_h02_bare_ref_queries_user_manager_only(tmp_path):
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    row = _plan_with_services(conn, ["opencode.service"])
+    job = {"id": "job-h02-bare", "plan_id": row["id"]}
+    fake = _FakeUnits(user={"opencode.service": _stopped()},
+                      system={"opencode.service": {"state": "live",
+                                                  "detail": "active"}})
+    quiescent, evidence, _reason = rc_lib.delegated_quiescence(
+        conn, job, units_mod=fake)
+    assert quiescent is True
+    assert ("system", "opencode.service") not in fake.calls
+    assert evidence[0]["scope"] == "user"
+    conn.close()
+
+
+def test_h02_malformed_ref_blocks(tmp_path):
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    for bad in (["system:"], ["a:b:c"], ["bogus:x.service"], [""]):
+        services = [s for s in bad if s] or ["system:"]
+        row = _plan_with_services(conn, services)
+        job = {"id": "job-h02-bad", "plan_id": row["id"]}
+        fake = _FakeUnits(user={}, system={})
+        quiescent, evidence, reason = rc_lib.delegated_quiescence(
+            conn, job, units_mod=fake)
+        assert quiescent is False
+        assert "malformed" in (evidence[0].get("detail", "") + reason)
+        assert fake.calls == []
+    conn.close()
+
+
+def test_h02_missing_plan_blocks(tmp_path):
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    quiescent, _evidence, reason = rc_lib.delegated_quiescence(
+        conn, {"id": "job-h02-noplan", "plan_id": "plan-missing"},
+        units_mod=_FakeUnits())
+    assert quiescent is False
+    assert "plan" in reason
+    conn.close()
+
+
+def test_h02_adapters_emit_structured_refs():
+    """Codex never emits the non-unit 'codex-daemon' name; OpenCode
+    emits an explicitly user-scoped ref (server_on implies a
+    configured non-empty unit, so the ref is always well-formed)."""
+    with open(os.path.join(_REPO_ROOT, "backend", "app", "adapters",
+                           "codex.py"), "r", encoding="utf-8") as fh:
+        codex_src = fh.read()
+    assert "codex-daemon" not in codex_src
+    with open(os.path.join(_REPO_ROOT, "backend", "app", "adapters",
+                           "opencode.py"), "r", encoding="utf-8") as fh:
+        opencode_src = fh.read()
+    assert '"user:%s" % os.environ.get("EGA_OPENCODE_UNIT", "")' in \
+        opencode_src
+    for name in ("hermes.py", "t3.py"):
+        with open(os.path.join(_REPO_ROOT, "backend", "app", "adapters",
+                               name), "r", encoding="utf-8") as fh:
+            src = fh.read()
+        assert '"%s:%s" % (scope' in src

@@ -212,6 +212,50 @@ def _parse_show(output):
     return props
 
 
+_SERVICE_SCOPES = ("user", "system")
+
+_UNIT_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.@:-")
+
+
+def parse_service_ref(value):
+    # type: (object) -> tuple
+    """Canonical delegated-service reference parser (H02 deploy mirror).
+
+    Same contract as backend/app/reconcile_core.parse_service_ref:
+    "scope:unit" or legacy bare "unit" (= user scope); anything else
+    is ("","") — malformed entries are UNKNOWN and block, never
+    guessed. Kept stdlib-only (no backend imports) by design.
+    """
+    try:
+        text = str(value or "").strip()
+    except Exception:
+        return "", ""
+    if not text:
+        return "", ""
+    scope = "user"
+    unit = text
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 2:
+            return "", ""
+        scope, unit = parts[0].strip(), parts[1].strip()
+        if scope not in _SERVICE_SCOPES:
+            return "", ""
+    if not unit:
+        return "", ""
+    try:
+        if any(ch.isspace() for ch in unit):
+            return "", ""
+        if "/" in unit or "\\" in unit or "\0" in unit:
+            return "", ""
+        if any(ch not in _UNIT_CHARS for ch in unit):
+            return "", ""
+    except Exception:
+        return "", ""
+    return scope, unit
+
+
 def _cgroup_empty(cgroup):
     # type: (str) -> object
     """True/False/None (unprovable). Root can read cgroupfs directly."""
@@ -551,19 +595,30 @@ def assess(config_path, require_drain=True):
                 scrutiny_unprovable = True
                 continue
             for service in services[:20]:
-                name = str(service or "")
-                if not name:
+                raw = str(service or "")
+                if not raw:
                     continue
-                state_u, _d = query_user_unit(tool_owner, uid, name)
-                entry_state = state_u
-                bus = "user"
-                if state_u == "unknown":
-                    state_s, _d2 = query_system_unit(name)
-                    if state_s != "unknown":
-                        entry_state, bus = state_s, "system"
+                # H02: structural parse first; scope directs the exact
+                # manager (system services query ONLY the system
+                # manager). Malformed refs and unprovable states block.
+                scope, unit = parse_service_ref(raw)
+                if not scope or not unit:
+                    delegated.append(
+                        {"service": raw, "bus": "-", "scope": "",
+                         "state": "unknown",
+                         "detail": "malformed service reference",
+                         "job": jid[:8]})
+                    continue
+                if scope == "system":
+                    entry_state, entry_detail = query_system_unit(unit)
+                    bus = "system"
+                else:
+                    entry_state, entry_detail = query_user_unit(
+                        tool_owner, uid, unit)
+                    bus = "user"
                 delegated.append(
-                    {"service": name, "bus": bus,
-                     "state": entry_state,
+                    {"service": raw, "bus": bus, "scope": scope,
+                     "state": entry_state, "detail": entry_detail[:200],
                      "job": jid[:8]})
         except Exception as exc:
             reasons.append("delegated proof unprovable: %s" % exc)

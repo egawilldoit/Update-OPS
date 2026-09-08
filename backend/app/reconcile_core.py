@@ -39,9 +39,57 @@ def canonical_unit(job_id):
     return "ega-update-job-%s.service" % stem
 
 
+SERVICE_SCOPES = ("user", "system")
+
+_UNIT_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.@:-")
+
+
+def parse_service_ref(value):
+    # type: (object) -> Tuple[str, str]
+    """Parse ONE canonical delegated-service reference (H02).
+
+    Returns (scope, unit) with scope in {"user", "system"} and unit a
+    non-empty valid systemd unit name. Accepts "scope:unit" and legacy
+    bare "unit" (bare means user scope: that is how the console has
+    always managed non-prefixed units, e.g. OpenCode's user service).
+    Anything else — empty, unknown scope, empty unit, illegal unit
+    characters, extra colons — returns ("", ""): malformed entries are
+    UNKNOWN and block, never guessed.
+    """
+    try:
+        text = str(value or "").strip()
+    except Exception:
+        return "", ""
+    if not text:
+        return "", ""
+    scope = "user"
+    unit = text
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 2:
+            return "", ""
+        scope, unit = parts[0].strip(), parts[1].strip()
+        if scope not in SERVICE_SCOPES:
+            return "", ""
+    if not unit:
+        return "", ""
+    try:
+        if any(ch.isspace() for ch in unit):
+            return "", ""
+        if "/" in unit or "\\" in unit or "\0" in unit:
+            return "", ""
+        if any(ch not in _UNIT_CHARS for ch in unit):
+            return "", ""
+    except Exception:
+        return "", ""
+    return scope, unit
+
+
 def job_processes(hex_token, full_id="", exclude_pids=()):
     # type: (str, str, object) -> List[Dict[str, Any]]
-    """Read-only /proc scan keyed on the unit hex + runner markers.
+    """Legacy raw scan: best-effort list, [] on ANY failure (H03: this
+    ambiguity is why callers must use prove_processes() instead)."""
 
     Matches cmdlines containing the hex token AND an execution marker
     (runner module, systemd-run unit, or updater context) so the
@@ -84,24 +132,29 @@ def job_processes(hex_token, full_id="", exclude_pids=()):
 
 def delegated_quiescence(conn, job, units_mod=None):
     # type: (object, Dict[str, Any], object) -> Tuple[bool, List[Dict[str, Any]], str]
-    """Shared delegated-operation proof (G03).
+    """Shared delegated-operation proof (G03, H02).
 
-    Inspects every plan-bound service/delegated operation for the job:
-    exact named unit, correct manager tried in order (user, then system
-    when the user bus cannot prove the state), ActiveState/SubState/
-    MainPID/cgroup evidence where appropriate. Returns
-    (quiescent, evidence, reason).
+    Inspects every plan-bound service/delegated operation for the job
+    through its DECLARED scope only (H02): a system-scoped service is
+    queried solely on the system manager, a user-scoped one solely on
+    the ubuntu user manager. No user-then-system fallback guessing — a
+    scope-bound service already declares its authority domain, and
+    querying the wrong manager turns real activity into false
+    not-found/stopped evidence. Returns (quiescent, evidence, reason).
 
     - No services bound: (True, [], "no delegated services") — vacuous
       quiescence, explicitly recorded.
-    - Every service confirmed stopped: (True, evidence, "").
-    - Anything live/starting/stopping/unknown, any query failure, or a
-      missing/unreadable plan row: (False, evidence, reason).
+    - Every service confirmed stopped on its own manager:
+      (True, evidence, "").
+    - Anything live/starting/stopping/unknown, any query failure, any
+      malformed service ref, or a missing/unreadable plan row:
+      (False, evidence, reason).
     - Do NOT infer delegated quiescence from the parent runner having
       disappeared; only per-service proof counts.
 
     units_mod defaults to backend.app.units (imported lazily so this
-    module stays import-light); tests inject fakes.
+    module stays import-light); tests inject fakes exposing
+    query_unit / query_unit_system.
     """
     if units_mod is None:
         try:
@@ -131,39 +184,41 @@ def delegated_quiescence(conn, job, units_mod=None):
         return False, [], "plan services unreadable: %s" % str(exc)[:150]
     if not services:
         return True, [], "no delegated services"
+    query_user = getattr(units_mod, "query_unit", None)
+    query_system = getattr(units_mod, "query_unit_system", None)
     evidence = []  # type: List[Dict[str, Any]]
-    for service in services[:20]:
-        entry = {"service": service, "bus": "", "state": "unknown",
+    for raw in services[:20]:
+        entry = {"service": str(raw or ""), "scope": "", "unit": "",
+                 "bus": "", "state": "unknown",
                  "detail": ""}  # type: Dict[str, Any]
-        proved = False
-        for bus, query in (("user", getattr(units_mod, "query_unit", None)),
-                           ("system",
-                            getattr(units_mod, "query_unit_system", None))):
-            if not callable(query):
-                continue
-            try:
-                info = query(service, timeout_s=5)
-            except Exception as exc:
-                entry["detail"] = "query crashed: %s" % str(exc)[:150]
-                continue
-            try:
-                state = str((info or {}).get("state", "unknown"))
-                detail = str((info or {}).get("detail", "") or "")[:200]
-            except Exception:
-                state, detail = "unknown", "state unreadable"
-            if bus == "user" and state == "unknown" and \
-                    "identity mismatch" not in detail:
-                # Unknown on the user bus may mean system scope: try it
-                # before concluding (either bus proving live blocks).
-                continue
-            entry["bus"] = bus
-            entry["state"] = state
-            entry["detail"] = detail
-            proved = True
-            break
-        if not proved:
-            entry["detail"] = entry["detail"] or \
-                "no manager could prove service state"
+        # H02: structural parse first. A malformed ref is UNKNOWN and
+        # blocks — the manager is never consulted with a guessed name.
+        scope, unit = parse_service_ref(raw)
+        if not scope or not unit:
+            entry["detail"] = "malformed service reference"
+            evidence.append(entry)
+            continue
+        entry["scope"] = scope
+        entry["unit"] = unit
+        entry["bus"] = scope
+        query = query_user if scope == "user" else query_system
+        if not callable(query):
+            entry["detail"] = "%s manager query unavailable" % scope
+            evidence.append(entry)
+            continue
+        try:
+            info = query(unit, timeout_s=5)
+        except Exception as exc:
+            entry["detail"] = "query crashed: %s" % str(exc)[:150]
+            evidence.append(entry)
+            continue
+        try:
+            entry["state"] = str((info or {}).get("state", "unknown"))
+            entry["detail"] = str(
+                (info or {}).get("detail", "") or "")[:200]
+        except Exception:
+            entry["state"] = "unknown"
+            entry["detail"] = "state unreadable"
         evidence.append(entry)
     for entry in evidence:
         if entry.get("state") != "confirmed_stopped":

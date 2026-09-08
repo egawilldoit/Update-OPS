@@ -238,8 +238,13 @@ class CodexAdapter(Adapter):
             source_clean="unknown",
             source_detail=sanitize_evidence(
                 "standalone install has no git checkout; %s%s" % (detail, alt_note)),
-            services=["codex-daemon"] if self._daemon_status()[0] in (
-                "healthy", "stale", "failed-probe") else [],
+            # H02: "codex-daemon" is an app-server concept, NOT a systemd
+            # unit, so it must never appear in delegated services (a
+            # non-unit name would fail structural parsing at reconcile
+            # time). Daemon liveness/version is proven by the
+            # daemon_readiness/daemon_version_agreement required checks,
+            # not by unit queries.
+            services=[],
             state_dirs=[d for d in (CODEX_HOME, STANDALONE_DIR) if os.path.exists(d)],
             channel="standalone-latest",
             fingerprint=fp,
