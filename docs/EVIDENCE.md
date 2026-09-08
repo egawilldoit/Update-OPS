@@ -119,6 +119,25 @@ New regression artifacts: `backend/tests/test_final_integration.py`
 (updated decide matrix) and `backend/tests/test_deploy_bootstrap.py`
 (G07/G08 fail-closed controller behavior).
 
+## Final pre-runtime surgical addendum, wave H (H01–H06, S01)
+
+Starting SHA `07ba218` (H01–H03 already landed). This pass landed as
+implementation head
+`3414a8b42cad4fd43277bb5f228aa1f5ac8d22b0`. Every row:
+`implemented-static`, result `NOT EXECUTED — IMPLEMENTATION PHASE`.
+No runtime PASS claimed. New regression artifact:
+`backend/tests/test_final_pre_runtime_static.py` (H01 block 5, H02
+block 6, H03 block 15, H04 block 10, H05 block 8, H06 block 6, S01
+block 8; write-only) plus updated G04 contract/launcher tests and the
+G02 hook update in `backend/tests/test_final_integration.py`.
+
+| Finding | Root-cause fix | Key files |
+| --- | --- | --- |
+| H04 | Authoritative probes run as transient probe SERVICES with the same NNP-off owner profile as the runner (`run_supervised_probe`, one shared `TRANSIENT_EXEC_PROPERTIES` tuple, one shared supervision helper); contract binds `probe_no_new_privileges=false` + `phase_privilege_source=runner` | `owner_env.py`, `phase_run.py`, `dispatch.py` |
+| H05 | One canonical recovery decision: proven success is resolved (recovery 0); all reconcile sites share it; success releases ownership so a second job admits | `reconcile_core.py`, `dispatch.py`, `reconcile.py` |
+| H06 | Evidence-init failure refuses before any adapter call (fixed `evidence_unavailable` literal); `_open_log` verifies `persist_failed`; execute refusal blocks without recovery; mid-operation failures stay interrupted-with-recovery | `runner.py`, `phase_run.py` |
+| S01 | install/upgrade provision empty `secrets.env` (0640 `root:ega-update`); validator requires it; example + RUNBOOK agree | `install.sh`, `upgrade.sh`, `validate-release.py`, `config.example.json`, `docs/RUNBOOK.md` |
+
 ## Main-agent core corrective addendum (senior review R01–R36, Gate A–C)
 
 Branch `feat/v1-implementation`, previous baseline `2e0f898`, this pass
