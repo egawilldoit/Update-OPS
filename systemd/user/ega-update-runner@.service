@@ -1,30 +1,34 @@
-# EGA Update Console — per-job runner USER-unit template (SPEC §8).
+# EGA Update Console — per-job runner USER-unit template (SPEC §8, CONTRACTS §8-§9).
 #
-# Preferred template for --user job units. Installed by
+# DOCUMENTATION OF THE TRANSIENT UNIT SHAPE ONLY — DO NOT START THIS
+# TEMPLATE DIRECTLY (not via `systemctl --user start` either). Installed by
 # deploy/scripts/install.sh to ubuntu's ~/.config/systemd/user as
-# ega-update-runner@.service and reloaded via `systemctl --user
-# daemon-reload` (as ubuntu). Requires `loginctl enable-linger ubuntu`
-# so the user manager exists at boot.
+# ega-update-runner@.service for shape reference only. Requires
+# `loginctl enable-linger ubuntu` so the user manager exists at boot.
 #
-# The dispatcher (running as ubuntu) prefers transient units:
+# The dispatcher (running as ubuntu) uses transient units ONLY:
 #
 #   systemd-run --user --collect \
-#     --unit=ega-update-job-<shortid> \
-#     --working-directory=/opt/ega-update/current \
-#     /opt/ega-update/current/venv/bin/python -m backend.app.worker.runner <job-id>
+#     --unit=ega-update-job-<32hex-uuid>.service \
+#     --working-directory=<resolved-release> \
+#     --setenv=EGA_CONFIG_FILE=... \
+#     --setenv=EGA_ATTEMPT_NONCE=... --setenv=<allow-listed owner env> \
+#     --property=KillMode=control-group \
+#     --property=Restart=no \
+#     <release-venv-python> -m backend.app.worker.runner <job-id> <nonce>
 #
-# Sites that prefer template instances over bare systemd-run properties may
-# instead start:
+# where <job-id> is the full job UUID and <nonce> is the attempt claim token
+# (runner refuses mismatches with exit 6 before any mutation). The recorded
+# jobs.runner_unit is the transient ega-update-job-<32hex-uuid>.service name
+# (full UUID hex, never shortid), inspected with `systemctl --user
+# is-active/show` (as ubuntu); never the system manager.
 #
-#   systemctl --user start ega-update-runner@<jobid>.service
-#
-# In both cases the recorded jobs.runner_unit is inspected with
-# `systemctl --user is-active/show` (as ubuntu); never the system manager.
 # Cgroup containment, timeouts, and no-restart semantics mirror the system
-# template (systemd/ega-update-runner@.service).
+# template (systemd/ega-update-runner@.service), which is likewise
+# documentation-only.
 
 [Unit]
-Description=EGA Update Console job runner %i (user unit)
+Description=EGA Update Console job runner <job-id> <nonce> (user unit shape documentation — do not start directly)
 Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
 After=network.target
 
@@ -32,7 +36,7 @@ After=network.target
 Type=simple
 WorkingDirectory=/opt/ega-update/current
 EnvironmentFile=/etc/ega-update/worker.env
-ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.runner %i
+ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.runner <job-id> <nonce>
 KillMode=control-group
 KillSignal=SIGTERM
 FinalKillSignal=SIGKILL

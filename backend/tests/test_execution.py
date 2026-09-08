@@ -136,8 +136,8 @@ def test_receipt_model_exists_and_matches():
     m = schemas_lib.ReceiptModel(job_id="j", tool_id="hermes",
                                  state="succeeded", after_version="1.2.3",
                                  ts="2026-09-08T00:00:00+00:00")
-    assert m.job_id == "j" and m.schema_version == 1
-    assert receipts_lib.RECEIPT_SCHEMA_VERSION == 1
+    assert m.job_id == "j" and m.schema_version == 2
+    assert receipts_lib.RECEIPT_SCHEMA_VERSION == 2
 
 
 def test_migration_002_alters_only():
@@ -153,24 +153,32 @@ def test_migration_002_alters_only():
 
 def test_canonical_launch_argv():
     job_id = "12345678-abcd-ef00-1234-56789abcdef0"
-    unit = "ega-update-job-12345678.service"
-    cmd = dispatch_lib._canonical_cmd(job_id, "nonceABC", unit)
+    unit = "ega-update-job-12345678abcdefef00123456789abcdef0.service"
+    env = {"EGA_CONFIG_FILE": "/etc/ega-update/config.json",
+           "EGA_ATTEMPT_NONCE": "nonceABC", "PATH": "/usr/bin:/bin"}
+    paths = {"release_root": "/opt/ega-update/releases/abc",
+             "venv_python": "/opt/ega-update/releases/abc/venv/bin/python"}
+    cmd = dispatch_lib._canonical_cmd(job_id, "nonceABC", unit, env, paths)
     assert cmd[0] == "systemd-run" and "--user" in cmd
     assert "--collect" in cmd
     assert "--unit=%s" % unit in cmd
-    assert "--working-directory=/opt/ega-update/current" in cmd
+    assert "--working-directory=/opt/ega-update/releases/abc" in cmd
     assert "--setenv=EGA_CONFIG_FILE=/etc/ega-update/config.json" in cmd
     assert "--setenv=EGA_ATTEMPT_NONCE=nonceABC" in cmd
     assert "--property=KillMode=control-group" in cmd
     assert "--property=Restart=no" in cmd
-    assert cmd[-4:] == [sys.executable, "-m",
-                        "backend.app.worker.runner", job_id, "nonceABC"] \
-        or cmd[-3:] == ["backend.app.worker.runner", job_id, "nonceABC"]
+    assert cmd[-4:] == ["/opt/ega-update/releases/abc/venv/bin/python",
+                        "-m", "backend.app.worker.runner",
+                        job_id, "nonceABC"]
     assert not any("sudo" in part for part in cmd)
-    # No system-manager fallback: every systemctl touch uses --user.
+    # Unit identity uses the full UUID hex (R03), never an 8-char prefix.
+    assert "12345678" not in unit.replace(
+        "12345678abcdefef00123456789abcdef0", "")
+    # Execution state is modeled explicitly (R04): no binary helper.
     import inspect
-    src = inspect.getsource(dispatch_lib._unit_active)
-    assert "--user" in src
+    assert not hasattr(dispatch_lib, "_unit_active")
+    src = inspect.getsource(dispatch_lib._reconcile_row)
+    assert "decide" in src
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +261,22 @@ def test_runner_verify_nonce_unit():
 # ---------------------------------------------------------------------------
 
 def _good_receipt(job_id="job-1", tool_id="hermes", state="succeeded",
-                  after="2.0.0"):
+                   after="2.0.0", nonce="n-1", plan_id="plan-1"):
+    # v2 bound receipt: success requires installer_exit 0, exact target
+    # observed, expected mandatory checks present+passing, durable
+    # evidence (R08).
     return receipts_lib.build_receipt(
         job_id, tool_id, state, "1.0.0", after, 0, "", [
             {"name": "smoke", "result": "pass", "mandatory": True,
              "summary": "ok"},
             {"name": "optional", "result": "unknown", "mandatory": False,
              "summary": ""},
-        ], "2026-09-08T00:00:00+00:00")
+        ], "2026-09-08T00:00:00+00:00",
+        plan_id=plan_id, plan_hash="ph-1", attempt_nonce=nonce,
+        release_path="/opt/ega-update/releases/abc", target=after,
+        target_mode="exact", expected_checks=["smoke"],
+        installer_exit=0, install_outcome="succeeded",
+        actual_change=True, evidence_durable=True)
 
 
 def test_receipt_validate_matrix():
@@ -291,14 +307,41 @@ def test_receipt_validate_matrix():
     bad_ts["finished_at"] = "not-a-time"
     assert receipts_lib.validate_receipt(bad_ts)[0] is False
     assert receipts_lib.validate_receipt("nope")[0] is False
+    # v2 bindings: plan/attempt/release/target required.
+    no_plan = _good_receipt()
+    no_plan["plan_id"] = ""
+    assert receipts_lib.validate_receipt(no_plan)[0] is False
+    no_nonce = _good_receipt()
+    no_nonce["attempt_nonce"] = ""
+    assert receipts_lib.validate_receipt(no_nonce)[0] is False
+    bad_exit = _good_receipt()
+    bad_exit["installer_exit"] = 4
+    assert receipts_lib.validate_receipt(bad_exit)[0] is False
+    mismatch = _good_receipt()
+    mismatch["after_version"] = "1.9.9"
+    assert receipts_lib.validate_receipt(mismatch)[0] is False
+    missing_expected = _good_receipt()
+    missing_expected["checks"] = [
+        {"name": "other", "result": "pass", "mandatory": True,
+         "summary": ""}]
+    assert receipts_lib.validate_receipt(missing_expected)[0] is False
+    failing_expected = _good_receipt()
+    failing_expected["checks"] = [
+        {"name": "smoke", "result": "fail", "mandatory": True,
+         "summary": ""}]
+    assert receipts_lib.validate_receipt(failing_expected)[0] is False
+    fragile = _good_receipt()
+    fragile["evidence_durable"] = False
+    assert receipts_lib.validate_receipt(fragile)[0] is False
 
 
 def test_receipt_apply_and_idempotency(tmp_path):
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _reserve(conn)
     assert jobs_lib.claim_with_nonce(conn, job_id, "n-1") is True
-    data = _good_receipt(job_id=job_id)
-    state = receipts_lib.apply_receipt(conn, data)
+    plan_id = _job_row(conn, job_id)["plan_id"]
+    data = _good_receipt(job_id=job_id, nonce="n-1", plan_id=plan_id)
+    state = receipts_lib.apply_receipt(conn, data, job_id)
     assert state == "succeeded"
     row = _job_row(conn, job_id)
     assert row["state"] == "succeeded" and row["after_version"] == "2.0.0"
@@ -310,7 +353,7 @@ def test_receipt_apply_and_idempotency(tmp_path):
         (job_id,)).fetchall()
     assert len(events) == 1
     # Idempotent re-apply writes nothing new.
-    assert receipts_lib.apply_receipt(conn, data) == "succeeded"
+    assert receipts_lib.apply_receipt(conn, data, job_id) == "succeeded"
     checks2 = conn.execute("SELECT * FROM checks WHERE job_id=?",
                            (job_id,)).fetchall()
     events2 = conn.execute(
@@ -322,6 +365,19 @@ def test_receipt_apply_and_idempotency(tmp_path):
         receipts_lib.apply_receipt(conn, {"schema_version": 999})
     with pytest.raises(ValueError):
         receipts_lib.apply_receipt(conn, _good_receipt(job_id="missing"))
+    # Unbound receipts (wrong nonce / swapped job) never apply (R08).
+    swapped = _good_receipt(job_id=job_id, nonce="WRONG", plan_id=plan_id)
+    with pytest.raises(ValueError):
+        receipts_lib.apply_receipt(conn, swapped, job_id)
+    other_id = _good_receipt(job_id="other", nonce="n-1", plan_id=plan_id)
+    with pytest.raises(ValueError):
+        receipts_lib.apply_receipt(conn, other_id, "other")
+    # Contradicting a resolved terminal row is refused (manual review).
+    contra = _good_receipt(job_id=job_id, nonce="n-1", plan_id=plan_id,
+                           state="failed", after="")
+    contra["after_version"] = ""
+    with pytest.raises(ValueError):
+        receipts_lib.apply_receipt(conn, contra, job_id)
     conn.close()
 
 
@@ -401,17 +457,18 @@ def test_is_timeout_result_matrix():
 
 
 def test_adapter_timeout_funnels_to_hard_timeout(monkeypatch):
-    calls = {"term": 0, "systemd": 0}
+    calls = {"scope_kill": 0, "quiescent": 0}
 
-    def _fake_term(grace_s=30):
-        calls["term"] += 1
+    def _fake_kill_scope(self, scope):
+        calls["scope_kill"] += 1
 
-    def _fake_systemd(unit):
-        calls["systemd"] += 1
+    def _fake_quiescent(self, scope):
+        calls["quiescent"] += 1
+        return True
 
-    monkeypatch.setattr(runner_lib, "terminate_tree", _fake_term)
-    monkeypatch.setattr(runner_lib, "_systemd_terminate_unit", _fake_systemd)
-    monkeypatch.setattr(runner_lib, "_no_live_descendants", lambda: True)
+    monkeypatch.setattr(runner_lib.Runner, "_kill_scope", _fake_kill_scope)
+    monkeypatch.setattr(runner_lib.Runner, "_scope_quiescent",
+                        _fake_quiescent)
     monkeypatch.setattr(runner_lib, "_job_processes_alive", lambda j: [])
 
     class _TimeoutAdapter(object):
@@ -432,7 +489,7 @@ def test_adapter_timeout_funnels_to_hard_timeout(monkeypatch):
     r.log = None
     out = r._do_execute(types.SimpleNamespace(), 30.0)
     assert out is None and r._timed_out is True
-    assert calls["term"] >= 1 and calls["systemd"] >= 1
+    assert calls["scope_kill"] >= 1 and calls["quiescent"] >= 1
 
 
 def test_finish_timeout_sets_recovery(tmp_path, monkeypatch):
@@ -446,6 +503,7 @@ def test_finish_timeout_sets_recovery(tmp_path, monkeypatch):
     r.conn = conn
     r.job = _job_row(conn, job_id)
     r.tool_id = "hermes"
+    r._known_state = "preflight"
     r.before_version = "1.0.0"
     r.after_version = ""
     r.checks = []
@@ -455,6 +513,7 @@ def test_finish_timeout_sets_recovery(tmp_path, monkeypatch):
     assert rc == runner_lib.EXIT_INSTALL_FAILED
     row = _job_row(conn, job_id)
     assert row["state"] == "failed" and int(row["recovery_required"]) == 1
+    assert int(row["unresolved"]) == 0
     conn.close()
 
 
@@ -554,6 +613,7 @@ def test_finish_maps_sticky_evidence_to_interrupted(tmp_path, monkeypatch):
     r.conn = conn
     r.job = _job_row(conn, job_id)
     r.tool_id = "hermes"
+    r._known_state = "preflight"
     r.before_version = "1.0.0"
     r.after_version = "2.0.0"
     r.checks = [{"name": "c", "result": "pass", "mandatory": True,
@@ -584,17 +644,49 @@ def _claimed_job(conn, state="updating", nonce="n-r"):
 
 def test_reconcile_live_unit_touches_heartbeat(tmp_path, monkeypatch):
     from backend.app.config import settings as settings_lib
+    from backend.app import units as units_lib
     monkeypatch.setattr(settings_lib, "log_dir", str(tmp_path / "logs"))
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _claimed_job(conn, state="updating")
     before = _job_row(conn, job_id)["heartbeat"]
-    monkeypatch.setattr(dispatch_lib, "_unit_active", lambda unit: "active")
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=10: {"state": "live", "unit": unit,
+                                    "active_state": "active",
+                                    "sub_state": "running", "main_pid": 1,
+                                    "cgroup": "", "identity_ok": True,
+                                    "detail": ""})
     acted = dispatch_lib.reconcile_claimed_jobs(conn)
     after = _job_row(conn, job_id)
     assert after["state"] == "updating"
     assert after["heartbeat"] and after["heartbeat"] >= before
     assert acted == 0
     conn.close()
+
+
+def _stopped(monkeypatch):
+    from backend.app import units as units_lib
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=10: {"state": "confirmed_stopped",
+                                    "unit": unit,
+                                    "active_state": "inactive",
+                                    "sub_state": "dead", "main_pid": 0,
+                                    "cgroup": "", "identity_ok": True,
+                                    "detail": "manager=inactive"})
+
+
+def _bound_success_receipt(conn, job_id, nonce="n-r", after="9.9.9"):
+    plan_id = _job_row(conn, job_id)["plan_id"]
+    return receipts_lib.build_receipt(
+        job_id, "hermes", "succeeded", "1.0.0", after, 0, "",
+        [{"name": "smoke", "result": "pass", "mandatory": True,
+          "summary": "ok"}], "2026-09-08T00:00:00+00:00",
+        plan_id=plan_id, plan_hash="ph-1", attempt_nonce=nonce,
+        release_path="/opt/ega-update/releases/abc", target=after,
+        target_mode="exact", expected_checks=["smoke"],
+        installer_exit=0, install_outcome="succeeded",
+        actual_change=True, evidence_durable=True)
 
 
 def test_reconcile_dead_plus_valid_receipt_applies(tmp_path, monkeypatch):
@@ -604,14 +696,11 @@ def test_reconcile_dead_plus_valid_receipt_applies(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_lib, "log_dir", log_dir)
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _claimed_job(conn, state="updating")
-    data = receipts_lib.build_receipt(
-        job_id, "hermes", "succeeded", "1.0.0", "9.9.9", 0, "",
-        [{"name": "smoke", "result": "pass", "mandatory": True,
-          "summary": "ok"}], "2026-09-08T00:00:00+00:00")
+    data = _bound_success_receipt(conn, job_id)
     with open(os.path.join(log_dir, "%s.receipt.json" % job_id), "w",
               encoding="utf-8") as fh:
         json.dump(data, fh)
-    monkeypatch.setattr(dispatch_lib, "_unit_active", lambda unit: "inactive")
+    _stopped(monkeypatch)
     acted = dispatch_lib.reconcile_claimed_jobs(conn)
     row = _job_row(conn, job_id)
     assert row["state"] == "succeeded" and row["after_version"] == "9.9.9"
@@ -626,7 +715,7 @@ def test_reconcile_dead_bare_mutation_state_needs_recovery(tmp_path,
                         str(tmp_path / "logs-empty"))
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _claimed_job(conn, state="updating")
-    monkeypatch.setattr(dispatch_lib, "_unit_active", lambda unit: "inactive")
+    _stopped(monkeypatch)
     dispatch_lib.reconcile_claimed_jobs(conn)
     row = _job_row(conn, job_id)
     assert row["state"] == "interrupted"
@@ -640,11 +729,32 @@ def test_reconcile_dead_bare_preflight_no_recovery(tmp_path, monkeypatch):
                         str(tmp_path / "logs-empty2"))
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _claimed_job(conn, state="preflight")
-    monkeypatch.setattr(dispatch_lib, "_unit_active", lambda unit: "inactive")
+    _stopped(monkeypatch)
     dispatch_lib.reconcile_claimed_jobs(conn)
     row = _job_row(conn, job_id)
     assert row["state"] == "interrupted"
     assert int(row["recovery_required"]) == 0
+    conn.close()
+
+
+def test_reconcile_unknown_holds_reservation(tmp_path, monkeypatch):
+    from backend.app import units as units_lib
+    from backend.app.config import settings as settings_lib
+    monkeypatch.setattr(settings_lib, "log_dir",
+                        str(tmp_path / "logs-unknown"))
+    conn = _make_db(str(tmp_path / "state.db"))
+    job_id = _claimed_job(conn, state="updating")
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=10: {"state": "unknown", "unit": unit,
+                                    "active_state": "", "sub_state": "",
+                                    "main_pid": 0, "cgroup": "",
+                                    "identity_ok": False,
+                                    "detail": "bus query failed"})
+    acted = dispatch_lib.reconcile_claimed_jobs(conn)
+    row = _job_row(conn, job_id)
+    assert row["state"] == "updating"
+    assert acted == 0
     conn.close()
 
 
@@ -654,7 +764,7 @@ def test_reconcile_boot_shares_logic(tmp_path, monkeypatch):
                         str(tmp_path / "logs-boot"))
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _claimed_job(conn, state="verifying")
-    monkeypatch.setattr(dispatch_lib, "_unit_active", lambda unit: "inactive")
+    _stopped(monkeypatch)
     dispatch_lib.reconcile_boot(conn)
     row = _job_row(conn, job_id)
     assert row["state"] == "interrupted"

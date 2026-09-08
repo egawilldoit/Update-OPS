@@ -52,18 +52,50 @@ common_reject_banned_args() {
 }
 
 # Mutating paths require locking support; missing flock blocks mutation.
+# Positive-form checks only (no negated-condition status capture).
 common_require_flock() {
-    if ! command -v flock >/dev/null 2>&1; then
-        if ! python3 -c 'import fcntl' >/dev/null 2>&1; then
-            echo "agent-update: locking unavailable (no flock, no fcntl); mutation blocked" >&2
-            return 3
-        fi
+    if command -v flock >/dev/null 2>&1; then
+        return 0
     fi
-    return 0
+    if python3 -c 'import fcntl' >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "agent-update: locking unavailable (no flock, no fcntl); mutation blocked" >&2
+    return 3
 }
 
 common_repo_root() {
     printf '%s' "$REPO_ROOT"
+}
+
+# Release resolution (UI/DEPLOY owned, R12/R13): script dir -> release root.
+# Deployed layouts run from $RELEASE/scripts (RELEASE = /opt/ega-update/
+# releases/<commit> or the /opt/ega-update/current pointer); checkouts run
+# from <repo>/scripts (RELEASE = repo root). The pointer wins when present
+# so wrappers always exec the staged release venv, never a CWD python.
+common_release_root() {
+    if [ -L "/opt/ega-update/current" ]; then
+        readlink -f "/opt/ega-update/current"
+        return 0
+    fi
+    if [ -d "/opt/ega-update/current/scripts" ]; then
+        printf '%s' "/opt/ega-update/current"
+        return 0
+    fi
+    if [ -d "/opt/ega-update/current" ]; then
+        printf '%s' "/opt/ega-update/current"
+        return 0
+    fi
+    printf '%s' "$REPO_ROOT"
+}
+
+# Release venv python for thin wrappers (R12): $RELEASE/venv/bin/python.
+common_release_python() {
+    local release="${1:-}"
+    if [ -z "$release" ]; then
+        release="$(common_release_root)"
+    fi
+    printf '%s' "$release/venv/bin/python"
 }
 
 common_usage() {

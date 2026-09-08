@@ -70,16 +70,20 @@ def _auth_ok(monkeypatch):
                          "test-rid"))
     monkeypatch.setattr(
         deps_lib, "require_mutation_guards", lambda request, claims: None)
-    monkeypatch.setattr(deps_lib, "check_rate_limit", lambda ident: True)
+    monkeypatch.setattr(deps_lib, "check_rate_limit",
+                         lambda ident, kind="read": True)
 
 
 def _isolate_settings(monkeypatch, tmp_path):
-    """Point state/db/logs at tmp; clear discovery cache."""
+    """Point state/db/logs at tmp; clear discovery cache; fresh heartbeat;
+    disposable release root (EGA_RELEASE_ROOT) so resolve_release works."""
     state_dir = str(tmp_path / "state")
     os.makedirs(state_dir, exist_ok=True)
     log_dir = str(tmp_path / "logs")
     os.makedirs(log_dir, exist_ok=True)
     db_path = str(tmp_path / "state.db")
+    release_dir = str(tmp_path / "release")
+    os.makedirs(release_dir, exist_ok=True)
     monkeypatch.setattr(settings_lib, "state_dir", state_dir)
     monkeypatch.setattr(settings_lib, "db_path", db_path)
     monkeypatch.setattr(settings_lib, "log_dir", log_dir)
@@ -87,6 +91,14 @@ def _isolate_settings(monkeypatch, tmp_path):
                         str(tmp_path / "missing-secrets.env"))
     monkeypatch.setattr(settings_lib, "body_limit_bytes", 256 * 1024)
     monkeypatch.setattr(settings_lib, "plan_ttl_s", 300)
+    monkeypatch.setenv("EGA_RELEASE_ROOT", release_dir)
+    try:
+        from backend.app.schemas import utcnow_iso
+        with open(os.path.join(state_dir, "dispatcher.heartbeat"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"ts": utcnow_iso(), "pid": 4242}, fh)
+    except Exception:
+        pass
     try:
         routes_lib._DISCOVERY_CACHE.clear()
     except Exception:
@@ -97,6 +109,47 @@ def _isolate_settings(monkeypatch, tmp_path):
     except Exception:
         pass
     return state_dir, db_path, log_dir
+
+
+def _ns_to_dict(value):
+    """Recursive SimpleNamespace/list/dict -> plain JSON dicts."""
+    if isinstance(value, types.SimpleNamespace):
+        return {k: _ns_to_dict(v) for k, v in vars(value).items()}
+    if isinstance(value, dict):
+        return {k: _ns_to_dict(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_ns_to_dict(v) for v in value]
+    return value
+
+
+def _probe_fake(monkeypatch, fake):
+    """Patch the owner probe queue with a fake owner (R01 test seam).
+
+    Counts the same probe calls as the legacy adapter fake; raising
+    adapter methods surface as ("error", ...) like a failed probe.
+    """
+    async def _fake_owner_probe(tool_id, op, timeout_s=25.0):
+        try:
+            if op == "refresh":
+                return "ok", {
+                    "inspection": _ns_to_dict(fake.inspect()),
+                    "discovery": _ns_to_dict(fake.discover()),
+                    "activity": _ns_to_dict(fake.activity()),
+                    "verification": _ns_to_dict(fake.verify()),
+                }
+            if op == "plan":
+                return "ok", {
+                    "planned": _ns_to_dict(fake.plan()),
+                    "activity": _ns_to_dict(fake.activity()),
+                    "inspection": _ns_to_dict(fake.inspect()),
+                }
+            if op == "inspect":
+                return "ok", _ns_to_dict(fake.inspect())
+            return "error", {"reason": "unsupported op in test"}
+        except Exception as exc:
+            return "error", {"reason": "probe failed: %s" % exc}
+    monkeypatch.setattr(routes_lib, "_owner_probe", _fake_owner_probe)
+    return fake
 
 
 def _make_db(db_path):
@@ -165,8 +218,10 @@ class _FakeAdapterBase(object):
             fingerprint=self._fp, target="9.9.9", target_mode="exact",
             channel="test-channel", services=[], backup_scope={},
             required_space_bytes=1024, steps=["preflight", "backup",
-                                             "updating", "verifying"],
-            timeouts={}, restart_impact="none")
+                                              "updating", "verifying"],
+            timeouts={}, restart_impact="none",
+            required_checks=["smoke"], budgets={"/tmp": 2048},
+            deadlines={"updating": 60})
 
     def verify(self):
         self.calls["verify"] += 1
@@ -198,7 +253,7 @@ def test_plan_unknown_without_ack_then_job_requires_ack(tmp_path,
     fake = _FakeAdapterBase(fingerprint="fp-ack-1",
                             activity_state="unknown",
                             verify_passed=True)
-    monkeypatch.setattr(routes_lib, "_load_adapter", lambda tool_id: fake)
+    _probe_fake(monkeypatch, fake)
 
     # POST /tools/{id}/plans with unknown activity and NO ack body must
     # still return 201 and record activity_state=unknown on the plan.
@@ -234,7 +289,7 @@ def test_plan_unknown_without_ack_then_job_requires_ack(tmp_path,
     fake2 = _FakeAdapterBase(fingerprint="fp-ack-2",
                              activity_state="idle",
                              verify_passed=True)
-    monkeypatch.setattr(routes_lib, "_load_adapter", lambda tool_id: fake2)
+    _probe_fake(monkeypatch, fake2)
     # Free the single slot: finish the acked job first.
     conn = db_lib.connect(db_path)
     try:
@@ -272,6 +327,9 @@ def test_plan_never_requires_ack_even_with_unknown():
 # ---------------------------------------------------------------------------
 
 def test_fingerprint_column_compare(tmp_path, monkeypatch):
+    from backend.app import plans as plans_lib
+    from backend.app.inventory import config_identity
+    from backend.app.owner_env import resolve_release
     _auth_ok(monkeypatch)
     _state_dir, db_path, _log_dir = _isolate_settings(monkeypatch, tmp_path)
     conn = _make_db(db_path)
@@ -282,28 +340,32 @@ def test_fingerprint_column_compare(tmp_path, monkeypatch):
         "UPDATE tools SET fingerprint=?, install_identity=? WHERE id=?",
         ("fp-real-1", "display-human-readable-identity", "hermes"))
     conn.commit()
+    # v2 immutable plans carrying the real config/release binding.
     now = datetime.now(timezone.utc)
     exp = (now + timedelta(seconds=600)).isoformat()
-    plan_match = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO plans(id,tool_id,subject,created_at,expires_at,"
-        "fingerprint,target,target_mode,channel,services,backup_scope,"
-        "activity_state,activity_evidence,used_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (plan_match, "hermes", "owner@example.invalid", now.isoformat(),
-         exp, "fp-real-1", "9.9.9", "exact", "c", json.dumps([]),
-         json.dumps({}), "idle", "", ""))
-    plan_changed = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO plans(id,tool_id,subject,created_at,expires_at,"
-        "fingerprint,target,target_mode,channel,services,backup_scope,"
-        "activity_state,activity_evidence,used_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (plan_changed, "hermes", "owner@example.invalid", now.isoformat(),
-         exp, "fp-other-2", "9.9.9", "exact", "c", json.dumps([]),
-         json.dumps({}), "idle", "", ""))
+    cfg_hash = config_identity(settings_lib)
+    release = resolve_release()
+    assert cfg_hash and release
+    plan_match = plans_lib.build_plan_row(
+        "hermes", "owner@example.invalid", "display-human-identity",
+        "fp-real-1", "9.9.9", "exact", "c", [], {}, [], {}, [], [],
+        {}, {}, ["preflight"], {"preflight": 120}, "none", "", "idle",
+        now.isoformat(), "", 1024, cfg_hash, release, now.isoformat(), exp)
+    plan_changed = plans_lib.build_plan_row(
+        "hermes", "owner@example.invalid", "display-human-identity",
+        "fp-other-2", "9.9.9", "exact", "c", [], {}, [], {}, [], [],
+        {}, {}, ["preflight"], {"preflight": 120}, "none", "", "idle",
+        now.isoformat(), "", 1024, cfg_hash, release, now.isoformat(), exp)
+    conn.execute("BEGIN IMMEDIATE")
+    plans_lib.insert_plan(conn, plan_match)
+    plans_lib.insert_plan(conn, plan_changed)
     conn.commit()
     conn.close()
+    # Owner revalidation returns the CURRENT installation fingerprint.
+    fake = _FakeAdapterBase(fingerprint="fp-real-1",
+                            activity_state="idle",
+                            verify_passed=True)
+    _probe_fake(monkeypatch, fake)
 
     def _post_job(plan_id):
         body = json.dumps(
@@ -316,8 +378,9 @@ def test_fingerprint_column_compare(tmp_path, monkeypatch):
         return _run(routes_lib.post_job(req))
 
     # Matching fingerprint succeeds even though install_identity differs
-    # from the plan fingerprint (display string is ignored).
-    ok = _post_job(plan_match)
+    # from the plan fingerprint (display string is ignored); the owner
+    # revalidation probe authoritatively confirms the installation.
+    ok = _post_job(plan_match["id"])
     assert ok.status_code == 202, _resp_json(ok)
     # Changed adapter fingerprint -> 409 fingerprint_changed.
     conn2 = db_lib.connect(db_path)
@@ -330,7 +393,7 @@ def test_fingerprint_column_compare(tmp_path, monkeypatch):
         conn2.commit()
     finally:
         conn2.close()
-    bad = _post_job(plan_changed)
+    bad = _post_job(plan_changed["id"])
     assert bad.status_code == 409, _resp_json(bad)
     assert _resp_json(bad).get("code") == "fingerprint_changed"
 
@@ -344,7 +407,7 @@ def test_drain_blocks_plans_and_jobs_not_reads(tmp_path, monkeypatch):
     state_dir, db_path, _log_dir = _isolate_settings(monkeypatch, tmp_path)
     _make_db(db_path).close()
     fake = _FakeAdapterBase()
-    monkeypatch.setattr(routes_lib, "_load_adapter", lambda tool_id: fake)
+    _probe_fake(monkeypatch, fake)
     assert routes_lib._drained() is False
 
     drain_path = os.path.join(state_dir, "drain")
@@ -392,6 +455,11 @@ def test_heartbeat_fresh_stale_and_health_mapping(tmp_path, monkeypatch):
     state_dir, db_path, _log_dir = _isolate_settings(monkeypatch, tmp_path)
     _make_db(db_path).close()
     hb_path = os.path.join(state_dir, "dispatcher.heartbeat")
+    # Start missing (helper pre-creates a fresh one for other tests).
+    try:
+        os.remove(hb_path)
+    except OSError:
+        pass
     # Missing -> {} -> worker down.
     assert jobs_lib.read_dispatcher_heartbeat(state_dir) == {}
     health_missing = routes_lib.get_health(_FakeRequest())
@@ -489,24 +557,24 @@ def test_discovery_coalesce_cache_hit_force_and_active_gate(
     _state_dir, db_path, _log_dir = _isolate_settings(monkeypatch, tmp_path)
     _make_db(db_path).close()
     fake = _FakeAdapterBase()
-    monkeypatch.setattr(routes_lib, "_load_adapter", lambda tool_id: fake)
+    _probe_fake(monkeypatch, fake)
 
-    first = routes_lib.post_tool_check("hermes", _check_req())
+    first = _run(routes_lib.post_tool_check("hermes", _check_req()))
     assert first.status_code == 200
     assert fake.calls["inspect"] == 1 and fake.calls["verify"] == 1
 
     # Fresh cache hit (<900s) skips adapter probes.
-    second = routes_lib.post_tool_check("hermes", _check_req())
+    second = _run(routes_lib.post_tool_check("hermes", _check_req()))
     assert second.status_code == 200
     assert fake.calls["inspect"] == 1 and fake.calls["verify"] == 1
 
     # ?force=1 bypasses the cache and probes again.
-    forced = routes_lib.post_tool_check("hermes", _check_req(force="1"))
+    forced = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))
     assert forced.status_code == 200
     assert fake.calls["inspect"] == 2 and fake.calls["verify"] == 2
 
     # Invalid force values are 422.
-    bad = routes_lib.post_tool_check("hermes", _check_req(force="yes"))
+    bad = _run(routes_lib.post_tool_check("hermes", _check_req(force="yes")))
     assert bad.status_code == 422
 
     # Active job (or recovery) skips probes even with ?force=1.
@@ -534,7 +602,7 @@ def test_discovery_coalesce_cache_hit_force_and_active_gate(
         conn.commit()
     finally:
         conn.close()
-    gated = routes_lib.post_tool_check("hermes", _check_req(force="1"))
+    gated = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))
     assert gated.status_code == 200
     assert fake.calls == before
     body = _resp_json(gated)
@@ -552,9 +620,8 @@ def test_check_again_persists_verify_health(tmp_path, monkeypatch):
     _make_db(db_path).close()
 
     passing = _FakeAdapterBase(verify_passed=True)
-    monkeypatch.setattr(routes_lib, "_load_adapter",
-                        lambda tool_id: passing)
-    resp = routes_lib.post_tool_check("hermes", _check_req(force="1"))
+    _probe_fake(monkeypatch, passing)
+    resp = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))
     assert resp.status_code == 200
     card = _resp_json(resp)
     assert card.get("health") == "healthy"
@@ -569,9 +636,8 @@ def test_check_again_persists_verify_health(tmp_path, monkeypatch):
         conn.close()
 
     failing = _FakeAdapterBase(verify_passed=False)
-    monkeypatch.setattr(routes_lib, "_load_adapter",
-                        lambda tool_id: failing)
-    resp2 = routes_lib.post_tool_check("hermes", _check_req(force="1"))
+    _probe_fake(monkeypatch, failing)
+    resp2 = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))
     assert _resp_json(resp2).get("health") == "unhealthy"
 
     unknown_checks = [types.SimpleNamespace(name="probe",
@@ -580,9 +646,8 @@ def test_check_again_persists_verify_health(tmp_path, monkeypatch):
                                             summary="inconclusive")]
     unknown = _FakeAdapterBase(verify_passed=False,
                                verify_checks=unknown_checks)
-    monkeypatch.setattr(routes_lib, "_load_adapter",
-                        lambda tool_id: unknown)
-    resp3 = routes_lib.post_tool_check("hermes", _check_req(force="1"))
+    _probe_fake(monkeypatch, unknown)
+    resp3 = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))
     assert _resp_json(resp3).get("health") == "unknown"
 
     # Verify exception preserves the last observation with discovery_error.
@@ -592,14 +657,14 @@ def test_check_again_persists_verify_health(tmp_path, monkeypatch):
             raise RuntimeError("verify probe exploded")
 
     boom = _BoomVerify()
-    monkeypatch.setattr(routes_lib, "_load_adapter", lambda tool_id: boom)
+    _probe_fake(monkeypatch, boom)
     conn = db_lib.connect(db_path)
     try:
         before = dict(conn.execute(
             "SELECT * FROM tools WHERE id='hermes'").fetchone())
     finally:
         conn.close()
-    resp4 = routes_lib.post_tool_check("hermes", _check_req(force="1"))
+    resp4 = _run(routes_lib.post_tool_check("hermes", _check_req(force="1")))
     assert resp4.status_code == 200
     conn = db_lib.connect(db_path)
     try:

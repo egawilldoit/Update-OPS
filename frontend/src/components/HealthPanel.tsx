@@ -19,13 +19,14 @@ export function HealthPanel({
     );
   }
   const stale = isStale(health.checked_at) || forcedStale;
-  // Disconnected forces stale presentation regardless of cached values:
-  // greyed, no green, explicit "stale — disconnected" label.
-  const apiStatus = forcedStale ? "stale" : health.api;
-  const dbStatus = forcedStale ? "stale" : health.database;
-  const workerStatus = forcedStale ? "stale" : health.worker;
+  // R21: stale health is NEVER green. When the observation is older than
+  // 5 min (or the API is unreachable), every badge renders the stale style
+  // with explicit stale text — cached green is never shown as current.
+  const apiStatus = stale ? "stale" : health.api;
+  const dbStatus = stale ? "stale" : health.database;
+  const workerStatus = stale ? "stale" : health.worker;
   return (
-    <section className={forcedStale ? "health-panel health-stale" : "health-panel"} aria-label="Service health">
+    <section className={stale ? "health-panel health-stale" : "health-panel"} aria-label="Service health">
       <h2>Health</h2>
       <ul className="health-list">
         <li>
@@ -42,14 +43,24 @@ export function HealthPanel({
         Checked {health.checked_at || "never"}
         {forcedStale ? " — stale — disconnected" : stale ? " — labeled stale (older than 5 min)" : ""}
       </p>
+      {stale && !forcedStale ? (
+        <p className="warn" role="note">
+          stale: health observation is older than 5 min — values are not current.
+        </p>
+      ) : null}
       {forcedStale ? (
         <p className="warn" role="note">
           stale — disconnected: cached values are never shown as green.
         </p>
       ) : null}
-      {health.recovery_required && !forcedStale ? (
+      {health.recovery_required && !stale ? (
         <p className="warn" role="alert">
           Recovery required — new updates are blocked until SSH reconcile clears it.
+        </p>
+      ) : null}
+      {health.recovery_required && stale ? (
+        <p className="warn" role="alert">
+          Recovery flag is set (last known) — verify over SSH; display is stale.
         </p>
       ) : null}
     </section>

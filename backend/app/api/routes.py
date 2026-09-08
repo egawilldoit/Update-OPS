@@ -20,12 +20,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
 import threading
 import time
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -156,7 +156,48 @@ def _health_from_verify(verify_result):
         return "unknown", detail
     # No fail evidence but not passed (e.g. empty checks): unknown.
     return "unknown", detail
-# Explicit per-job cap marker emitted by worker/runner.py JobLog._write_record.
+
+
+def _health_from_payload_verification(payload):
+    # type: (Dict[str, Any]) -> Tuple[str, str]
+    """Dict-shaped twin of _health_from_verify for owner-probe payloads."""
+
+    class _Box(object):
+        def __init__(self, data):
+            # type: (Dict[str, Any]) -> None
+            self._data = data if isinstance(data, dict) else {}
+
+        def __getattr__(self, name):
+            # type: (str) -> Any
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return self._data.get(name)
+
+    boxes = []
+    try:
+        raw_checks = (payload or {}).get("checks", []) or []
+    except Exception:
+        raw_checks = []
+    for item in raw_checks:
+        boxes.append(_Box(item if isinstance(item, dict) else []))
+
+    class _V(object):
+        pass
+    verification = _V()
+    try:
+        verification.passed = bool((payload or {}).get("passed", False))
+        verification.version = str((payload or {}).get("version", "") or "")
+        verification.error_detail = str(
+            (payload or {}).get("error_detail", "") or "")
+    except Exception:
+        verification.passed = False
+        verification.version = ""
+        verification.error_detail = ""
+    verification.checks = boxes
+    return _health_from_verify(verification)
+
+
+# Explicit per-job cap marker emitted by worker/runner.py JobLog.
 # Log readers match only this string (not a generic "truncat" substring) so
 # per-line "…[truncated-line]" suffixes and user output containing "truncate"
 # never falsely report per-job truncation.
@@ -175,12 +216,52 @@ def _known_secrets():
 
 def _load_adapter(tool_id):
     # type: (str) -> Any
-    """Lazily resolve the adapter for a tool id (no probes at import)."""
+    """Lazily resolve the adapter for a tool id (no probes at import).
+
+    Kept for owner-side (dispatcher/CLI/SSH) use. Request handlers must
+    use the owner probe queue instead (R01): the API account cannot
+    execute installation probes.
+    """
     try:
         from backend.app.adapters import registry as adapter_registry
     except Exception:
         from ..adapters import registry as adapter_registry  # type: ignore[no-redef]
     return adapter_registry.get_adapter(tool_id)
+
+
+def _probe_field(payload, section, key, default=""):
+    # type: (Dict[str, Any], str, str, object) -> Any
+    """Read a field from an owner-probe payload section (dicts only)."""
+    try:
+        section_d = (payload or {}).get(section, {})
+        if not isinstance(section_d, dict):
+            return default
+        value = section_d.get(key, default)
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+async def _owner_probe(tool_id, op, timeout_s=25.0):
+    # type: (str, str, float) -> Tuple[str, Dict[str, Any]]
+    """Owner probe via the typed queue (R01/R16).
+
+    Runs the blocking enqueue+wait in a worker thread so the event loop
+    stays responsive during slow probes. Returns (status, payload) with
+    status in ok|deferred|error|timeout.
+    """
+    try:
+        from ..owner_probes import request_owner_probe
+    except Exception:
+        try:
+            from backend.app.owner_probes import request_owner_probe  # type: ignore[no-redef]
+        except Exception:
+            return "error", {"reason": "probe boundary unavailable"}
+    try:
+        return await asyncio.to_thread(
+            request_owner_probe, tool_id, op, timeout_s, "api")
+    except Exception as exc:
+        return "error", {"reason": "probe wait crashed: %s" % exc}
 
 
 def _ok(payload):
@@ -217,16 +298,23 @@ def _parse_iso(value):
         return None
 
 
-def _authed(request):
-    # type: (Request) -> Any
-    """Common auth + rate-limit gate. Returns (claims, subject, rid) or
-    an error JSONResponse (caller must `isinstance`-check)."""
+def _authed(request, kind="read"):
+    # type: (Request, str) -> Any
+    """Common auth + kind-aware rate-limit gate ("read"|"write").
+
+    Returns (claims, subject, rid) or an error JSONResponse (caller must
+    `isinstance`-check). 429 carries Retry-After (R21)."""
     claims, err_resp, rid = deps.authenticate(request)
     if err_resp is not None:
         return err_resp
     subject = deps.subject_of(claims or {})
-    if not deps.check_rate_limit(subject or "anonymous"):
-        return deps.rate_limited_response()
+    bucket = kind if kind in ("read", "write") else "read"
+    if not deps.check_rate_limit(subject or "anonymous", bucket):
+        try:
+            retry_s = deps.retry_after_s(subject or "anonymous", bucket)
+        except Exception:
+            retry_s = 60
+        return deps.rate_limited_response(rid, retry_s)
     return claims, subject, rid
 
 
@@ -245,6 +333,12 @@ def _tool_response_row(tool_row, last_success, last_attempt):
         "checked_at": d.get("observation_time", "") or "",
         "discovery_error": d.get("discovery_error", "") or "",
         "install_identity": d.get("install_identity", "") or "",
+        # R19: last successful observation vs last attempt are separate;
+        # checked_at stays the last success so a failed check never
+        # refreshes an old healthy timestamp.
+        "last_success_at": d.get("last_success_at", "") or "",
+        "attempted_at": d.get("last_attempt_at", "") or "",
+        "attempt_error": d.get("last_attempt_error", "") or "",
     }
 
 
@@ -276,7 +370,8 @@ def _read_tool_card(conn, tool_id):
             "channel": "", "last_success": last_success,
             "last_attempt": last_attempt, "health": "unknown",
             "health_detail": "", "checked_at": "", "discovery_error": "",
-            "install_identity": "",
+            "install_identity": "", "last_success_at": "",
+            "attempted_at": "", "attempt_error": "",
         }
     return _tool_response_row(row, last_success, last_attempt)
 
@@ -284,6 +379,14 @@ def _read_tool_card(conn, tool_id):
 def _job_view(row):
     # type: (Any) -> Dict[str, Any]
     d = dict(row)
+    try:
+        final_seq = int(d.get("final_log_seq", -1))
+    except (TypeError, ValueError):
+        final_seq = -1
+    try:
+        installer_exit = int(d.get("installer_exit", 0) or 0)
+    except (TypeError, ValueError):
+        installer_exit = 0
     return {
         "id": d.get("id", ""),
         "tool_id": d.get("tool_id", ""),
@@ -301,6 +404,12 @@ def _job_view(row):
         "runner_unit": d.get("runner_unit", "") or "",
         "recovery_required": bool(d.get("recovery_required", 0)),
         "backup_summary": "",
+        # R18 outcome separation (installer vs wrapper, actual change) and
+        # R20 durable log cursor (-1 until the final flush).
+        "installer_exit": installer_exit,
+        "install_outcome": d.get("install_outcome", "") or "",
+        "actual_change": bool(d.get("actual_change", 0)),
+        "final_log_seq": final_seq,
     }
 
 
@@ -469,8 +578,8 @@ def get_tools(request: Request):
 # 3. POST /tools/{id}/check — bounded read-only refresh via real adapters
 # ---------------------------------------------------------------------------
 @router.post("/tools/{tool_id}/check")
-def post_tool_check(tool_id: str, request: Request):
-    gated = _authed(request)
+async def post_tool_check(tool_id: str, request: Request):
+    gated = _authed(request, kind="write")
     if isinstance(gated, JSONResponse):
         return gated
     claims, _subject, _rid = gated
@@ -498,8 +607,9 @@ def post_tool_check(tool_id: str, request: Request):
 
     def _preserve_with_error(tool_id_inner, message):
         # type: (str, str) -> Dict[str, Any]
-        # On exception preserve the last observation; record only
-        # discovery_error + observation timestamps (never invent health).
+        # R19: on failure preserve the last observation AND its timestamp;
+        # record only last_attempt_at + last_attempt_error (an old healthy
+        # result must never look freshly healthy). Never invent health.
         now_inner = utcnow_iso()
         conn_inner = _db()
         try:
@@ -510,8 +620,8 @@ def post_tool_check(tool_id: str, request: Request):
                     (tool_id_inner,))
                 conn_inner.execute(
                     "UPDATE tools SET discovery_error=?,"
-                    " observation_time=?, updated_at=? WHERE id=?",
-                    (str(message)[:500], now_inner, now_inner,
+                    " last_attempt_at=?, last_attempt_error=? WHERE id=?",
+                    (str(message)[:500], now_inner, str(message)[:500],
                      tool_id_inner))
                 conn_inner.commit()
             except Exception:
@@ -685,43 +795,49 @@ def post_tool_check(tool_id: str, request: Request):
             _lock.release()
         except Exception:
             pass
-        # No active job: run the real read-only probes outside any
-        # transaction (inspect/discover/activity + verify). Never invent
-        # observations: every field comes from the adapter results.
-        try:
-            adapter = _load_adapter(tool_id)
-        except KeyError:
-            return deps.error_envelope(
-                404, "not_found", "unknown tool", "tool_id=%s" % tool_id[:32])
-        except Exception as exc:
-            return _ok(_preserve_with_error(tool_id, exc))
+        # No active job: refresh via the owner probe queue (R01). The API
+        # account cannot execute installation probes; the dispatcher
+        # (ubuntu) runs inspect/discover/activity/verify and returns typed
+        # results. No transaction is held across the wait (bounded 25s in
+        # a worker thread; the event loop stays responsive per R16).
         now_iso = utcnow_iso()
-        try:
-            inspection = adapter.inspect()
-            discovery = adapter.discover()
-            activity = adapter.activity()
-            verification = adapter.verify()
-        except Exception as exc:
-            # Any probe failure preserves the last observation and records
-            # discovery_error (fail-closed, no invented data).
-            return _ok(_preserve_with_error(tool_id, exc))
+        _status, _payload = await _owner_probe(tool_id, "refresh", 25.0)
+        if _status == "deferred":
+            # Dispatcher deferred (mutation started meanwhile): cached.
+            return _ok(_labeled_cached(
+                dict(cached),
+                "stale — probe deferred; update started"))
+        if _status == "timeout":
+            return _ok(_preserve_with_error(
+                tool_id, "owner probe timeout after 25s; retry"))
+        if _status != "ok":
+            return _ok(_preserve_with_error(
+                tool_id, str(_payload.get("reason", "probe failed"))[:500]))
         try:
             install_identity = str(
-                getattr(inspection, "install_identity", "") or "")[:500]
+                _probe_field(_payload, "inspection",
+                             "install_identity", "") or "")[:500]
             observed_version = str(
-                getattr(inspection, "version", "") or "")[:200]
+                _probe_field(_payload, "inspection", "version", "")
+                or "")[:200]
             tool_fingerprint = str(
-                getattr(inspection, "fingerprint", "") or "")[:200]
+                _probe_field(_payload, "inspection", "fingerprint", "")
+                or "")[:200]
             available_target = str(
-                getattr(discovery, "target", "") or "")[:200]
+                _probe_field(_payload, "discovery", "target", "")
+                or "")[:200]
             channel = str(
-                getattr(inspection, "channel", "") or
-                getattr(discovery, "channel", "") or "")[:200]
-            available = bool(getattr(discovery, "available", False))
+                _probe_field(_payload, "inspection", "channel", "") or
+                _probe_field(_payload, "discovery", "channel", "")
+                or "")[:200]
+            available = bool(
+                _probe_field(_payload, "discovery", "available", False))
             unknown_reason = str(
-                getattr(discovery, "unknown_reason", "") or "")[:1000]
+                _probe_field(_payload, "discovery", "unknown_reason", "")
+                or "")[:1000]
             discovery_error = "" if available else unknown_reason
-            health, health_detail = _health_from_verify(verification)
+            health, health_detail = _health_from_payload_verification(
+                _payload.get("verification", {}))
         except Exception as exc:
             return _ok(_preserve_with_error(tool_id, exc))
         # Short write transaction only; the subprocess-backed probes above
@@ -777,10 +893,12 @@ def post_tool_check(tool_id: str, request: Request):
                     "UPDATE tools SET install_identity=?, observed_version=?,"
                     " available_target=?, channel=?, fingerprint=?,"
                     " observation_time=?, discovery_error=?, health=?,"
-                    " health_detail=?, updated_at=? WHERE id=?",
+                    " health_detail=?, updated_at=?, last_success_at=?,"
+                    " last_attempt_at=?, last_attempt_error=? WHERE id=?",
                     (install_identity, observed_version, available_target,
                      channel, tool_fingerprint, now_iso, discovery_error,
-                     health, health_detail, now_iso, tool_id))
+                     health, health_detail, now_iso, now_iso, now_iso,
+                     "", tool_id))
                 conn2.commit()
             except Exception:
                 try:
@@ -839,7 +957,7 @@ def post_tool_check(tool_id: str, request: Request):
 # ---------------------------------------------------------------------------
 @router.post("/tools/{tool_id}/plans")
 async def post_tool_plan(tool_id: str, request: Request):
-    gated = _authed(request)
+    gated = _authed(request, kind="write")
     if isinstance(gated, JSONResponse):
         return gated
     claims, subject, _rid = gated
@@ -888,55 +1006,60 @@ async def post_tool_plan(tool_id: str, request: Request):
             409, "recovery_required",
             "recovery required; SSH reconcile must clear first", "")
     # Ack is never sent at plan time: unknown activity is recorded on the
-    # plan (201) and enforced at POST /jobs with activity_ack=true. Any
-    # request body is ignored for ack purposes.
+    # plan (201) and enforced at POST /jobs with activity_ack=true. The
+    # body is read bounded and ignored for ack purposes (R16).
     try:
-        await request.body()
+        await deps.read_bounded_body(request)
+    except ValueError:
+        return deps.error_envelope(
+            422, "invalid_request", "request body too large", "")
     except Exception:
         pass
-    # Read-only adapter probes outside any DB transaction. Never install,
-    # download, or restart here; plan() is the read-only preview.
-    try:
-        adapter = _load_adapter(tool_id)
-    except KeyError:
+    # Owner-side plan construction (R01/R15): the dispatcher (ubuntu)
+    # runs activity()+plan() and returns typed results. The API never
+    # installs, downloads, or restarts; the wait is bounded (worker
+    # thread, R16). No transaction is held across the wait.
+    _status, _payload = await _owner_probe(tool_id, "plan", 30.0)
+    if _status == "deferred":
         return deps.error_envelope(
-            404, "not_found", "unknown tool", "tool_id=%s" % tool_id[:32])
-    except Exception as exc:
+            409, "busy", "another update started; retry", "")
+    if _status == "timeout":
         return deps.error_envelope(
-            503, "unavailable", "adapter unavailable: %s" % str(exc)[:200],
-            "tool_id=%s" % tool_id[:32])
-    try:
-        activity = adapter.activity()
-    except Exception as exc:
-        # Unprovable activity degrades to unknown (recorded on the plan,
-        # enforced at job time); planning itself stays 201-capable.
-        class _UnknownActivity(object):
-            state = "unknown"
-            evidence = "activity probe failed: %s" % str(exc)[:500]
-        activity = _UnknownActivity()
-    try:
-        planned = adapter.plan()
-    except Exception as exc:
+            503, "unavailable", "owner plan probe timeout; retry", "")
+    if _status != "ok":
         return deps.error_envelope(
             503, "unavailable",
-            "could not build plan: %s" % str(exc)[:200],
+            "could not build plan: %s"
+            % str(_payload.get("reason", "probe failed"))[:200],
             "tool_id=%s" % tool_id[:32])
+    _activity = _payload.get("activity", {})
+    _planned = _payload.get("planned", {})
+    if not isinstance(_activity, dict):
+        _activity = {}
+    if not isinstance(_planned, dict):
+        return deps.error_envelope(
+            503, "unavailable", "could not parse plan", "")
     try:
-        fingerprint = str(getattr(planned, "fingerprint", "") or "").strip()
-        target = str(getattr(planned, "target", "") or "").strip()
-        target_mode = str(getattr(planned, "target_mode", "") or "").strip()
-        channel = str(getattr(planned, "channel", "") or "")[:200]
-        services_raw = getattr(planned, "services", []) or []
-        backup_raw = getattr(planned, "backup_scope", {}) or {}
+        fingerprint = str(
+            _planned.get("fingerprint", "") or "").strip()
+        target = str(_planned.get("target", "") or "").strip()
+        target_mode = str(
+            _planned.get("target_mode", "") or "").strip()
+        channel = str(_planned.get("channel", "") or "")[:200]
+        services_raw = _planned.get("services", []) or []
+        backup_raw = _planned.get("backup_scope", {}) or {}
         required_space = int(
-            getattr(planned, "required_space_bytes", 0) or 0)
-        steps_raw = getattr(planned, "steps", []) or []
+            _planned.get("required_space_bytes", 0) or 0)
+        steps_raw = _planned.get("steps", []) or []
         restart_impact = str(
-            getattr(planned, "restart_impact", "") or "")[:2000]
+            _planned.get("restart_impact", "") or "")[:2000]
         activity_state = str(
-            getattr(activity, "state", "unknown") or "unknown").strip()
+            _activity.get("state", "unknown") or "unknown").strip()
         activity_evidence = str(
-            getattr(activity, "evidence", "") or "")[:1000]
+            _activity.get("evidence", "") or "")[:1000]
+        activity_ts = str(_activity.get("checked_at", "") or "")
+        install_identity = str(
+            _planned.get("install_identity", "") or "")[:500]
     except Exception as exc:
         return deps.error_envelope(
             503, "unavailable",
@@ -983,29 +1106,115 @@ async def post_tool_plan(tool_id: str, request: Request):
             409, "stale_plan",
             "plan steps unavailable; run check again",
             "tool_id=%s" % tool_id[:32])
+    # Fail-closed manifests (R15/R24): a plan without a mandatory-check
+    # manifest or any space budget is not an executable contract.
+    try:
+        _required_checks = [str(c) for c in
+                            (_planned.get("required_checks", []) or [])
+                            if str(c).strip()]
+    except Exception:
+        _required_checks = []
+    if not _required_checks:
+        return deps.error_envelope(
+            409, "stale_plan",
+            "plan check manifest unavailable; run check again",
+            "tool_id=%s" % tool_id[:32])
+    try:
+        _has_budget = bool(_planned.get("budgets") or
+                           _planned.get("space_fs") or False)
+    except Exception:
+        _has_budget = False
     if required_space < 0:
         required_space = 0
+    if required_space <= 0 and not _has_budget:
+        return deps.error_envelope(
+            409, "stale_plan",
+            "plan space budget unavailable; run check again",
+            "tool_id=%s" % tool_id[:32])
+    # Immutable plan contract (R15): bind config hash + resolved release
+    # now; execution re-checks them and blocks on drift instead of
+    # silently mixing saved fields with fresh defaults.
+    try:
+        from ..inventory import config_identity
+        from ..owner_env import resolve_release
+    except Exception:
+        try:
+            from backend.app.inventory import config_identity  # type: ignore[no-redef]
+            from backend.app.owner_env import resolve_release  # type: ignore[no-redef]
+        except Exception:
+            config_identity = None  # type: ignore[assignment]
+            resolve_release = None  # type: ignore[assignment]
+    try:
+        _config_hash = config_identity(settings) if config_identity else ""
+    except Exception:
+        _config_hash = ""
+    try:
+        _release_path = resolve_release() if resolve_release else ""
+    except Exception as exc:
+        return deps.error_envelope(
+            503, "unavailable",
+            "release unresolvable: %s" % str(exc)[:200], "")
+    if not _config_hash or not _release_path:
+        return deps.error_envelope(
+            503, "unavailable",
+            "configuration identity unprovable; retry", "")
     now = datetime.now(timezone.utc)
     try:
         ttl = int(getattr(settings, "plan_ttl_s", 300) or 300)
     except Exception:
         ttl = 300
     expires = now + timedelta(seconds=ttl)
-    plan_id = str(uuid.uuid4())
+    try:
+        from ..plans import build_plan_row, insert_plan
+    except Exception:
+        try:
+            from backend.app.plans import build_plan_row, insert_plan  # type: ignore[no-redef]
+        except Exception:
+            return deps.error_envelope(
+                503, "unavailable", "plan store unavailable", "")
+    try:
+        _deadlines = dict(_planned.get("deadlines", {}) or {})
+    except Exception:
+        _deadlines = {}
+    # Adapter-attached non-field extras (R15/R25/R27): daemon expectation
+    # and manual-limitation flags ride in artifact_json + the response so
+    # they are never silently dropped by model boundaries.
+    _artifact = {}
+    try:
+        for _k in ("daemon_expected", "daemon_status_at_plan",
+                   "manual_restart_limitation"):
+            _v = _planned.get(_k, None)
+            if _v is not None and not isinstance(_v, dict):
+                _artifact[_k] = _v
+    except Exception:
+        _artifact = {}
+    try:
+        _row = build_plan_row(
+            tool_id, subject or "", install_identity, fingerprint,
+            target, target_mode, channel, services,
+            _planned.get("launch", {}) or {},
+            _planned.get("state_homes", []) or [],
+            backup_scope, _planned.get("backup_policy", {}) or {},
+            _planned.get("required_probes", []) or [],
+            _planned.get("required_checks", []) or [],
+            _planned.get("budgets", {}) or {},
+            _planned.get("space_fs", {}) or {},
+            steps, _deadlines, restart_impact,
+            _planned.get("restart_detail", "") or "",
+            activity_state, activity_ts, activity_evidence,
+            required_space, _config_hash, _release_path,
+            now.isoformat(), expires.isoformat(), _artifact)
+    except Exception as exc:
+        return deps.error_envelope(
+            503, "unavailable",
+            "could not assemble plan: %s" % str(exc)[:200], "")
+    plan_id = str(_row.get("id", ""))
     # Short write transaction only; probes above already finished.
     conn = _db()
     try:
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO plans(id,tool_id,subject,created_at,expires_at,"
-                "fingerprint,target,target_mode,channel,services,backup_scope,"
-                "activity_state,activity_evidence,used_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (plan_id, tool_id, subject or "", now.isoformat(),
-                 expires.isoformat(), fingerprint, target, target_mode,
-                 channel, json.dumps(services), json.dumps(backup_scope),
-                 activity_state, activity_evidence, ""))
+            insert_plan(conn, _row)
             conn.commit()
         except Exception:
             try:
@@ -1035,6 +1244,12 @@ async def post_tool_plan(tool_id: str, request: Request):
         "steps": steps,
         "expires_at": expires.isoformat(),
         "restart_impact": restart_impact,
+        "plan_version": 2,
+        "config_hash": _config_hash,
+        "release_path": _release_path,
+        "plan_hash": str(_row.get("plan_hash", "")),
+        "artifact": dict(_artifact),
+        "single_use": True,
     })
 
 
@@ -1043,19 +1258,17 @@ async def post_tool_plan(tool_id: str, request: Request):
 # ---------------------------------------------------------------------------
 @router.post("/jobs")
 async def post_job(request: Request):
-    gated = _authed(request)
+    gated = _authed(request, kind="write")
     if isinstance(gated, JSONResponse):
         return gated
     claims, subject, _rid = gated
     guard = deps.require_mutation_guards(request, claims or {})
     if guard is not None:
         return guard
-    # Drain gate: refuse new jobs with 503 maintenance (reads unaffected).
-    if _drained():
-        return deps.error_envelope(
-            503, "maintenance",
-            "console is drained for maintenance; new jobs are refused",
-            "")
+    # R14: authenticate + minimal shape first. Idempotency lookup comes
+    # BEFORE every new-admission condition (drain, readiness, expiry,
+    # fingerprint): a replay after a lost response returns the recorded
+    # job instead of stale-plan/recovery/maintenance.
     idem_key = (request.headers.get("idempotency-key", "") or "").strip()
     if not idem_key:
         return deps.error_envelope(
@@ -1064,14 +1277,13 @@ async def post_job(request: Request):
         return deps.error_envelope(
             422, "invalid_request", "Idempotency-Key too long", "")
     try:
-        raw_body = await request.body()
+        raw_body = await deps.read_bounded_body(request)
+    except ValueError:
+        return deps.error_envelope(
+            422, "invalid_request", "request body too large", "")
     except Exception:
         return deps.error_envelope(
             422, "invalid_request", "could not read request body", "")
-    if len(raw_body) > int(getattr(settings, "body_limit_bytes",
-                                   256 * 1024) or 256 * 1024):
-        return deps.error_envelope(
-            422, "invalid_request", "request body too large", "")
     try:
         body = json.loads(raw_body.decode("utf-8") or "{}") \
             if raw_body else {}
@@ -1093,40 +1305,116 @@ async def post_job(request: Request):
     if not isinstance(ack, bool):
         return deps.error_envelope(
             422, "invalid_request", "activity_ack must be boolean", "")
+    digest = jobs_lib.request_hash(plan_id, ack)
     conn = _db()
     try:
-        plan = conn.execute("SELECT * FROM plans WHERE id=?",
-                            (plan_id,)).fetchone()
-        if plan is None:
+        # Safe sweep of never-claimed reservations (accepted + past claim
+        # deadline + empty nonce only; claimed rows untouched).
+        try:
+            jobs_lib.expire_stale_accepted(conn)
+        except Exception:
+            pass
+        existing = jobs_lib.find_replay(conn, subject or "", idem_key)
+        if existing is not None:
+            if (dict(existing).get("request_hash", "") or "") == digest:
+                view = _job_view(existing)
+                view["backup_summary"] = _backup_summary(
+                    conn, str(dict(existing).get("id", "")))
+                view["replayed"] = True
+                return _ok(view)
+            return deps.error_envelope(
+                409, "conflict",
+                "Idempotency-Key already used with different payload",
+                "")
+        # Genuinely new reservation: drain gate first (reads unaffected).
+        if _drained():
+            return deps.error_envelope(
+                503, "maintenance",
+                "console is drained for maintenance; new jobs are refused",
+                "")
+        # Worker readiness gate (R17): never accept work the worker cannot
+        # be proven ready to claim (heartbeat fresh <=20s).
+        try:
+            _hb = jobs_lib.read_dispatcher_heartbeat(
+                settings.state_dir, max_age_s=20)
+        except Exception:
+            _hb = {}
+        if not _hb:
+            return deps.error_envelope(
+                503, "worker_unavailable",
+                "worker not ready; job not accepted", "")
+        try:
+            from ..plans import (PlanNotFound, PlanInvalid, load_plan)
+        except Exception:
+            try:
+                from backend.app.plans import (  # type: ignore[no-redef]
+                    PlanNotFound, PlanInvalid, load_plan)
+            except Exception:
+                return deps.error_envelope(
+                    503, "unavailable", "plan store unavailable", "")
+        try:
+            plan_d = load_plan(conn, plan_id)
+        except PlanNotFound:
             return deps.error_envelope(
                 404, "not_found", "unknown plan", "")
-        plan_d = dict(plan)
+        except PlanInvalid as exc:
+            return deps.error_envelope(
+                409, "stale_plan", "plan invalid: %s" % str(exc)[:200],
+                "plan_id=%s" % plan_id[:8])
         tool_id = plan_d.get("tool_id", "") or ""
         if tool_id == "claude":
             return deps.error_envelope(
                 410, "install_method_unsupported",
                 "claude adapter is disabled", "")
-        # Expiry: plans live 300s (settings.plan_ttl_s); stale -> 409.
+        # Plan subject binding (explicit one-owner policy).
+        if (plan_d.get("subject", "") or "") != (subject or ""):
+            return deps.error_envelope(
+                422, "invalid_request",
+                "plan subject mismatch; create a fresh plan", "")
+        # One-use policy (explicit): a plan that already produced a job
+        # cannot produce another; retries need a fresh preview.
+        if plan_d.get("used_at", ""):
+            return deps.error_envelope(
+                409, "stale_plan",
+                "plan already used (single-use); create a fresh plan",
+                "plan_id=%s" % plan_id[:8])
+        # Expiry: plans live settings.plan_ttl_s; stale -> 409.
         exp = _parse_iso(plan_d.get("expires_at", "") or "")
         now = datetime.now(timezone.utc)
         if exp is None or exp <= now:
             return deps.error_envelope(
                 409, "stale_plan", "plan expired; create a fresh plan",
                 "plan_id=%s" % plan_id[:8])
-        # Fingerprint recheck before mutation (SPEC section 6).
-        # Compare against tools.fingerprint (adapter fingerprint persisted
-        # at check/plan time); install_identity is a human-readable
-        # display string and is never used for this comparison.
-        tool_row = conn.execute("SELECT * FROM tools WHERE id=?",
-                                (tool_id,)).fetchone()
-        current_fp = ""
-        if tool_row is not None:
-            current_fp = dict(tool_row).get("fingerprint", "") or ""
-        planned_fp = plan_d.get("fingerprint", "") or ""
-        if current_fp and planned_fp and current_fp != planned_fp:
+        # Fresh authoritative revalidation (R15): owner inspect
+        # fingerprint + config/release binding, not the dashboard cache.
+        _fp_status, _fp_payload = await _owner_probe(
+            tool_id, "inspect", 20.0)
+        if _fp_status != "ok":
+            return deps.error_envelope(
+                503, "unavailable",
+                "installation revalidation unavailable; retry", "")
+        _fresh_fp = str(_fp_payload.get("fingerprint", "") or "")
+        if _fresh_fp and _fresh_fp != (plan_d.get("fingerprint", "") or ""):
             return deps.error_envelope(
                 409, "fingerprint_changed",
                 "installation changed since plan; create a fresh plan",
+                "tool_id=%s" % tool_id[:32])
+        try:
+            from ..inventory import config_identity
+            from ..owner_env import resolve_release
+            _cur_hash = config_identity(settings)
+            _cur_release = resolve_release()
+        except Exception:
+            _cur_hash, _cur_release = "", ""
+        if not _cur_hash or not _cur_release:
+            return deps.error_envelope(
+                503, "unavailable",
+                "configuration identity unprovable; retry", "")
+        if _cur_hash != (plan_d.get("config_hash", "") or "") or \
+                _cur_release != (plan_d.get("release_path", "") or ""):
+            return deps.error_envelope(
+                409, "config_changed",
+                "configuration changed since plan; create a fresh plan",
                 "tool_id=%s" % tool_id[:32])
         # Activity gate: busy blocks; unknown requires recorded ack.
         activity = plan_d.get("activity_state", "unknown") or "unknown"
@@ -1211,6 +1499,13 @@ def list_jobs(request: Request):
             422, "invalid_request",
             "limit must be an integer 1..100", "")
     cursor = (qp.get("cursor", "") or "").strip()
+    # R21 global active-job poll: ?active=true returns nonterminal rows
+    # only (used for update gating independent of history/detail views).
+    _active_raw = str(qp.get("active", "") or "").strip().lower()
+    if _active_raw not in ("", "0", "false", "1", "true"):
+        return deps.error_envelope(
+            422, "invalid_request", "active must be 0/1", "")
+    _active_only = _active_raw in ("1", "true")
     conn = _db()
     try:
         cursor_created = ""
@@ -1230,12 +1525,18 @@ def list_jobs(request: Request):
         if cursor:
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE (created_at, id) < (?, ?)"
+                + (" AND state IN (?,?,?,?,?)" if _active_only else "") +
                 " ORDER BY created_at DESC, id DESC LIMIT ?",
-                (cursor_created, cursor_id, limit + 1)).fetchall()
+                ((cursor_created, cursor_id) +
+                 (tuple(jobs_lib.NONTERMINAL) if _active_only else ()) +
+                 (limit + 1,))).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT ?",
-                (limit + 1,)).fetchall()
+                "SELECT * FROM jobs"
+                + (" WHERE state IN (?,?,?,?,?)" if _active_only else "") +
+                " ORDER BY created_at DESC, id DESC LIMIT ?",
+                ((tuple(jobs_lib.NONTERMINAL) if _active_only else ()) +
+                 (limit + 1,))).fetchall()
         page = list(rows[:limit])
         if len(rows) > limit:
             next_cursor = dict(page[-1]).get("id", "") if page else ""

@@ -15,7 +15,25 @@
 # Safety: never modifies tool installations, homes, alternate binaries,
 # service units of managed tools, or tool data dirs. Tool-affecting steps
 # require an explicit console job, never the installer.
-set -euo pipefail
+#
+# Maintenance protocol (R33): on an EXISTING deploy (state.db present) this
+# script follows the same 11-step protocol as upgrade.sh — (1) drain,
+# (2) cli-status quiescence, (3) stop + prove stopped, (4) consistent backup,
+# (5) stage + validate, (6) migrate, (7) atomic switch, (8) units,
+# (9) start, (10) readiness, (11) undrain only on success. Failures keep the
+# drain and restore the PRIOR symlink only when the validator compat check
+# passes; otherwise the host is left in manual-recovery state (never
+# "start same broken release" as rollback).
+#
+# Python rule (R32): every python invocation below runs with CWD set to the
+# release dir (cd "$RELEASE_DIR") under the release venv binary
+# ("$RELEASE_DIR/venv/bin/python"), with EGA_CONFIG_FILE exported for ALL
+# invocations including quiescence. State paths (state/db/log/backup/drain)
+# are parsed from config via python -c JSON, never hardcoded. No
+# heredoc-python blocks. pip uses --require-hashes with NO fallback (R35):
+# a hashless requirements file blocks with a message instead of installing
+# unverified code.
+set -uo pipefail
 
 COMMIT=""
 TARBALL=""
@@ -39,24 +57,72 @@ if [ -z "$COMMIT" ] || [ -z "$TARBALL" ]; then
   echo "usage: install.sh --commit <sha> --release-tarball <path> [--config <path>]" >&2
   exit 2
 fi
+# Commit must be a 40-hex release pin (R32); refuse short/branch names.
+case "$COMMIT" in
+  *[^0-9a-f]*|"")
+    echo "[install] REFUSING: --commit must be a 40-hex sha (got: $COMMIT)" >&2
+    exit 2
+    ;;
+esac
+if [ "${#COMMIT}" -ne 40 ]; then
+  echo "[install] REFUSING: --commit must be a 40-hex sha (got length ${#COMMIT})" >&2
+  exit 2
+fi
 if [ "$(id -u)" -ne 0 ]; then
   echo "install.sh must run as root (sudo)" >&2
+  exit 2
+fi
+if [ -f "$TARBALL" ]; then
+  :
+else
+  echo "[install] release tarball missing: $TARBALL" >&2
   exit 2
 fi
 
 RELEASE_DIR="$PREFIX/releases/$COMMIT"
 CURRENT_LINK="$PREFIX/current"
+PREV_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || echo '')"
+DRAIN_CREATED_BY_US=0
+WAS_API=0
+WAS_WORKER=0
+EXISTING_DEPLOY=0
+if [ -f "$STATE/state.db" ]; then
+  EXISTING_DEPLOY=1
+fi
 
-echo "[install] pinned release: $COMMIT"
+# Config value helper (R32): parse state paths from JSON via python3 -c,
+# never hardcoded. Uses the staged config when /etc is not yet populated.
+cfg_value() {
+  local file="$1"
+  local key="$2"
+  local fallback="$3"
+  python3 -c 'import json,sys; f=sys.argv[1]; k=sys.argv[2]; d=sys.argv[3]; try:
+    data=json.load(open(f,encoding="utf-8"))
+    except Exception: print(d); raise SystemExit(0)
+ v=data.get(k,""); print(v if isinstance(v,str) and v else d)' \
+    "$file" "$key" "$fallback" 2>/dev/null || printf '%s' "$fallback"
+}
+
+fail_keep_drain() {
+  echo "[install] FAILED: $1" >&2
+  echo "[install] drain KEPT (blocking admission) for manual review." >&2
+  echo "[install] inspect, reconcile (docs/RUNBOOK.md), then sudo rm -f <state_dir>/drain only when healthy." >&2
+  exit 1
+}
+
+echo "[install] pinned release: $COMMIT (existing_deploy=$EXISTING_DEPLOY)"
 
 # 1. Dedicated non-root API account (no login shell, no tool ownership).
-if ! id "$API_USER" >/dev/null 2>&1; then
+if id "$API_USER" >/dev/null 2>&1; then
+  :
+else
   useradd --system --no-create-home --shell /usr/sbin/nologin "$API_USER"
   echo "[install] created user $API_USER"
 fi
 id "$TOOL_OWNER" >/dev/null 2>&1 || { echo "tool-owner account $TOOL_OWNER missing" >&2; exit 1; }
 
-# 2. Release layout: immutable release dir + `current` symlink.
+# 2. Release layout: immutable release dir + `current` symlink (staged but
+#    NOT switched until stage+validate+migrate succeed — see step 7).
 mkdir -p "$PREFIX/releases"
 if [ -e "$RELEASE_DIR" ]; then
   echo "[install] release dir already exists: $RELEASE_DIR (refusing to overwrite)" >&2
@@ -71,7 +137,9 @@ chmod -R a-w "$RELEASE_DIR" || true
 # Build output mapping: frontend/vite.config.ts outDir is
 # ../backend/app/static and backend/app/main.py serves backend/app/static,
 # so the gate checks backend/app/static/index.html (not frontend/dist/).
-if [ ! -f "$RELEASE_DIR/backend/app/static/index.html" ]; then
+if [ -f "$RELEASE_DIR/backend/app/static/index.html" ]; then
+  :
+else
   echo "[install] release tarball missing built frontend (backend/app/static/index.html)" >&2
   exit 1
 fi
@@ -90,7 +158,9 @@ chown root:ega-update "$ETC"
 chmod 0750 "$ETC"
 chown root:ega-update "$ETC/cloudflared"
 chmod 0750 "$ETC/cloudflared"
-if [ ! -f "$ETC/config.json" ]; then
+if [ -f "$ETC/config.json" ]; then
+  :
+else
   cp "$CONFIG_SRC" "$ETC/config.json"
   chmod 0640 "$ETC/config.json"
   chown root:"$API_USER" "$ETC/config.json"
@@ -106,7 +176,9 @@ done
 # Cloudflared tunnel config: generate ONLY with an explicit placeholder
 # hostname (fail-closed). The tunnel service validates non-placeholder
 # before routing; see docs/RUNBOOK.md. Never invent a real hostname here.
-if [ ! -f "$ETC/cloudflared/config.yml" ]; then
+if [ -f "$ETC/cloudflared/config.yml" ]; then
+  :
+else
   cat > "$ETC/cloudflared/config.yml" <<'YML'
 # EGA Update Console — tunnel ingress (placeholder only; owner MUST replace).
 # Fail-closed: cloudflared-ega-update.service refuses to route while the
@@ -124,11 +196,22 @@ YML
   chown root:ega-update "$ETC/cloudflared/config.yml"
   echo "[install] wrote placeholder $ETC/cloudflared/config.yml — REPLACE hostname/tunnel before enabling routing"
 fi
+
+# EGA_CONFIG_FILE is exported for ALL python invocations below (R32),
+# including quiescence/status/validator/migrate/readiness.
+export EGA_CONFIG_FILE="$ETC/config.json"
+
+# Resolve state paths from config (R32: never hardcoded for backup/drain).
+EFFECTIVE_STATE="$(cfg_value "$ETC/config.json" state_dir "$STATE")"
+EFFECTIVE_DB="$(cfg_value "$ETC/config.json" db_path "$EFFECTIVE_STATE/state.db")"
+EFFECTIVE_BACKUPS="$(cfg_value "$ETC/config.json" backup_dir "$EFFECTIVE_STATE/backups")"
+DRAIN="$EFFECTIVE_STATE/drain"
+echo "[install] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB backups=$EFFECTIVE_BACKUPS"
+
 # Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
-# while present). No drain by default; hooks below document the procedure.
-#   sudo touch /var/lib/ega-update/drain   # admission stop (upgrade/maintenance)
-#   sudo rm -f /var/lib/ega-update/drain    # re-admit only after quiescence + healthy start
-echo "[install] drain hooks: no drain by default ($STATE/drain absent = admitting)"
+# while present). No drain by default on fresh installs; existing deploys
+# drain FIRST per the maintenance protocol below.
+echo "[install] drain hooks: fresh default absent ($DRAIN absent = admitting)"
 
 # 4. Persistent state dirs OUTSIDE releases, shared by the two service
 #    accounts only. Both accounts share joint group ega-update with group
@@ -137,121 +220,233 @@ echo "[install] drain hooks: no drain by default ($STATE/drain absent = admittin
 getent group ega-update >/dev/null 2>&1 || groupadd -r ega-update
 usermod -aG ega-update "$API_USER" || true
 usermod -aG ega-update "$TOOL_OWNER" || true
-mkdir -p "$STATE/logs" "$STATE/backups"
-chown "$API_USER:ega-update" "$STATE"
-chown "$API_USER:ega-update" "$STATE/logs"
-chown "$TOOL_OWNER:ega-update" "$STATE/backups"
-chmod 0770 "$STATE" "$STATE/logs" "$STATE/backups"
-# Drain file: absent by default (admitting). Never create here.
-# Admission stop: sudo touch "$STATE/drain"; re-admit: sudo rm -f "$STATE/drain".
+mkdir -p "$EFFECTIVE_STATE/logs" "$EFFECTIVE_BACKUPS"
+chown "$API_USER:ega-update" "$EFFECTIVE_STATE"
+chown "$API_USER:ega-update" "$EFFECTIVE_STATE/logs"
+chown "$TOOL_OWNER:ega-update" "$EFFECTIVE_BACKUPS"
+chmod 0770 "$EFFECTIVE_STATE" "$EFFECTIVE_STATE/logs" "$EFFECTIVE_BACKUPS"
+# Drain file: absent by default (admitting). Never create here on fresh.
+# Admission stop: sudo touch "$EFFECTIVE_STATE/drain"; re-admit: sudo rm -f "$EFFECTIVE_STATE/drain".
 
 # 4b. User-manager linger: job runners launch via `systemd-run --user` as
 #     ubuntu and T3 user services run under the ubuntu user manager, so the
 #     manager must exist at boot even with no login session.
-if [ "$(loginctl show-user "$TOOL_OWNER" -p Linger --value 2>/dev/null || echo no)" != "yes" ]; then
+if [ "$(loginctl show-user "$TOOL_OWNER" -p Linger --value 2>/dev/null || echo no)" = "yes" ]; then
+  echo "[install] linger already enabled for $TOOL_OWNER"
+else
   loginctl enable-linger "$TOOL_OWNER"
   echo "[install] enabled linger for $TOOL_OWNER (user manager at boot for --user job units)"
-else
-  echo "[install] linger already enabled for $TOOL_OWNER"
+fi
+
+# Existing-deploy maintenance gate (R33 steps 1-3): drain FIRST, prove
+# quiescence via cli status (bounded 120s, fail closed), then stop services
+# and PROVE stopped. Fresh installs skip to venv/stage.
+if [ "$EXISTING_DEPLOY" = "1" ]; then
+  echo "[install] existing deploy detected — entering maintenance protocol"
+  mkdir -p "$EFFECTIVE_STATE"
+  if [ -f "$DRAIN" ]; then
+    echo "[install] drain already present at $DRAIN (admission already stopped)"
+  else
+    touch "$DRAIN" || { echo "cannot create drain $DRAIN" >&2; exit 1; }
+    DRAIN_CREATED_BY_US=1
+    echo "[install] drain created at $DRAIN (new plans/jobs refused)"
+  fi
+  if [ -L "$CURRENT_LINK" ] && [ -x "$CURRENT_LINK/venv/bin/python" ]; then
+    echo "[install] waiting for quiescence via cli status (bounded 120s)..."
+    QUIESCED=0
+    for _i in $(seq 1 24); do
+      cd "$RELEASE_DIR"
+      if EGA_CONFIG_FILE="$ETC/config.json" "$CURRENT_LINK/venv/bin/python" -m backend.app.cli status --wait-secs 5 >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
+        if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-install-status.json")); raise SystemExit(0 if (not d.get("active_job") and not d.get("unresolved_runners")) else 1)' 2>/dev/null; then
+          QUIESCED=1
+          break
+        fi
+        if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-install-status.json")); raise SystemExit(0 if d.get("unresolved_runners") else 1)' 2>/dev/null; then
+          echo "[install] unresolved runners present — reconcile first (drain kept)" >&2
+          fail_keep_drain "unresolved runners present"
+        fi
+      fi
+      echo "[install] active job still present, waiting 5s ($_i/24)..."
+      sleep 5
+    done
+    if [ "$QUIESCED" = "1" ]; then
+      echo "[install] quiesced: no active job, no unresolved runners"
+    else
+      fail_keep_drain "quiescence timeout after 120s (fail closed, drain kept)"
+    fi
+  else
+    echo "[install] no runnable current release for status gate — stopping services directly"
+  fi
+  if systemctl is-active --quiet ega-update-api 2>/dev/null; then WAS_API=1; fi
+  if systemctl is-active --quiet ega-update-worker 2>/dev/null; then WAS_WORKER=1; fi
+  systemctl stop ega-update-worker ega-update-api || true
+  if systemctl is-active --quiet ega-update-api 2>/dev/null; then
+    fail_keep_drain "api failed to stop (fail closed, drain kept)"
+  fi
+  if systemctl is-active --quiet ega-update-worker 2>/dev/null; then
+    fail_keep_drain "worker failed to stop (fail closed, drain kept)"
+  fi
+  echo "[install] stopped: api and worker proven inactive"
 fi
 
 # 5. Dedicated app venv + pinned requirements install (baseline Python
 #    >=3.10,<3.14; shared runtimes are untouched — this only creates the
-#    release-local venv).
+#    release-local venv). --require-hashes REQUIRED (R35): no fallback to an
+#    unhashed install. A hashless requirements file blocks here with a
+#    message (generate hashes during authorized release prep).
 command -v python3 >/dev/null 2>&1 || { echo "python3 (>=3.10,<3.14) required" >&2; exit 1; }
 python3 -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info < (3, 14) else 1)' \
   || { echo "python3 >=3.10,<3.14 required (got: $(python3 --version 2>&1))" >&2; exit 1; }
-python3 -m venv "$RELEASE_DIR/venv"
-"$RELEASE_DIR/venv/bin/pip" install --require-hashes -r "$RELEASE_DIR/backend/requirements.txt" 2>/dev/null \
-  || "$RELEASE_DIR/venv/bin/pip" install -r "$RELEASE_DIR/backend/requirements.txt"
+python3 -m venv "$RELEASE_DIR/venv" || fail_keep_drain "venv creation failed"
+cd "$RELEASE_DIR"
+EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/pip" install --require-hashes -r "$RELEASE_DIR/backend/requirements.txt" \
+  || fail_keep_drain "requirements install failed (pip --require-hashes REQUIRED; missing hashes file is blocked — generate hashes during authorized release prep, never fabricate them)"
 
-# 6. Consistent SQLite backup BEFORE migrate.
-#    Quiesce writers: stop worker/API if a previous install exists, use the
-#    SQLite backup API (or .backup) so WAL content is included — never a bare
-#    `cp` of a live DB file.
-if systemctl is-active --quiet ega-update-worker 2>/dev/null; then systemctl stop ega-update-worker; fi
-if systemctl is-active --quiet ega-update-api 2>/dev/null; then systemctl stop ega-update-api; fi
-if [ -f "$STATE/state.db" ]; then
-  TS="$(date -u +%Y%m%dT%H%M%SZ)"
-  "$RELEASE_DIR/venv/bin/python" - "$STATE/state.db" "$STATE/backups/state-preinstall-$TS.db" <<'PY'
-import sqlite3, sys
-src, dst = sys.argv[1], sys.argv[2]
-s = sqlite3.connect(src, timeout=10.0)
-d = sqlite3.connect(dst, timeout=10.0)
-with d:
-    s.backup(d)
-s.close(); d.close()
-print("backup ok:", dst)
-PY
-  chmod 0600 "$STATE/backups"/state-preinstall-*.db
-  chown "$API_USER":"$API_USER" "$STATE/backups"/state-preinstall-*.db || true
+# 5b. Stage-time MANIFEST (R32): sha256 of backend/** recorded now; the
+# validator verifies it before any switch (validator never writes it).
+cd "$RELEASE_DIR"
+find backend -type f -exec sha256sum {} + | sort > "$RELEASE_DIR/MANIFEST" \
+  || fail_keep_drain "manifest staging failed"
+echo "[install] staged MANIFEST with $(wc -l < "$RELEASE_DIR/MANIFEST") backend files"
+
+# 5c. Stage validation (R32/R35): validator runs under the release venv
+# with CWD at the release root and EGA_CONFIG_FILE exported. Any block
+# aborts before the symlink switch (drain kept on existing deploys).
+cd "$RELEASE_DIR"
+if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR/deploy/etc/validate-release.py" --release "$RELEASE_DIR" --config "$ETC/config.json"; then
+  echo "[install] stage validation ok"
+else
+  fail_keep_drain "stage validation blocked (see validator reason above)"
 fi
 
-# 7. Flip `current` symlink, then migrate.
-ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
-EGA_CONFIG_FILE="$ETC/config.json" "$CURRENT_LINK/venv/bin/python" - <<'PY'
-from backend.app.db import connect, migrate
-from backend.app.config import load_settings
-import os
-os.environ.setdefault("EGA_CONFIG_FILE", "/etc/ega-update/config.json")
-s = load_settings()
-conn = connect(s.db_path)
-migrate(conn)
-print("migrate ok:", s.db_path)
-PY
+# 6. Consistent SQLite backup BEFORE migrate (existing deploys only).
+#    Writers are already quiesced + stopped above; use the SQLite backup API
+#    so WAL content is included — never a bare `cp` of a live DB file.
+#    State paths come from config (R32), not hardcoded $STATE.
+if [ "$EXISTING_DEPLOY" = "1" ] && [ -f "$EFFECTIVE_DB" ]; then
+  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+  cd "$RELEASE_DIR"
+  EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'import sqlite3,sys; src, dst = sys.argv[1], sys.argv[2]; s = sqlite3.connect(src, timeout=10.0); d = sqlite3.connect(dst, timeout=10.0); s.backup(d); s.close(); d.close(); print("backup ok:", dst)' "$EFFECTIVE_DB" "$EFFECTIVE_BACKUPS/state-preinstall-$TS.db" \
+    || fail_keep_drain "pre-install DB backup failed"
+  chmod 0600 "$EFFECTIVE_BACKUPS"/state-preinstall-*.db
+  chown "$API_USER":"$API_USER" "$EFFECTIVE_BACKUPS"/state-preinstall-*.db || true
+fi
+
+# 6b. Migrate via the release venv with CWD at the release root (R32).
+cd "$RELEASE_DIR"
+if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.db import connect, migrate; from backend.app.config import load_settings; s = load_settings(); conn = connect(s.db_path); migrate(conn); print("migrate ok:", s.db_path)'; then
+  echo "[install] migrate ok"
+else
+  fail_keep_drain "migration failed (drain kept; see RUNBOOK migration-recovery)"
+fi
 # Joint-group DB ownership so both API (ega-update) and worker (ubuntu)
 # read/write state.db/WAL/SHM; 0660 keeps it restricted to the two accounts.
 # Secrets stay 0600 root:API_USER (unchanged, see §3).
-DB_PATH="$(EGA_CONFIG_FILE="$ETC/config.json" "$CURRENT_LINK/venv/bin/python" -c 'from backend.app.config import load_settings; print(load_settings().db_path)' 2>/dev/null || echo "$STATE/state.db")"
+cd "$RELEASE_DIR"
+DB_PATH="$(EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.config import load_settings; print(load_settings().db_path)' 2>/dev/null || printf '%s' "$EFFECTIVE_DB")"
 for dbf in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"; do
-  [ -e "$dbf" ] && { chown "$API_USER:ega-update" "$dbf" || true; chmod 0660 "$dbf" || true; }
+  if [ -e "$dbf" ]; then chown "$API_USER:ega-update" "$dbf" || true; chmod 0660 "$dbf" || true; fi
 done
+
+# 7. Atomic symlink switch (R33 step 7) — only after stage+validate+migrate.
+ln -sfn "$RELEASE_DIR" "$CURRENT_LINK" || fail_keep_drain "cannot flip current symlink"
+
+# 7b. Port drop-in (R35): render the effective listen port from config so
+# the unit never diverges from config defaults.
+EFFECTIVE_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("listen_port",8771))' "$ETC/config.json" 2>/dev/null || printf '8771')"
+mkdir -p /etc/systemd/system/ega-update-api.service.d
+printf '[Service]\nEnvironment=EGA_LISTEN_PORT=%s\n' "$EFFECTIVE_PORT" > /etc/systemd/system/ega-update-api.service.d/10-port.conf
+chmod 0644 /etc/systemd/system/ega-update-api.service.d/10-port.conf
+echo "[install] rendered port drop-in 10-port.conf with EGA_LISTEN_PORT=$EFFECTIVE_PORT"
 
 # 8. Systemd units: daemon-reload + enable + start order (api, worker, cloudflared).
 # Job units launch via `systemd-run --user` as ubuntu (see RUNBOOK --user
-# launch model); inspect them with `systemctl --user` as ubuntu, never the
-# system manager. The optional user-unit template lives at
-# systemd/user/ega-update-runner@.service for sites that prefer template
-# instances over bare systemd-run properties.
-cp "$CURRENT_LINK/systemd/ega-update-api.service" /etc/systemd/system/
-cp "$CURRENT_LINK/systemd/ega-update-worker.service" /etc/systemd/system/
-cp "$CURRENT_LINK/systemd/ega-update-runner@.service" /etc/systemd/system/
-cp "$CURRENT_LINK/systemd/cloudflared-ega-update.service" /etc/systemd/system/
+# launch model); inspect them with `systemctl --user` as ubuntu (with
+# XDG_RUNTIME_DIR set, e.g. via `sudo -u ubuntu -i`), never the system
+# manager. Runner templates document the transient unit shape only.
+cp "$CURRENT_LINK/systemd/ega-update-api.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (api)"
+cp "$CURRENT_LINK/systemd/ega-update-worker.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (worker)"
+cp "$CURRENT_LINK/systemd/ega-update-runner@.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (runner)"
+cp "$CURRENT_LINK/systemd/cloudflared-ega-update.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (tunnel)"
 if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
   mkdir -p "/home/$TOOL_OWNER/.config/systemd/user"
-  cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" "/home/$TOOL_OWNER/.config/systemd/user/"
+  cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" "/home/$TOOL_OWNER/.config/systemd/user/" || fail_keep_drain "user unit copy failed"
   chown -R "$TOOL_OWNER:$TOOL_OWNER" "/home/$TOOL_OWNER/.config/systemd/user"
   su -s /bin/bash "$TOOL_OWNER" -c 'systemctl --user daemon-reload' || true
 fi
-systemctl daemon-reload
-systemctl enable ega-update-api ega-update-worker cloudflared-ega-update
-systemctl start ega-update-api
-systemctl start ega-update-worker
-systemctl start cloudflared-ega-update
+systemctl daemon-reload || fail_keep_drain "daemon-reload failed"
+systemctl enable ega-update-api ega-update-worker cloudflared-ega-update || fail_keep_drain "unit enable failed"
 
-# 9. Localhost-binding + Access JWT validation checks (implemented here;
+# 9. Start console services.
+systemctl start ega-update-api || fail_keep_drain "api start failed"
+systemctl start ega-update-worker || fail_keep_drain "worker start failed"
+systemctl start cloudflared-ega-update || echo "[install] WARN: tunnel failed to start (placeholders expected pre-config) — API/worker unaffected" >&2
+
+# 10. Bounded readiness (R33 step 10): API health via curl localhost plus
+# worker heartbeat freshness via cli status. Both must pass before undrain.
+echo "[install] waiting for readiness (bounded 60s)..."
+READY=0
+for _i in $(seq 1 12); do
+  HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EFFECTIVE_PORT/api/v1/health" 2>/dev/null || printf '000')"
+  if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "200" ]; then
+    cd "$RELEASE_DIR"
+    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --wait-secs 5 >/tmp/ega-install-ready.json 2>/dev/null; then
+      if python3 -c 'import json,sys; d=json.load(open("/tmp/ega-install-ready.json")); raise SystemExit(0 if d.get("worker_alive") else 1)' 2>/dev/null; then
+        READY=1
+        break
+      fi
+    fi
+  fi
+  echo "[install] readiness pending (http=$HTTP_CODE, $_i/12)..."
+  sleep 5
+done
+if [ "$READY" = "1" ]; then
+  echo "[install] readiness ok (api http=$HTTP_CODE, worker heartbeat fresh)"
+else
+  # Rollback rule (R33): restore PRIOR symlink ONLY when compat passes;
+  # else leave manual-recovery state. Never restart the broken release.
+  if [ -n "$PREV_RELEASE" ] && [ -d "$PREV_RELEASE" ] && [ "$PREV_RELEASE" != "$RELEASE_DIR" ]; then
+    cd "$RELEASE_DIR"
+    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR/deploy/etc/validate-release.py" --check-compat "$PREV_RELEASE" "$RELEASE_DIR" >/dev/null 2>&1; then
+      echo "[install] readiness failed — compat ok, restoring prior release $PREV_RELEASE" >&2
+      ln -sfn "$PREV_RELEASE" "$CURRENT_LINK"
+      systemctl daemon-reload || true
+      systemctl restart ega-update-api ega-update-worker || true
+      fail_keep_drain "readiness failed; prior release restored (drain kept for review)"
+    fi
+    echo "[install] readiness failed — schema drift: MANUAL RECOVERY (prior symlink NOT restored; drain kept)" >&2
+    fail_keep_drain "readiness failed with schema drift; see RUNBOOK migration-recovery"
+  fi
+  fail_keep_drain "readiness failed after 60s (drain kept)"
+fi
+
+# 9b. Localhost-binding + Access JWT validation checks (implemented here;
 #    executed only when this script runs on the VM, never during code review).
 echo "[check] localhost binding:"
-(ss -ltnp 2>/dev/null | grep -E '127\.0\.0\.1:8771' \
-  || echo "WARN: nothing on 127.0.0.1:8771 — check EGA_LISTEN_PORT and api.env")
-LISTEN_HOST="$(EGA_CONFIG_FILE=$ETC/config.json "$CURRENT_LINK/venv/bin/python" -c 'from backend.app.config import load_settings; print(load_settings().listen_host)' 2>/dev/null || echo '?')"
-[ "$LISTEN_HOST" = "127.0.0.1" ] || { echo "REFUSING: listen_host=$LISTEN_HOST is not 127.0.0.1" >&2; exit 1; }
+(ss -ltnp 2>/dev/null | grep -E "127\\.0\\.0\\.1:$EFFECTIVE_PORT" \
+  || echo "WARN: nothing on 127.0.0.1:$EFFECTIVE_PORT — check EGA_LISTEN_PORT and api.env")
+cd "$RELEASE_DIR"
+LISTEN_HOST="$(EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.config import load_settings; print(load_settings().listen_host)' 2>/dev/null || printf '?')"
+if [ "$LISTEN_HOST" = "127.0.0.1" ]; then
+  :
+else
+  echo "REFUSING: listen_host=$LISTEN_HOST is not 127.0.0.1" >&2
+  fail_keep_drain "listen_host is not loopback"
+fi
 echo "[check] Access JWT config present:"
-EGA_CONFIG_FILE=$ETC/config.json "$CURRENT_LINK/venv/bin/python" - <<'PY'
-from backend.app.config import load_settings
-s = load_settings()
-missing = [k for k in ("team_domain", "audience", "public_origin") if not getattr(s, k)]
-if missing or not s.owner_emails or not s.csrf_secret:
-    raise SystemExit("REFUSING: incomplete Access config, missing: %s" % (missing or ["owner_emails/csrf_secret"]))
-print("Access config ok:", s.team_domain, s.audience, s.public_origin)
-PY
+cd "$RELEASE_DIR"
+if EGA_CONFIG_FILE=$ETC/config.json "$RELEASE_DIR/venv/bin/python" -c 'from backend.app.config import load_settings; s = load_settings(); missing = [k for k in ("team_domain", "audience", "public_origin") if not getattr(s, k)]; raise SystemExit("REFUSING: incomplete Access config, missing: %s" % (missing or ["owner_emails/csrf_secret"])) if (missing or not s.owner_emails or not s.csrf_secret) else print("Access config ok:", s.team_domain, s.audience, s.public_origin)'; then
+  :
+else
+  fail_keep_drain "Access config incomplete"
+fi
 
 # 10. Conflicting updaterSchedule handling — RECORD-ONLY by default.
 #     Detect cron entries, systemd timers, and tool self-update flags that
 #     could race the console lock. Disable ONLY confirmed-conflicting ones,
 #     AFTER saving prior config for restoration. Never blanket-disable.
 echo "[check] conflicting automation scan (record-only):"
-CONFLICT_DIR="$STATE/conflicting-automation"
+CONFLICT_DIR="$EFFECTIVE_STATE/conflicting-automation"
 mkdir -p "$CONFLICT_DIR"
 chmod 0700 "$CONFLICT_DIR"
 {
@@ -265,11 +460,18 @@ echo "    systemctl cat <timer> > $CONFLICT_DIR/<timer>.unit.bak"
 echo "    sudo systemctl disable --now <timer>"
 echo "  and record the restoration command in $CONFLICT_DIR/README."
 
+# 11. Release drain only on success (R33 step 11). A pre-existing drain
+# (manual maintenance) is left for its owner to clear.
+if [ "$DRAIN_CREATED_BY_US" = "1" ]; then
+  rm -f "$DRAIN"
+  echo "[install] drain removed (admitting); done: $COMMIT"
+else
+  echo "[install] done: $COMMIT (tool state untouched)"
+fi
+
 # Lingering / user-services: job runners launch via `systemd-run --user` as
 # ubuntu and T3 user services run under the ubuntu user manager, so
 # `loginctl enable-linger ubuntu` is REQUIRED (see §4b with idempotent
 # check). Without linger the user manager (and all --user job units) dies
 # when the last SSH session closes. The worker itself remains a system unit
 # under User=ubuntu; only job execution uses the user manager.
-
-echo "[install] done: $COMMIT (tool state untouched)"

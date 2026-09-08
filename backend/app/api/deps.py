@@ -19,11 +19,54 @@ TOOL_IDS = ("hermes", "opencode", "codex", "t3")
 
 NO_STORE = {"Cache-Control": "no-store"}
 
-# Rate-limit choice: return HTTP 429 with code "rate_limited" (not 503).
-# Rationale: 429 is the standard per-identity throttle signal; 503 is reserved
-# for worker/storage unavailability (SPEC section 10) so callers can tell a
-# busy identity apart from a down backend.
+# Rate limits (R21): separate read-polling budget from mutation abuse
+# protection so normal UI polling can never consume its own admission
+# limit. Buckets are per-identity sliding 60s windows. 429 carries
+# Retry-After (seconds until the oldest bucket entry ages out).
+READ_LIMIT_PER_MIN = 600
+WRITE_LIMIT_PER_MIN = 60
 _rate_buckets = {}  # type: Dict[str, List[float]]
+
+
+def _bucket_limit(kind):
+    # type: (str) -> int
+    if kind == "write":
+        try:
+            return int(getattr(settings, "rate_limit_per_min", 0)
+                       or WRITE_LIMIT_PER_MIN)
+        except Exception:
+            return WRITE_LIMIT_PER_MIN
+    return READ_LIMIT_PER_MIN
+
+
+def check_rate_limit(identity, kind="read"):
+    # type: (str, str) -> bool
+    """Sliding 60s window per identity per bucket kind ("read"|"write").
+
+    Legacy single-argument callers land in the read bucket.
+    """
+    limit = _bucket_limit(kind if kind in ("read", "write") else "read")
+    now = time.time()
+    key = "%s\x00%s" % (kind, identity)
+    bucket = _rate_buckets.get(key, [])
+    bucket = [t for t in bucket if now - t < 60.0]
+    if len(bucket) >= limit:
+        _rate_buckets[key] = bucket
+        return False
+    bucket.append(now)
+    _rate_buckets[key] = bucket
+    return True
+
+
+def retry_after_s(identity, kind="read"):
+    # type: (str, str) -> int
+    """Seconds until the oldest bucket entry ages out (for Retry-After)."""
+    now = time.time()
+    key = "%s\x00%s" % (kind, identity)
+    bucket = [t for t in _rate_buckets.get(key, []) if now - t < 60.0]
+    if not bucket:
+        return 0
+    return max(0, int(60.0 - (now - min(bucket))) + 1)
 
 
 def new_request_id():
@@ -103,26 +146,18 @@ def subject_of(claims):
     return str(claims.get("sub", "") or "")
 
 
-def check_rate_limit(identity):
-    # type: (str) -> bool
-    """Sliding 60s window per identity. True if allowed."""
-    limit = int(getattr(settings, "rate_limit_per_min", 60) or 60)
-    now = time.time()
-    bucket = _rate_buckets.get(identity, [])
-    bucket = [t for t in bucket if now - t < 60.0]
-    if len(bucket) >= limit:
-        _rate_buckets[identity] = bucket
-        return False
-    bucket.append(now)
-    _rate_buckets[identity] = bucket
-    return True
-
-
-def rate_limited_response(request_id=""):
-    # type: (str) -> JSONResponse
-    return error_envelope(
+def rate_limited_response(request_id="", retry_after=60):
+    # type: (str, int) -> JSONResponse
+    try:
+        retry_s = max(0, int(retry_after))
+    except (TypeError, ValueError):
+        retry_s = 60
+    resp = error_envelope(
         429, "rate_limited",
-        "rate limit exceeded; retry after 60s", "", request_id or new_request_id())
+        "rate limit exceeded; retry after %ds" % retry_s, "",
+        request_id or new_request_id())
+    resp.headers["Retry-After"] = str(retry_s)
+    return resp
 
 
 def check_body_limit(request):
@@ -148,6 +183,46 @@ def check_body_limit(request):
         except ValueError:
             return False
     return True
+
+
+async def read_bounded_body(request, limit=None):
+    # type: (Request, object) -> bytes
+    """Read the body enforcing the byte limit WHILE streaming (R16).
+
+    Raises ValueError on overflow instead of buffering unlimited input
+    before enforcement. Returns b"" for empty bodies.
+    """
+    if limit is None:
+        try:
+            limit = int(getattr(settings, "body_limit_bytes",
+                                256 * 1024) or 256 * 1024)
+        except Exception:
+            limit = 256 * 1024
+    chunks = []
+    total = 0
+    try:
+        stream = request.stream()
+    except Exception:
+        # No streaming interface (e.g. test doubles): bounded single read.
+        try:
+            body = await request.body()
+        except Exception:
+            return b""
+        try:
+            raw = bytes(body or b"")
+        except Exception:
+            return b""
+        if len(raw) > int(limit):
+            raise ValueError("request body too large")
+        return raw
+    async for chunk in stream:
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > int(limit):
+            raise ValueError("request body too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def require_mutation_guards(request, claims):

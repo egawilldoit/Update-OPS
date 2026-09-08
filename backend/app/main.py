@@ -17,31 +17,29 @@ from fastapi.staticfiles import StaticFiles
 
 from .api.routes import router as v1_router
 from .config import settings
-from .db import connect, migrate
+from .db import connect, validate_schema
+from .readiness import ReadinessError, validate_startup
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # type: (FastAPI) -> AsyncIterator[None]
-    # Short migrate-at-startup only; request handlers use short
-    # transactions and never migrate per request. A migration failure must
-    # fail startup/readiness (re-raise after rollback) so a
-    # schema-incompatible API never serves traffic.
+    # R31: startup VALIDATES ONLY — the controlled deploy procedure owns
+    # migration. A pending/incompatible/newer schema, or failed readiness
+    # (placeholders, unreadable secrets), fails startup so an unsafe API
+    # never serves traffic.
     conn = connect(settings.db_path)
     try:
-        migrate(conn)
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
+        validate_schema(conn)
     finally:
         try:
             conn.close()
         except Exception:
             pass
+    try:
+        validate_startup("api", settings)
+    except ReadinessError:
+        raise
     yield
 
 

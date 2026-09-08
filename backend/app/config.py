@@ -87,6 +87,8 @@ class Settings:
     npx_path: str = "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npx"
     # Secrets file (one secret per line; never logged)
     secrets_file: str = "/etc/ega-update/secrets.env"
+    # Inventory file (deploy/etc/inventory.json content installed here).
+    inventory_file: str = "/etc/ega-update/inventory.json"
     # Deploy-owned passthroughs (mirror deploy/etc/config.example.json).
     # service_units: console + inventoried units (deploy-managed).
     # adapter_timeouts_s: per-step ceilings overlaying ADAPTER_TIMEOUT_DEFAULTS.
@@ -200,6 +202,9 @@ def load_settings():
     s.npx_path = pick("EGA_NPX_PATH", "npx_path") or s.npx_path
     s.secrets_file = pick(
         "EGA_SECRETS_FILE", "secrets_file", s.secrets_file) or s.secrets_file
+    s.inventory_file = pick(
+        "EGA_INVENTORY_FILE", "inventory_file",
+        s.inventory_file) or s.inventory_file
     # service_units dict passthrough (file key service_units; optional JSON
     # object in EGA_SERVICE_UNITS wins). Unparsable shapes yield {}.
     _units = {}  # type: Dict[str, Any]

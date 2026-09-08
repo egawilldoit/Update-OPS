@@ -9,12 +9,13 @@
 # is unavailable). restart=always keeps exactly one dispatcher alive; the
 # lock prevents duplicates during restarts/overlaps.
 #
-# Job launch model: the dispatcher (User=ubuntu) spawns each job via
-# `systemd-run --user` into the ubuntu user manager (requires
-# `loginctl enable-linger ubuntu`; see install.sh §4b + RUNBOOK). Job units
-# (ega-update-job-<shortid>) are inspected with `systemctl --user` as
-# ubuntu — never the system manager. See systemd/user/
-# ega-update-runner@.service for the preferred user-unit template.
+# Job launch model: the dispatcher (User=ubuntu) spawns each job via the
+# canonical `systemd-run --user ... runner <job-id> <nonce>` dispatch into
+# the ubuntu user manager (requires `loginctl enable-linger ubuntu`; see
+# install.sh §4b + RUNBOOK). Job units
+# (ega-update-job-<32hex-uuid>.service, full UUID hex) are inspected with
+# `systemctl --user` as ubuntu — never the system manager. Runner templates
+# document this transient shape only and are never started directly.
 #
 # On (re)start the dispatcher runs reconcile_boot(): nonterminal jobs without
 # a live runner unit AND without a persisted completion receipt become

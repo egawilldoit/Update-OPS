@@ -1,24 +1,16 @@
-"""SSH-only reconcile command (SPEC §8).
+"""SSH-only reconcile command (R07). Python 3.10 compatible.
 
 Usage:
   python -m backend.app.worker.reconcile --job-id <uuid> [--clear-recovery]
   [--db-path /var/lib/ega-update/state.db]
 
-Inspects the recorded systemd runner unit (``systemctl is-active/show``),
-process state (``/proc`` liveness scan), and installation probes (READ-ONLY
-reads of the tools row), then prints a verdict.
-
-Rules:
-- Clears ``recovery_required`` ONLY with ``--clear-recovery`` AND after
-  proving no updater remains (unit inactive + MainPID dead + no process
-  carries the job id). NEVER on heartbeat age.
-- Records every run in ``events`` (``reconcile`` / ``recovered``).
-- Exits nonzero when unresolved.
-- Requires ``--job-id``; refuses to run without it (including
-  non-interactively). Run over SSH or the provider console only — never
-  from the browser/API (the API cannot invoke this).
-
-Python 3.10 compatible. Stdlib + backend.app.db only.
+Single shared algorithm (reconcile_core.decide + units.query_unit +
+receipts v2 binding + tx.transition_tx) — never a second recovery
+algorithm. Observer self-exclusion via canonical unit hex (the observer
+carries only the dashed UUID, never the unit hex). Receipts load as JSON
+first and validate; NO unvalidated fallback promotion. Clearing recovery
+additionally terminalizes abandoned nonterminal rows atomically and runs
+a genuine bounded owner-side inspection for the report.
 """
 from __future__ import annotations
 
@@ -31,7 +23,6 @@ import sys
 from backend.app.db import connect
 
 DEFAULT_DB = "/var/lib/ega-update/state.db"
-RECEIPT_TMPL = "/var/lib/ega-update/logs/%s.receipt.json"
 
 
 def _db_path(args_db):
@@ -53,251 +44,238 @@ def _db_path(args_db):
     return DEFAULT_DB
 
 
-def _run_systemctl(args):
-    # type: (list) -> str
-    # Job runner units are user-manager units: the dispatcher launches via
-    # `systemd-run --user` as ubuntu, so inspection MUST use
-    # `systemctl --user` run as ubuntu (requires linger, see RUNBOOK).
-    # Fixed argv, shell=False, read-only inspection only.
-    try:
-        proc = subprocess.run(
-            ["systemctl", "--user"] + args,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=15, shell=False)
-        return proc.stdout.strip()
-    except Exception as exc:
-        return "ERROR: %s" % exc
-
-
-def _unit_state(unit):
-    # type: (str) -> dict
-    """Read-only inspection of the recorded runner unit (user manager).
-
-    Uses `systemctl --user` (run as ubuntu) because job units are transient
-    user units launched via `systemd-run --user`.
-    """
-    active = _run_systemctl(["is-active", unit])
-    show = _run_systemctl(["show", unit, "-p", "ActiveState,SubState,MainPID,ExecMainStatus,Result"])
-    info = {"is_active": active, "show": show, "main_pid": 0}  # type: dict
-    for line in show.splitlines():
-        if line.startswith("MainPID="):
-            try:
-                info["main_pid"] = int(line.split("=", 1)[1])
-            except ValueError:
-                info["main_pid"] = 0
-    return info
-
-
-def _pid_alive(pid):
-    # type: (int) -> bool
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
-    # Zombie check via /proc stat (state Z == dead for our purposes).
-    try:
-        with open("/proc/%d/stat" % pid, "r", encoding="utf-8") as fh:
-            parts = fh.read().rsplit(")", 1)
-            if len(parts) == 2 and parts[1].split():
-                return parts[1].split()[0] != "Z"
-    except Exception:
-        pass
-    return True
-
-
-def _job_processes(job_id):
-    # type: (str) -> list
-    """Read-only /proc scan for processes still carrying the job id."""
-    found = []
-    short = job_id[:8]
-    try:
-        pids = [p for p in os.listdir("/proc") if p.isdigit()]
-    except Exception:
-        return found
-    for pid in pids:
-        try:
-            with open("/proc/%s/cmdline" % pid, "rb") as fh:
-                cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
-        except Exception:
-            continue
-        if job_id in cmd or ("ega-update" in cmd and short in cmd):
-            found.append({"pid": int(pid), "cmdline": cmd[:300]})
-    return found
-
-
 def _utcnow():
     # type: () -> str
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _genuine_inspection(tool_id):
+    # type: (str) -> str
+    """Bounded owner-side inspection for the report (R07).
+
+    Runs as ubuntu over SSH: genuine adapter inspect, bounded, read-only.
+    Never used for state transitions — only human-readable evidence.
+    """
+    try:
+        from backend.app.adapters import registry as _registry
+        adapter = _registry.get_adapter(tool_id)
+    except Exception as exc:
+        return "adapter unavailable: %s" % exc
+    try:
+        inspection = adapter.inspect()
+    except Exception as exc:
+        return "inspect failed: %s" % str(exc)[:200]
+    try:
+        return "version=%s fingerprint=%s identity=%s" % (
+            getattr(inspection, "version", "") or "-",
+            str(getattr(inspection, "fingerprint", "") or "")[:16],
+            str(getattr(inspection, "install_identity", "") or "")[:80])
+    except Exception:
+        return "inspect unparseable"
+
+
 def main(argv=None):
     # type: (list) -> int
-    ap = argparse.ArgumentParser(description="SSH-only job reconcile (read-only probes + gated recovery clear).")
-    ap.add_argument("--job-id", required=True, help="Job UUID to reconcile (required, incl. non-interactive use).")
+    from backend.app import reconcile_core as _rc
+    from backend.app import units as _units
+    from backend.app.receipts import (apply_receipt, check_binding,
+                                      load_receipt_file, shows_mutation,
+                                      validate_receipt)
+    from backend.app.tx import TxError, transition_tx
+
+    ap = argparse.ArgumentParser(
+        description="SSH-only job reconcile (shared algorithm + gated "
+                    "recovery clear).")
+    ap.add_argument("--job-id", required=True,
+                    help="Job UUID (required, incl. non-interactive use).")
     ap.add_argument("--clear-recovery", action="store_true",
-                    help="Clear recovery_required ONLY after proving no updater remains.")
-    ap.add_argument("--db-path", default="", help="SQLite path (default: EGA_DB_PATH / config db_path / %s)." % DEFAULT_DB)
+                    help="Clear recovery_required ONLY after proving no "
+                         "updater remains (terminalizes abandoned rows).")
+    ap.add_argument("--db-path", default="",
+                    help="SQLite path (default: EGA_DB_PATH / config / %s)."
+                    % DEFAULT_DB)
     args = ap.parse_args(argv)
     if not args.job_id:
         ap.error("--job-id is required (refusing to run without it)")
 
     db_path = _db_path(args.db_path)
-    conn = connect(db_path)
     try:
-        job = conn.execute("SELECT * FROM jobs WHERE id=?", (args.job_id,)).fetchone()
+        conn = connect(db_path)
+    except Exception as exc:
+        print("ERROR: cannot open db: %s" % exc)
+        return 2
+    try:
+        job = conn.execute("SELECT * FROM jobs WHERE id=?",
+                           (args.job_id,)).fetchone()
     except Exception as exc:
         print("ERROR: cannot read job: %s" % exc)
         return 2
     if job is None:
         print("ERROR: unknown job id: %s" % args.job_id)
         return 2
+    job_d = dict(job)
+    unit = str(job_d.get("canonical_unit", "")
+               or job_d.get("runner_unit", "") or "")
+    if not unit:
+        unit = _rc.canonical_unit(args.job_id)
+    state = str(job_d.get("state", ""))
+    recovery = bool(job_d.get("recovery_required", 0))
+    print("job: %s tool=%s state=%s recovery_required=%s"
+          % (job_d["id"], job_d.get("tool_id", ""), state, int(recovery)))
+    print("runner_unit: %s" % unit)
+    print("heartbeat (informational only, never clears recovery): %s"
+          % (job_d.get("heartbeat", "") or "(none)"))
 
-    unit = job["runner_unit"] or ""
-    state = job["state"]
-    recovery = bool(job["recovery_required"])
-    heartbeat = job["heartbeat"] or ""
-    print("job: %s tool=%s state=%s recovery_required=%s" % (job["id"], job["tool_id"], state, int(recovery)))
-    print("runner_unit: %s" % (unit or "(none recorded)"))
-    # Heartbeat is informational only — never a basis for clearing.
-    print("heartbeat (informational only, never clears recovery): %s" % (heartbeat or "(none)"))
+    info = _units.query_unit(unit, timeout_s=10)
+    print("unit state: %s (active=%s sub=%s main_pid=%s)" % (
+        info.get("state"), info.get("active_state"),
+        info.get("sub_state"), info.get("main_pid")))
+    if info.get("detail"):
+        print("unit detail: %s" % info["detail"])
 
-    unit_info = _unit_state(unit) if unit else {"is_active": "(no unit)", "show": "", "main_pid": 0}
-    print("unit is-active: %s" % unit_info["is_active"])
-    for line in str(unit_info["show"]).splitlines():
-        print("unit show: %s" % line)
-    main_pid = int(unit_info.get("main_pid") or 0)
-    print("main_pid: %d alive=%s" % (main_pid, _pid_alive(main_pid) if main_pid else False))
-
-    receipt = RECEIPT_TMPL % args.job_id
-    receipt_ok = os.path.exists(receipt)
-    print("completion receipt: %s present=%s" % (receipt, receipt_ok))
-
-    leftovers = _job_processes(args.job_id)
-    if leftovers:
-        print("live job processes: %d" % len(leftovers))
-        for item in leftovers[:20]:
+    try:
+        procs = _rc.job_processes(_rc.unit_hex(args.job_id), args.job_id)
+    except Exception:
+        procs = []
+    if procs:
+        print("live execution-marked processes: %d (self excluded)"
+              % len(procs))
+        for item in procs[:20]:
             print("  pid=%s cmd=%s" % (item["pid"], item["cmdline"]))
     else:
-        print("live job processes: 0")
+        print("live execution-marked processes: 0")
 
-    # Read-only installation probe: observed tool state, never mutated here.
+    # Receipt loads as JSON FIRST, then validates; never promoted without
+    # validation and binding (R07: no unvalidated fallback).
     try:
-        tool = conn.execute("SELECT * FROM tools WHERE id=?", (job["tool_id"],)).fetchone()
+        from backend.app.config import settings as _settings
+        receipt_path = os.path.join(
+            getattr(_settings, "log_dir", "/var/lib/ega-update/logs"),
+            "%s.receipt.json" % args.job_id)
     except Exception:
-        tool = None
-    if tool is not None:
-        print("tool probe (read-only): id=%s version=%s health=%s detail=%s" %
-              (tool["id"], tool["observed_version"], tool["health"], (tool["health_detail"] or "")[:200]))
+        receipt_path = "/var/lib/ega-update/logs/%s.receipt.json" \
+            % args.job_id
+    ok, data, reason = load_receipt_file(receipt_path)
+    receipt_view = None
+    if ok and isinstance(data, dict):
+        bound, why = check_binding(data, job_d, args.job_id)
+        if bound:
+            receipt_view = dict(data)
+            receipt_view["_valid"] = True
+            print("validated bound receipt: state=%s exit=%s" % (
+                data.get("state", "?"), data.get("exit_code", "?")))
+        else:
+            print("receipt present but UNBOUND (%s); never applied" % why)
+            ok = False
     else:
-        print("tool probe (read-only): no tools row for %s" % job["tool_id"])
+        print("receipt: %s" % (reason or "absent"))
 
-    unit_live = (unit_info["is_active"] == "active") or _pid_alive(main_pid) or bool(leftovers)
-    now = _utcnow()
+    action, detail = _rc.decide(job_d, info, receipt_view, procs)
+    print("decision: %s — %s" % (action, detail))
     try:
         conn.execute(
-            "INSERT INTO events(job_id,created_at,event_type,detail) VALUES(?,?,?,?)",
-            (args.job_id, now, "reconcile",
-             "unit=%s active=%s receipt=%s procs=%d" % (unit or "-", unit_info["is_active"], int(receipt_ok), len(leftovers))))
+            "INSERT INTO events(job_id,created_at,event_type,detail)"
+            " VALUES(?,?,?,?)",
+            (args.job_id, _utcnow(), "reconcile",
+             "unit=%s state=%s receipt=%s procs=%d decision=%s" % (
+                 unit, info.get("state"), int(bool(receipt_view)),
+                 len(procs), action)))
         conn.commit()
     except Exception as exc:
         print("WARN: could not record reconcile event: %s" % exc)
 
-    if unit_live:
-        print("VERDICT: UNRESOLVED — runner/updater still present; recovery_required stays set. "
-              "Do not start new jobs; do not clear on heartbeat age. Re-run after the unit exits.")
+    print("genuine owner inspection (read-only, bounded): %s"
+          % _genuine_inspection(str(job_d.get("tool_id", ""))))
+
+    if action in ("live", "starting", "stopping"):
+        print("VERDICT: UNRESOLVED — execution still present; "
+              "recovery_required stays set. Re-run after quiescence.")
         return 1
-
-    # No updater remains proven (unit inactive + MainPID dead + no job procs).
-    # Optionally reconstruct DB terminal state from a validated receipt.
-    # Import backend.app.receipts defensively; when unavailable fall back to
-    # an existence-report (never invent terminal state, never clear on
-    # heartbeat age).
-    receipt_state = ""
-    try:
+    if action == "keep-unknown":
+        print("VERDICT: UNRESOLVED — unit state unknown; reservation and "
+              "recovery gate stay. Investigate the user manager, then "
+              "re-run. Never clear on heartbeat age.")
+        return 1
+    # Unit confirmed stopped from here on.
+    if action == "apply-receipt" and receipt_view is not None:
         try:
-            from backend.app.receipts import validate_receipt as _validate_receipt  # type: ignore
-        except Exception:
-            from backend.app.receipts import load_receipt as _load_receipt_fallback  # type: ignore
-            _validate_receipt = None  # type: ignore
-        if "_validate_receipt" in locals() and _validate_receipt is not None:
-            _validated = _validate_receipt(receipt)
-            if isinstance(_validated, dict) and _validated.get("job_id") == args.job_id:
-                receipt_state = str(_validated.get("state", "") or "")
-                print("validated receipt: state=%s exit=%s (via backend.app.receipts)" % (
-                    receipt_state or "?", _validated.get("exit_code", "?")))
-            else:
-                print("validated receipt: unreadable or job mismatch; existence-report only (present=%s)" % receipt_ok)
-        else:
-            raise ImportError("receipts validator unavailable")
-    except Exception:
-        # Fallback: existence-report only; never reconstruct without validation.
-        if receipt_ok:
+            applied = apply_receipt(conn, receipt_view, args.job_id)
+            print("applied bound receipt: state=%s" % applied)
+            state = applied
+        except ValueError as exc:
+            print("ERROR: receipt apply refused: %s" % exc)
+            return 1
+        needs_recovery = _rc.recovery_for(
+            state, shows_mutation(receipt_view),
+            bool(job_d.get("unresolved", 0)))
+        if str(receipt_view.get("recovery_disposition", "")) == "required":
+            needs_recovery = True
+        if needs_recovery and not recovery:
             try:
-                with open(receipt, "r", encoding="utf-8") as _fh:
-                    import json as _json
-
-                    _data = _json.load(_fh)
-                if isinstance(_data, dict) and _data.get("job_id") == args.job_id:
-                    _cand = str(_data.get("state", "") or "")
-                    if _cand in ("succeeded", "blocked", "failed", "health_failed", "interrupted"):
-                        receipt_state = _cand
-                        print("receipt existence-report: state=%s (unvalidated fallback; receipts module unavailable)" % receipt_state)
-                    else:
-                        print("receipt existence-report: present but terminal state unproven (present=%s)" % receipt_ok)
-                else:
-                    print("receipt existence-report: present but job mismatch/unreadable (present=%s)" % receipt_ok)
-            except Exception as _exc:
-                print("receipt existence-report: present=%s unreadable (%s)" % (receipt_ok, str(_exc)[:200]))
-        else:
-            print("receipt existence-report: absent; outcome unproven")
-    # When a validated receipt proves a terminal outcome but the DB still
-    # shows nonterminal/interrupted, reconcile the DB to the receipt (with an
-    # event) so history reflects proven completion. Fail-closed: any doubt
-    # leaves the DB untouched for manual review.
-    if receipt_state in ("succeeded", "blocked", "failed", "health_failed", "interrupted"):
-        try:
-            if state != receipt_state:
-                conn.execute("UPDATE jobs SET state=? WHERE id=?", (receipt_state, args.job_id))
                 conn.execute(
-                    "INSERT INTO events(job_id,created_at,event_type,detail) VALUES(?,?,?,?)",
-                    (args.job_id, _utcnow(), "reconcile-receipt",
-                     "DB state %s reconciled to validated receipt state %s" % (state, receipt_state)))
+                    "UPDATE jobs SET recovery_required=1 WHERE id=?",
+                    (args.job_id,))
+                conn.execute(
+                    "INSERT INTO events(job_id,created_at,event_type,"
+                    "detail) VALUES(?,?,?,?)",
+                    (args.job_id, _utcnow(), "recovery_required",
+                     "reconciled %s with mutation evidence" % applied))
                 conn.commit()
-                print("reconciled DB state %s -> %s from validated receipt" % (state, receipt_state))
-                state = receipt_state
-        except Exception as exc:
-            print("WARN: could not reconcile DB state from receipt: %s" % exc)
+                recovery = True
+            except Exception as exc:
+                print("ERROR: could not set recovery: %s" % exc)
+                return 1
+    elif action == "mark-interrupted":
+        needs_recovery = _rc.recovery_for(
+            state, False, bool(job_d.get("unresolved", 0)))
+        try:
+            transition_tx(
+                conn, args.job_id, "interrupted", step="interrupted",
+                expect_states=["accepted", "preflight", "backup",
+                               "updating", "verifying", "interrupted"],
+                update={"error_code": "interrupted",
+                        "error_detail": "ssh reconcile: %s" % detail[:400],
+                        "recovery_required": 1 if needs_recovery else 0,
+                        "unresolved": 0},
+                event="interrupted", event_detail=detail[:500])
+            print("terminalized abandoned job as interrupted "
+                  "(recovery=%s)" % int(needs_recovery))
+            state = "interrupted"
+            recovery = recovery or needs_recovery
+        except TxError as exc:
+            print("ERROR: cannot terminalize: %s" % exc)
+            return 1
 
     if args.clear_recovery:
         if not recovery:
-            print("VERDICT: no updater remains; recovery_required already clear. Nothing to do.")
+            print("VERDICT: no updater remains; recovery_required already "
+                  "clear. Nothing to do.")
             return 0
         try:
-            conn.execute("UPDATE jobs SET recovery_required=0 WHERE id=?", (args.job_id,))
             conn.execute(
-                "INSERT INTO events(job_id,created_at,event_type,detail) VALUES(?,?,?,?)",
-                (args.job_id, _utcnow(), "recovered", "ssh reconcile: no updater remains (unit=%s)" % (unit or "-")))
+                "UPDATE jobs SET recovery_required=0 WHERE id=?",
+                (args.job_id,))
+            conn.execute(
+                "INSERT INTO events(job_id,created_at,event_type,detail)"
+                " VALUES(?,?,?,?)",
+                (args.job_id, _utcnow(), "recovered",
+                 "ssh reconcile: no updater remains (unit=%s)" % unit))
             conn.commit()
         except Exception as exc:
             print("ERROR: failed to clear recovery: %s" % exc)
             return 1
-        print("VERDICT: recovery_required CLEARED after proving no updater remains. "
-              "Terminal job history is preserved; run a manual `Check again` after any SSH repair.")
+        print("VERDICT: recovery_required CLEARED after proving no updater "
+              "remains. Terminal history preserved; run Check again.")
         return 0
 
-    if recovery or state in ("accepted", "preflight", "backup", "updating", "verifying", "interrupted"):
-        print("VERDICT: UNRESOLVED — no updater remains, but recovery_required/state needs an explicit "
-              "`--clear-recovery` decision. Inspect the installation, then re-run with --clear-recovery.")
+    if recovery or state in ("accepted", "preflight", "backup", "updating",
+                             "verifying", "interrupted"):
+        print("VERDICT: UNRESOLVED — no updater remains, but recovery/state "
+              "needs an explicit `--clear-recovery` decision after "
+              "inspecting the installation.")
         return 1
-    print("VERDICT: resolved — no updater remains and no recovery block is set. "
-          "Receipt present: %s." % receipt_ok)
+    print("VERDICT: resolved — no updater remains and no recovery block.")
     return 0
 
 

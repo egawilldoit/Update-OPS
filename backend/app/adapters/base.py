@@ -58,6 +58,23 @@ class PlanResult(BaseModel):
     timeouts: Dict[str, int] = Field(default_factory=dict)
     restart_impact: str = ""
     already_current: bool = False
+    # v2 immutable-contract fields (R15). Adapters fill what they prove;
+    # the API/runner bind config_hash/release/deadlines and persist all.
+    install_identity: str = ""
+    artifact: Dict[str, str] = Field(default_factory=dict)
+    config_hash: str = ""
+    launch: Dict[str, str] = Field(default_factory=dict)
+    state_homes: List[str] = Field(default_factory=list)
+    backup_policy: Dict[str, str] = Field(default_factory=dict)
+    required_probes: List[str] = Field(default_factory=list)
+    required_checks: List[str] = Field(default_factory=list)
+    budgets: Dict[str, int] = Field(default_factory=dict)
+    space_fs: Dict[str, int] = Field(default_factory=dict)
+    deadlines: Dict[str, int] = Field(default_factory=dict)
+    restart_detail: str = ""
+    activity_ts: str = ""
+    release_path: str = ""
+    scope_unit: str = ""
 
 
 class BackupResult(BaseModel):
@@ -135,6 +152,15 @@ class Adapter(abc.ABC):
     def verify(self):
         # type: () -> VerifyResult
         raise NotImplementedError
+
+    def measure_footprint(self, plan=None):
+        # type: (object) -> Dict[str, int]
+        """Measured {filesystem_path: bytes} for space budgets (R28).
+
+        -1 values mean unknown and must block. Default: unknown everywhere
+        (fail closed); concrete adapters override with real measurements.
+        """
+        return {}
 
 
 ADAPTER_TIMEOUT_DEFAULTS = {

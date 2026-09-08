@@ -1,10 +1,18 @@
-// Typed fetch client for all 9 /api/v1 endpoints.
+// Typed fetch client for all /api/v1 endpoints.
 // - Same-origin requests with credentials (Cloudflare Access cookie).
 // - CSRF: GET /session returns csrf_token; POSTs send it as X-CSRF-Token
 //   with Content-Type: application/json (backend rejects mismatches with 403).
 // - Error envelope: {code,message,details,request_id} per CONTRACTS section 4.
-// - Disconnected: network failure throws DisconnectedError so the UI shows a
-//   "disconnected" banner and never renders cached green as current.
+// - Disconnected: network failure or 15s AbortController timeout throws
+//   DisconnectedError so the UI shows a "disconnected" banner and never
+//   renders cached green as current.
+// - 429: backend carries a Retry-After header (read vs mutation rate buckets
+//   are separate server-side). ApiError.retryAfterMs preserves it; callers
+//   honor Retry-After then exponential backoff (max 30s) and surface
+//   reconnect state. Never busy-spin on 429.
+// - JobView.final_log_seq: int, -1 unknown until durable flush (main agent).
+//   UI drains logs until (terminal && next_after >= final_log_seq &&
+//   !has_more); see app.tsx R20 drain.
 
 export interface ErrorBody {
   code: string;
@@ -16,10 +24,13 @@ export interface ErrorBody {
 export class ApiError extends Error {
   status: number;
   body: ErrorBody;
-  constructor(status: number, body: ErrorBody) {
+  /** Retry-After in ms when status is 429 and the header parsed; else null. */
+  retryAfterMs: number | null;
+  constructor(status: number, body: ErrorBody, retryAfterMs: number | null = null) {
     super(body.message || `request failed (${status})`);
     this.status = status;
     this.body = body;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -77,6 +88,8 @@ export interface JobView {
   runner_unit: string;
   recovery_required: boolean;
   backup_summary: string;
+  /** Final durable log seq; -1 unknown until durable flush (main agent). */
+  final_log_seq: number;
   replayed?: boolean;
 }
 
@@ -126,6 +139,11 @@ export interface HealthView {
 
 const BASE = "/api/v1";
 
+/** AbortController timeout for every request (R21): 15s. */
+export const REQUEST_TIMEOUT_MS = 15000;
+/** Backoff ceiling for 429/network retries (R21): 30s. */
+export const MAX_BACKOFF_MS = 30000;
+
 let csrfToken = "";
 let idemCounter = 0;
 
@@ -160,19 +178,63 @@ function parseErrorBody(text: string): ErrorBody {
   }
 }
 
+/** Parse a Retry-After header (delay-seconds or HTTP-date) to ms; null when absent/invalid. */
+export function parseRetryAfterMs(value: string | null): number | null {
+  if (!value) return null;
+  const v = value.trim();
+  if (!v) return null;
+  if (/^\d+$/.test(v)) {
+    const secs = parseInt(v, 10);
+    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, MAX_BACKOFF_MS);
+    return null;
+  }
+  const t = Date.parse(v);
+  if (!Number.isNaN(t)) {
+    const delta = t - Date.now();
+    if (delta <= 0) return 0;
+    return Math.min(delta, MAX_BACKOFF_MS);
+  }
+  return null;
+}
+
+/** Exponential backoff honoring Retry-After first, capped at 30s (R21). */
+export function backoffMs(attempt: number, retryAfterMs: number | null): number {
+  const safeAttempt = Math.max(0, Math.min(10, Math.floor(attempt) || 0));
+  const exp = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** safeAttempt);
+  if (retryAfterMs !== null && retryAfterMs >= 0) {
+    return Math.min(MAX_BACKOFF_MS, Math.max(retryAfterMs, exp));
+  }
+  return exp;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(`${BASE}${path}`, {
       credentials: "same-origin",
       ...init,
+      signal: controller.signal,
     });
   } catch {
+    window.clearTimeout(timer);
+    // Abort (15s timeout) and network failure both surface as disconnected;
+    // callers apply backoff and reconnect state, never cached-green.
     throw new DisconnectedError();
   }
+  window.clearTimeout(timer);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new ApiError(res.status, parseErrorBody(text));
+    let retryAfterMs: number | null = null;
+    if (res.status === 429) {
+      try {
+        retryAfterMs = parseRetryAfterMs(res.headers.get("Retry-After"));
+      } catch {
+        retryAfterMs = null;
+      }
+    }
+    throw new ApiError(res.status, parseErrorBody(text), retryAfterMs);
   }
   return (await res.json()) as T;
 }
@@ -221,6 +283,13 @@ export const api = {
   listJobs(cursor = "", limit = 25): Promise<HistoryPage> {
     const q = new URLSearchParams();
     if (cursor) q.set("cursor", cursor);
+    q.set("limit", String(limit));
+    return req<HistoryPage>(`/jobs?${q.toString()}`);
+  },
+  /** Global active-job poll for update gating (R21): nonterminal only, independent of history/detail. */
+  listActiveJobs(limit = 25): Promise<HistoryPage> {
+    const q = new URLSearchParams();
+    q.set("active", "true");
     q.set("limit", String(limit));
     return req<HistoryPage>(`/jobs?${q.toString()}`);
   },

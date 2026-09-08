@@ -50,15 +50,12 @@ import json
 import os
 import signal
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
 import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-
-TERMINATE_GRACE_S = 30
 
 EXIT_OK = 0
 EXIT_INVALID = 2
@@ -68,113 +65,27 @@ EXIT_VERIFY_FAILED = 5
 EXIT_INTERRUPTED = 6
 
 
-# -- process tree termination (systemd-first + /proc-verify) ------------------
-# The dispatcher launches each job as its own user-manager unit with
-# KillMode=control-group, so systemd reaps the unit cgroup on exit. The
-# runner additionally terminates its own tree directly (SIGTERM then SIGKILL)
-# and, on hard timeout, best-effort ``systemctl --user stop/kill`` of its own
-# recorded unit. Nothing is assumed dead: survivors are verified with a
-# read-only /proc scan of the job process tree before recovery checks run.
-
-def _descendant_pids(root):
-    # type: (int) -> List[int]
-    """All live descendants of root via /proc (read-only scan)."""
-    try:
-        entries = [e for e in os.listdir("/proc") if e.isdigit()]
-    except OSError:
-        return []
-    children = {}  # type: Dict[int, List[int]]
-    for entry in entries:
-        try:
-            with open("/proc/%s/stat" % entry, "r") as fh:
-                parts = fh.read().rsplit(")", 1)
-            ppid = int(parts[1].split()[1])
-            pid = int(entry)
-        except (OSError, ValueError, IndexError):
-            continue
-        children.setdefault(ppid, []).append(pid)
-    out = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        out.append(pid)
-        stack.extend(children.get(pid, []))
-    return out
-
-
-def _signal_tree(sig):
-    # type: (int) -> None
-    for pid in _descendant_pids(os.getpid()):
-        try:
-            os.kill(pid, sig)
-        except OSError:
-            continue
-
-
-def terminate_tree(grace_s=TERMINATE_GRACE_S):
-    # type: (float) -> None
-    """SIGTERM the job tree, then SIGKILL survivors after grace.
-
-    Systemd-first: the runner unit uses KillMode=control-group so the unit
-    cgroup is reaped on runner exit; this direct signalling covers native
-    updater descendants promptly. Callers must verify with a /proc scan
-    afterwards; killing only the shell is never treated as proof that
-    mutation stopped.
-    """
-    _signal_tree(signal.SIGTERM)
-    deadline = time.time() + max(1.0, float(grace_s))
-    while time.time() < deadline:
-        if not _descendant_pids(os.getpid()):
-            return
-        time.sleep(1.0)
-    _signal_tree(signal.SIGKILL)
-
-
-def _systemd_terminate_unit(unit):
-    # type: (str) -> None
-    """Best-effort ``systemctl --user stop/kill`` of the runner's own unit.
-
-    Fixed argv, shell=False, bounded timeouts. Never raises; failures are
-    reported by the later /proc verification, never assumed away.
-    """
-    if not unit:
-        return
-    for args in (["systemctl", "--user", "stop", unit],
-                 ["systemctl", "--user", "kill", unit]):
-        try:
-            subprocess.run(
-                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=15, shell=False, check=False)
-        except Exception:
-            continue
-
-
-def _no_live_descendants():
-    # type: () -> bool
-    """True when the /proc scan finds no live descendants of this process."""
-    return not _descendant_pids(os.getpid())
+# -- supervision: scopes owned by the runner, killed as cgroups --------------
+# Phase work runs inside per-phase scope units (executor phase_context);
+# the runner (coordinator, in the parent job unit) kills scopes — never its
+# own unit. Reparented children stay in the scope cgroup, so scope-kill +
+# quiescence verify (units.query_unit) is proof; PPID scans are not used
+# for termination (R06).
 
 
 def _job_processes_alive(job_id):
     # type: (str) -> list
-    """Read-only /proc scan for processes still carrying the job id."""
-    found = []
-    short = (job_id or "")[:8]
+    """Execution-marked processes for this job, observer excluded (R07).
+
+    Matches the canonical unit hex + runner markers (never the bare
+    dashed UUID the observer itself carries), so the caller never
+    detects itself as a live updater.
+    """
     try:
-        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+        from ..reconcile_core import job_processes, unit_hex
+        return job_processes(unit_hex(job_id), job_id)
     except Exception:
-        return found
-    for pid in pids:
-        try:
-            with open("/proc/%s/cmdline" % pid, "rb") as fh:
-                cmd = fh.read().replace(b"\0", b" ").decode(
-                    "utf-8", errors="replace")
-        except Exception:
-            continue
-        if (job_id and job_id in cmd) or (
-                short and "ega-update" in cmd and short in cmd):
-            found.append({"pid": int(pid), "cmdline": cmd[:300]})
-    return found
+        return []
 
 
 def _is_timeout_result(exec_result):
@@ -234,7 +145,13 @@ def _known_secrets():
 
 
 class JobLog(object):
-    """Per-job ordered redacted JSONL log with cap + truncation marker."""
+    """Per-job ordered sanitized JSONL log with cap + truncation marker.
+
+    All bytes flow through sanitize.SanitizingStream: empty sanitizer
+    output means buffered (never raw fallback); incomplete sensitive
+    blocks are withheld, never finalized by timer flushes; sanitizer
+    failure sets persist_failed (fail closed). Sequence starts at 1.
+    """
 
     def __init__(self, path, cap_bytes, secrets=()):
         # type: (str, int, tuple) -> None
@@ -252,16 +169,15 @@ class JobLog(object):
         self._last_flush = time.time()
         self._lock = threading.Lock()
         self._secrets = tuple(secrets or ())
+        self._streams = {}
         try:
-            from ..redaction import StreamRedactor
-
-            self._redactors = {
-                "stdout": StreamRedactor(secrets),
-                "stderr": StreamRedactor(secrets),
-                "event": StreamRedactor(secrets),
-            }
+            from ..sanitize import SanitizingStream
+            for _name in ("stdout", "stderr", "event"):
+                self._streams[_name] = SanitizingStream(
+                    tuple(secrets or ()))
         except Exception:
-            self._redactors = {}
+            self._streams = {}
+            self.persist_failed = True
 
     def open(self):
         # type: () -> None
@@ -344,45 +260,52 @@ class JobLog(object):
 
     def emit(self, stream, text):
         # type: (str, str) -> None
-        """Redact and persist (or drain-only past the cap). Thread-safe."""
+        """Sanitize and persist (or drain-only past the cap). Thread-safe.
+
+        Empty sanitizer output means the input is intentionally buffered
+        (e.g. an incomplete sensitive block) — never raw fallback (R10).
+        """
         if stream not in ("stdout", "stderr", "event"):
             stream = "stdout"
         with self._lock:
             if self._fh is None:
                 return
-            redactor = self._redactors.get(stream)
-            lines = []
-            if redactor is not None:
-                try:
-                    chunk = text if text.endswith("\n") else text + "\n"
-                    lines = redactor.feed(chunk.encode("utf-8", errors="replace"))
-                except Exception:
-                    lines = []
-            if not lines:
-                try:
-                    from ..redaction import redact_text, strip_controls
-
-                    lines = [redact_text(strip_controls(text), self._secrets)]
-                except Exception:
-                    lines = [text[:8000]]
+            target = self._streams.get(stream)
+            if target is None:
+                self.persist_failed = True
+                return
+            try:
+                chunk = text if text.endswith("\n") else text + "\n"
+                lines = target.feed(chunk.encode("utf-8", errors="replace"))
+            except Exception:
+                # Sanitizer failure fails closed (R10): mark evidence bad,
+                # never emit raw.
+                self.persist_failed = True
+                return
             for line in lines:
                 self._write_record(stream, line)
+
+    def _tick(self):
+        # type: () -> None
+        """Timer flush: complete non-sensitive lines only (R10).
+
+        Never finalizes an incomplete sensitive block.
+        """
+        for name, target in self._streams.items():
+            try:
+                lines = target.flush_tick()
+            except Exception:
+                self.persist_failed = True
+                continue
+            for line in lines:
+                self._write_record(name, line)
 
     def flush(self):
         # type: () -> None
         with self._lock:
             if self._fh is not None:
                 try:
-                    tails = {}
-                    for name, redactor in self._redactors.items():
-                        try:
-                            for line in redactor.flush():
-                                tails.setdefault(name, []).append(line)
-                        except Exception:
-                            continue
-                    for name, lines in tails.items():
-                        for line in lines:
-                            self._write_record(name, line)
+                    self._tick()
                     self._fh.flush()
                 except OSError:
                     self.persist_failed = True
@@ -391,7 +314,22 @@ class JobLog(object):
     def close(self):
         # type: () -> None
         try:
-            self.flush()
+            with self._lock:
+                if self._fh is not None:
+                    # End-of-stream: incomplete blocks become a marker,
+                    # never body text (R10).
+                    for name, target in self._streams.items():
+                        try:
+                            lines = target.flush_final()
+                        except Exception:
+                            self.persist_failed = True
+                            continue
+                        for line in lines:
+                            self._write_record(name, line)
+                    try:
+                        self._fh.flush()
+                    except OSError:
+                        self.persist_failed = True
         finally:
             with self._lock:
                 if self._fh is not None:
@@ -425,11 +363,26 @@ class Runner(object):
         self.before_version = ""
         self.after_version = ""
         self.exit_code = EXIT_INTERRUPTED
+        self.installer_exit = EXIT_INTERRUPTED
+        self.install_outcome = ""
+        self.actual_change = False
         self.error_code = "interrupted"
         self.error_detail = ""
         self.checks = []  # type: List[Dict[str, Any]]
         self.backup_summary = ""
         self.verify_passed = False
+        # Guarded-transition cursor (R05): every _set_state expects this.
+        self._known_state = "accepted"
+        self._cancel = threading.Event()
+        self._release_path = ""
+        self._before_commit = ""
+        self._after_commit = ""
+        # Live-line digest window for tail-summary dedup (R09).
+        try:
+            import collections as _collections
+            self._seen_live = _collections.deque(maxlen=4000)
+        except Exception:
+            self._seen_live = []  # type: ignore[assignment]
 
     # -- setup ----------------------------------------------------------
 
@@ -550,16 +503,31 @@ class Runner(object):
 
     def _own_unit(self):
         # type: () -> str
+        # Canonical full-UUID unit (R03); the DB row is authoritative.
         try:
             assert self.conn is not None
             row = self.conn.execute(
-                "SELECT runner_unit FROM jobs WHERE id=?",
+                "SELECT runner_unit, canonical_unit FROM jobs WHERE id=?",
                 (self.job_id,)).fetchone()
             if row is not None:
-                return str(row["runner_unit"] or "")
+                try:
+                    if row["canonical_unit"]:
+                        return str(row["canonical_unit"])
+                except Exception:
+                    pass
+                try:
+                    if row["runner_unit"]:
+                        return str(row["runner_unit"])
+                except Exception:
+                    pass
         except Exception:
             pass
-        return "ega-update-job-%s.service" % self.job_id[:8]
+        try:
+            from ..reconcile_core import canonical_unit
+            return canonical_unit(self.job_id)
+        except Exception:
+            return "ega-update-job-%s.service" % (
+                self.job_id or "").replace("-", "")
 
     def emit(self, stream, line):
         # type: (str, str) -> None
@@ -571,16 +539,31 @@ class Runner(object):
         self.emit("event", text)
 
     def _set_state(self, state, step="", error_code="", error_detail="",
-                   exit_code=None, after_version=None):
+                   exit_code=None, after_version=None, extra=None):
         # type: (...) -> None
-        """Short DB transaction; never held across a subprocess."""
-        from ..jobs import transition
+        """Guarded atomic transition (R05): expected prior state + attempt
+        ownership enforced; recovery flag and versions move together.
+        Never held across a subprocess. Raises TxError on guard/commit
+        failure (callers map to blocked/interrupted explicitly)."""
+        from ..tx import transition_tx
 
         assert self.conn is not None
-        transition(self.conn, self.job_id, state, step=step,
-                   error_code=error_code, error_detail=error_detail,
-                   exit_code=exit_code, after_version=after_version)
-        self.conn.commit()
+        update = dict(extra or {})
+        if exit_code is not None:
+            update["exit_code"] = exit_code
+        if after_version is not None:
+            update["after_version"] = after_version
+        if error_code:
+            update["error_code"] = error_code
+        if error_detail:
+            update["error_detail"] = error_detail
+        new_row = transition_tx(
+            self.conn, self.job_id, state, step=step or state,
+            expect_states=[self._known_state],
+            expect_nonce=self.expected_nonce or "",
+            update=update, event=state,
+            event_detail=(error_code or step or "")[:500])
+        self._known_state = str(new_row.get("state", state))
         try:
             self.conn.execute("UPDATE jobs SET heartbeat=? WHERE id=?",
                               (_now_iso(), self.job_id))
@@ -600,41 +583,191 @@ class Runner(object):
 
     # -- plan reconstruction ---------------------------------------------
 
-    def _build_plan(self, fresh):
-        # type: (Any) -> Any
-        """Trusted server plan from the DB row, with fresh timeouts/space."""
+    def _validate_env_release(self):
+        # type: () -> Tuple[bool, str, str]
+        """R02/R15 gate: required executables + plan release/config binding.
+
+        No mutation, no tool touch. Returns (ok, error_code, detail).
+        """
+        assert self.plan_row is not None
+        try:
+            from ..owner_env import (resolve_release, resolved_paths,
+                                     validate_executables)
+            from ..inventory import config_identity
+        except Exception as exc:
+            return False, "unavailable", \
+                "owner env contract unavailable: %s" % str(exc)[:200]
+        try:
+            paths = resolved_paths(self._settings())
+        except Exception as exc:
+            return False, "unavailable", \
+                "owner paths unresolvable: %s" % str(exc)[:200]
+        ok, missing = validate_executables(paths)
+        if not ok:
+            return False, "install_method_unsupported", \
+                "required executables missing: %s" % ", ".join(missing)[:300]
+        try:
+            current_release = resolve_release()
+        except ValueError as exc:
+            return False, "unavailable", str(exc)[:300]
+        self._release_path = current_release
+        planned_release = str(self.plan_row.get("release_path", "") or "")
+        if planned_release and planned_release != current_release:
+            return False, "config_changed", \
+                "console release changed since plan (%s -> %s); fresh plan" \
+                " required" % (planned_release[-12:], current_release[-12:])
+        try:
+            current_hash = config_identity(self._settings())
+        except Exception:
+            current_hash = ""
+        if not current_hash:
+            return False, "unavailable", \
+                "configuration identity unprovable"
+        planned_hash = str(self.plan_row.get("config_hash", "") or "")
+        if planned_hash and planned_hash != current_hash:
+            return False, "config_changed", \
+                "configuration changed since plan; fresh plan required"
+        return True, "", ""
+
+    def _build_plan(self):
+        # type: () -> Any
+        """Trusted server plan from the DB row, used WHOLLY (R15).
+
+        Timeouts, budgets, steps, checks manifest, and scope come from the
+        persisted immutable contract. Fresh probes may only INVALIDATE
+        (preflight compares fingerprint/config); they never refill fields.
+        """
         from ..adapters.base import PlanResult
 
         assert self.plan_row is not None
+
+        def _loads(value, default):
+            # type: (object, object) -> object
+            try:
+                if isinstance(value, str) and value:
+                    parsed = json.loads(value)
+                    return parsed
+            except Exception:
+                pass
+            return default
+
+        row = self.plan_row
+        timeouts = _loads(row.get("deadlines_json"), {}) or {}
+        if not isinstance(timeouts, dict):
+            timeouts = {}
         try:
-            services = json.loads(self.plan_row.get("services") or "[]")
+            from ..config import get_adapter_timeouts
+            effective = get_adapter_timeouts(self._settings())
+            for key, default in (("preflight", 120), ("backup", 600),
+                                 ("updating", 1800), ("verifying", 300)):
+                if key not in timeouts:
+                    timeouts[key] = effective.get(key, default)
         except Exception:
-            services = []
-        try:
-            backup_scope = json.loads(self.plan_row.get("backup_scope") or "{}")
-        except Exception:
-            backup_scope = {}
-        timeouts = dict(getattr(fresh, "timeouts", {}) or {})
-        required = int(getattr(fresh, "required_space_bytes", 0) or 0)
-        return PlanResult(
+            for key, default in (("preflight", 120), ("backup", 600),
+                                 ("updating", 1800), ("verifying", 300)):
+                timeouts.setdefault(key, default)
+        services = _loads(row.get("services"), []) or []
+        plan = PlanResult(
             tool=self.tool_id,
-            target=self.plan_row.get("target", ""),
-            target_mode=self.plan_row.get("target_mode", "exact"),
-            channel=self.plan_row.get("channel", ""),
-            fingerprint=self.plan_row.get("fingerprint", ""),
+            target=row.get("target", ""),
+            target_mode=row.get("target_mode", "exact"),
+            channel=row.get("channel", ""),
+            fingerprint=row.get("fingerprint", ""),
             services=list(services) if isinstance(services, list) else [],
-            backup_scope=dict(backup_scope) if isinstance(backup_scope, dict) else {},
-            required_space_bytes=required,
-            steps=list(getattr(fresh, "steps", []) or []),
-            timeouts=timeouts,
-            restart_impact=getattr(fresh, "restart_impact", ""),
-            already_current=bool(getattr(fresh, "already_current", False)),
+            backup_scope=dict(_loads(row.get("backup_scope"), {}) or {}),
+            required_space_bytes=int(
+                row.get("required_space_bytes", 0) or 0),
+            steps=list(_loads(row.get("steps_json"), []) or []),
+            timeouts={str(k): int(v) for k, v in timeouts.items()},
+            restart_impact=row.get("restart_impact", ""),
+            already_current=False,
+            install_identity=row.get("install_identity", ""),
+            config_hash=row.get("config_hash", ""),
+            launch=dict(_loads(row.get("launch_json"), {}) or {}),
+            state_homes=list(_loads(row.get("state_homes_json"), []) or []),
+            backup_policy=dict(
+                _loads(row.get("backup_policy_json"), {}) or {}),
+            required_probes=list(
+                _loads(row.get("required_probes_json"), []) or []),
+            required_checks=list(
+                _loads(row.get("required_checks_json"), []) or []),
+            budgets=dict(_loads(row.get("budgets_json"), {}) or {}),
+            space_fs=dict(_loads(row.get("space_json"), {}) or {}),
+            deadlines={str(k): int(v) for k, v in timeouts.items()},
+            restart_detail=row.get("restart_detail", ""),
+            activity_ts=row.get("activity_ts", ""),
+            release_path=row.get("release_path", ""),
         )
+        try:
+            plan.scope_unit = ""
+        except Exception:
+            pass
+        return plan
+
+    def _space_need(self, plan, footprint, floor, reserve):
+        # type: (Any, object, int, int) -> Tuple[int, List[str], str]
+        """Grounded space budget (R28): measured footprint + plan budgets.
+
+        Returns (need_bytes, fs_paths, unknown_reason). need =
+        max(floor, estimate + reserve) applied on EVERY affected
+        filesystem. Any unknown required component blocks with a reason.
+        """
+        fps = footprint if isinstance(footprint, dict) else {}
+        try:
+            budgets = dict(getattr(plan, "budgets", {}) or {})
+        except Exception:
+            budgets = {}
+        try:
+            space_fs = dict(getattr(plan, "space_fs", {}) or {})
+        except Exception:
+            space_fs = {}
+        paths = []  # type: List[str]
+        total = 0
+        for source in (fps, budgets, space_fs):
+            try:
+                items = list(source.items())
+            except Exception:
+                continue
+            for path, size in items:
+                try:
+                    size_i = int(size)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    return 0, [], \
+                        "unmeasurable budget for %s" % str(path)[:120]
+                if size_i < 0:
+                    return 0, [], \
+                        "unknown size blocks mutation: %s" % str(path)[:120]
+                total += size_i
+                if path and str(path) not in paths:
+                    paths.append(str(path))
+        try:
+            planned = int(getattr(plan, "required_space_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            planned = 0
+        if planned > 0:
+            total += planned
+        # Zero total with no measured component is not an estimate: block
+        # rather than hiding behind the floor (R28).
+        if total <= 0:
+            return 0, [], "no space estimate available"
+        try:
+            settings = self._settings()
+            for extra in (getattr(settings, "backup_dir", ""),
+                          getattr(settings, "log_dir", "")):
+                if extra and str(extra) not in paths:
+                    paths.append(str(extra))
+        except Exception:
+            pass
+        try:
+            need = max(int(floor), total + int(reserve))
+        except (TypeError, ValueError):
+            need = total
+        return need, paths, ""
 
     # -- preflight ---------------------------------------------------------
 
-    def _preflight(self):
-        # type: () -> Tuple[bool, str, str]
+    def _preflight(self, plan):
+        # type: (Any) -> Tuple[bool, str, str]
         """Return (ok, error_code, detail). No tool mutation here."""
         assert self.conn is not None and self.plan_row is not None
         # 1. Plan freshness: stale plans require a fresh plan.
@@ -657,20 +790,20 @@ class Runner(object):
         if expected_fp and inspection.fingerprint != expected_fp:
             return False, "fingerprint_changed", \
                 "installation changed since plan; fresh plan required"
-        # H-02: overwrite jobs.before_version with the fresh preflight
-        # inspect version before any mutation (reservation-time observed
-        # versions may be stale).
+        try:
+            self._last_inspection_fingerprint = str(
+                getattr(inspection, "fingerprint", "") or "")
+        except Exception:
+            self._last_inspection_fingerprint = ""
+        # H-02: capture the fresh preflight inspect version for the
+        # main thread to persist (this method may run under a phase
+        # deadline thread; DB writes stay on the caller thread).
         try:
             fresh_before = getattr(inspection, "version", "") or ""
             if fresh_before and fresh_before != self.before_version:
-                self.conn.execute(
-                    "UPDATE jobs SET before_version=? WHERE id=?",
-                    (fresh_before, self.job_id))
-                self.conn.commit()
-                self.before_version = fresh_before
-        except Exception as exc:
-            return False, "storage_failure", \
-                "before_version record unwritable: %s" % str(exc)[:300]
+                self._fresh_before = fresh_before
+        except Exception:
+            pass
         # 4. Activity incl. recorded ack.
         try:
             activity = self.adapter.activity()
@@ -682,26 +815,34 @@ class Runner(object):
         if activity.state == "unknown" and not ack:
             return False, "ack_required", \
                 "unknown activity requires plan-specific owner ack: %s" % activity.evidence[:400]
-        # 5. Disk floor on every affected filesystem.
-        try:
-            fresh = self.adapter.plan()
-        except Exception as exc:
-            return False, "unavailable", "plan probe failed: %s" % str(exc)[:300]
+        # 5. Disk: plan budgets + MEASURED footprint on every affected
+        # filesystem (R28). Fixed invented sizes never prove safety;
+        # unknown estimates block. Reserve + floor apply at every gate.
         settings = self._settings()
-        floor = int(getattr(settings, "disk_floor_bytes", 3 * 1024 * 1024 * 1024))
-        need = int(getattr(fresh, "required_space_bytes", 0) or 0)
-        if need <= 0:
-            return False, "disk_blocked", "unknown space estimate blocks mutation"
-        need = max(floor, need)
+        try:
+            floor = int(getattr(settings, "disk_floor_bytes",
+                                3 * 1024 * 1024 * 1024))
+        except (TypeError, ValueError):
+            floor = 3 * 1024 * 1024 * 1024
+        try:
+            reserve = int(getattr(settings, "reserve_bytes",
+                                  1 * 1024 * 1024 * 1024))
+        except (TypeError, ValueError):
+            reserve = 1024 * 1024 * 1024
+        try:
+            footprint = self.adapter.measure_footprint(plan)
+        except Exception as exc:
+            return False, "disk_blocked", \
+                "footprint probe failed: %s" % str(exc)[:300]
+        need, per_fs, unknown = self._space_need(plan, footprint, floor,
+                                                 reserve)
+        if unknown:
+            return False, "disk_blocked", \
+                "unknown space estimate blocks mutation: %s" \
+                % unknown[:300]
         try:
             from ..adapters.registry import check_disk
-
-            paths = list(getattr(inspection, "state_dirs", []) or [])
-            if getattr(inspection, "executable", ""):
-                paths.append(inspection.executable)
-            paths.append(getattr(settings, "backup_dir", "/var/lib/ega-update/backups"))
-            paths.append(getattr(settings, "log_dir", "/var/lib/ega-update/logs"))
-            disk_ok, disk_detail, _per_fs = check_disk(paths, need)
+            disk_ok, disk_detail, _per = check_disk(per_fs, need)
         except Exception as exc:
             return False, "disk_blocked", "disk probe failed: %s" % str(exc)[:300]
         if not disk_ok:
@@ -735,13 +876,23 @@ class Runner(object):
 
     # -- phases --------------------------------------------------------------
 
-    def _do_backup(self):
-        # type: () -> Tuple[bool, str, str]
+    def _do_backup(self, timeout_s):
+        # type: (float) -> Tuple[bool, str, str]
         assert self.conn is not None
-        try:
-            result = self.adapter.backup(self.job_id)
-        except Exception as exc:
-            return False, "backup_failed", "backup raised: %s" % str(exc)[:400]
+        scope = self._scope_name("backup")
+        finished, value, status = self._call_in_thread(
+            lambda: self.adapter.backup(self.job_id), timeout_s,
+            scope_name=scope, phase="backup")
+        if status == "timeout":
+            self._hard_timeout_recovery(timeout_s, "backup deadline", scope)
+            return False, "timeout", \
+                "backup timed out; recovery_required set"
+        if status == "interrupted":
+            return False, "interrupted", "runner stopped during backup"
+        if status == "error":
+            return False, "backup_failed", \
+                "backup raised: %s" % str(value)[:400]
+        result = value
         if not result.supported:
             reason = result.unsupported_reason or "backup unsupported"
             code = "backup_unsupported" if "backup_unsupported" in reason else "backup_failed"
@@ -762,30 +913,137 @@ class Runner(object):
         self._event("backup ok: %s" % self.backup_summary)
         return True, "", ""
 
-    def _call_in_thread(self, fn, timeout_s):
-        # type: (Any, float) -> Tuple[bool, Any, str]
-        """Run fn in a thread with a hard deadline.
+    def _scope_name(self, phase):
+        # type: (str) -> str
+        try:
+            from ..reconcile_core import unit_hex
+            stem = unit_hex(self.job_id)
+        except Exception:
+            stem = ""
+        if not stem:
+            return ""
+        return "ega-update-job-%s-%s.scope" % (stem, phase)
 
-        Returns (finished, value_or_exc, status) where status is ok|timeout|
-        error. On timeout the caller must terminate the job tree gracefully
-        then forcibly after grace; this helper only reports the deadline.
+    def _kill_scope(self, scope):
+        # type: (str) -> None
+        """Terminate a phase scope cgroup (coordinator survives: it runs
+        in the parent job unit, never inside the killed scope)."""
+        if not scope:
+            return
+        try:
+            from ..executor import run_stream
+        except Exception:
+            return
+        for sig in ("SIGTERM", "SIGKILL"):
+            try:
+                run_stream(["/usr/bin/systemctl", "--user", "kill",
+                            "--kill-whom=all", "--signal=%s" % sig, scope],
+                           timeout_s=15, scope_unit=None)
+            except Exception:
+                continue
+            try:
+                if self._scope_quiescent(scope):
+                    return
+            except Exception:
+                continue
+            time.sleep(2.0)
+
+    def _scope_quiescent(self, scope):
+        # type: (str) -> bool
+        """True when the scope unit is confirmed stopped with no members."""
+        try:
+            from .. import units as _units
+            info = _units.query_unit(scope, timeout_s=5)
+            return str(info.get("state", "")) == "confirmed_stopped"
+        except Exception:
+            return False
+
+    def _live_on_line(self, stream, line):
+        # type: (str, str) -> None
+        """R09 live sink: executor lines land in the log within ~1s while
+        the process still runs. Records a content digest so the adapter's
+        post-hoc tail summaries do not duplicate the same bytes."""
+        try:
+            import hashlib as _hashlib
+            digest = _hashlib.sha1(
+                line.encode("utf-8", errors="replace")).hexdigest()
+            try:
+                self._seen_live.append(digest)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self.emit(stream, line)
+
+    def _phase_sink(self, stream, text):
+        # type: (str, str) -> None
+        """Adapter _emit sink: drops bytes already streamed live (bounded
+        tail summaries), keeps novel status lines. Content is never lost:
+        dropped lines are byte-identical to lines already persisted."""
+        try:
+            import hashlib as _hashlib
+            seen = set(self._seen_live)
+        except Exception:
+            seen = set()
+            _hashlib = None  # type: ignore[assignment]
+        try:
+            parts = str(text or "").split("\n")
+        except Exception:
+            return
+        for line in parts:
+            try:
+                digest = _hashlib.sha1(
+                    line.encode("utf-8", errors="replace")).hexdigest() \
+                    if _hashlib is not None else None
+            except Exception:
+                digest = None
+            if digest is not None and digest in seen:
+                continue
+            self.emit(stream, line)
+
+    def _call_in_thread(self, fn, timeout_s, scope_name="", phase=""):
+        # type: (Any, float, str, str) -> Tuple[bool, Any, str]
+        """Run fn in a thread with a real monotonic deadline (R06).
+
+        The phase runs inside executor.phase_context(scope, cancel): every
+        adapter subprocess inherits containment + cancellation, so a
+        deadline stops WORK (not just reporting). On timeout the scope
+        cgroup is killed and quiescence verified before recovery.
+        Returns (finished, value_or_exc, status ok|timeout|error|
+        interrupted).
         """
+        from ..executor import phase_context
+
         box = {}  # type: Dict[str, Any]
+        cancel = threading.Event()
 
         def _target():
             try:
-                box["value"] = fn()
-            except BaseException as exc:  # noqa: BLE001 - must surface adapter crashes
+                with phase_context(scope_name or None, cancel,
+                                   self._live_on_line):
+                    box["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - surface crashes
                 box["error"] = exc
 
         thread = threading.Thread(target=_target, daemon=True)
         thread.start()
-        deadline = time.time() + max(1.0, float(timeout_s))
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
         while thread.is_alive():
-            if self._stop.is_set():
+            if self._stop.is_set() or self._cancel.is_set():
+                cancel.set()
+                if scope_name:
+                    self._kill_scope(scope_name)
+                thread.join(timeout=30)
                 return False, None, "interrupted"
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
+                cancel.set()
+                if scope_name:
+                    self._kill_scope(scope_name)
+                # Bounded join: the thread may linger only if adapter code
+                # ignores cancellation between commands; all its
+                # subprocesses are already terminated via scope+cancel.
+                thread.join(timeout=30)
                 return False, None, "timeout"
             thread.join(min(1.0, remaining))
             self._heartbeat()
@@ -795,29 +1053,22 @@ class Runner(object):
             return False, box["error"], "error"
         return True, box.get("value"), "ok"
 
-    def _hard_timeout_recovery(self, timeout_s, reason):
-        # type: (float, str) -> None
-        """Single-owner hard-timeout path: terminate, systemd stop/kill own
-        unit (best effort), /proc-verify no survivors, bounded read-only
-        recovery checks. Callers terminalize failed/interrupted with
-        recovery_required whenever completion is not fully proved."""
+    def _hard_timeout_recovery(self, timeout_s, reason, scope_name=""):
+        # type: (float, str, str) -> None
+        """Runner-owned hard-timeout path (R06): the phase scope cgroup is
+        already killed by _call_in_thread; here verify quiescence, inspect
+        delegated service states from the plan, run bounded read-only
+        recovery checks, and leave recovery_required set. The coordinator
+        (this process, in the parent job unit) is never killed: it must
+        persist the outcome. Callers terminalize failed/interrupted."""
         self._timed_out = True
-        self._event("hard timeout (%s) after %ds; SIGTERM job tree,"
-                    " grace %ds then SIGKILL; best-effort systemctl --user"
-                    " stop/kill own unit"
-                    % (reason, int(timeout_s), TERMINATE_GRACE_S))
+        self._event("hard timeout (%s) after %ds; phase scope %s killed;"
+                    " verifying quiescence"
+                    % (reason, int(timeout_s), scope_name or "n/a"))
         try:
-            terminate_tree(TERMINATE_GRACE_S)
-        except Exception:
-            pass
-        try:
-            _systemd_terminate_unit(self._own_unit())
-        except Exception:
-            pass
-        try:
-            if not _no_live_descendants():
-                self._event("timeout verify: descendants alive after"
-                            " terminate; treating as unresolved")
+            if scope_name and not self._scope_quiescent(scope_name):
+                self._event("timeout verify: scope %s not quiescent;"
+                            " treating as unresolved" % scope_name)
             leftovers = _job_processes_alive(self.job_id)
             if leftovers:
                 self._event("timeout verify: %d job processes still carry"
@@ -825,11 +1076,41 @@ class Runner(object):
                             % len(leftovers))
         except Exception:
             pass
+        # Delegated service operations (plan services): bounded state read
+        # so an uncertain service keeps recovery required explicitly.
+        try:
+            services = list((self.plan_row or {}).get("_services_list", [])
+                            or [])
+        except Exception:
+            services = []
+        if not services:
+            try:
+                import json as _json
+                services = list(_json.loads(
+                    (self.plan_row or {}).get("services", "[]") or "[]"))
+            except Exception:
+                services = []
+        for svc in services[:10]:
+            try:
+                from ..executor import run_stream
+                res = run_stream(
+                    ["/usr/bin/systemctl", "--user", "show", str(svc),
+                     "-p", "ActiveState,SubState"],
+                    timeout_s=15, scope_unit=None)
+                out = (res.stdout_tail or b"").decode(
+                    "utf-8", errors="replace")[:200]
+                self._event("delegated service %s: %s"
+                            % (svc, out.replace("\n", " ")))
+            except Exception:
+                self._event("delegated service %s: state unreadable;"
+                            " recovery stays required" % svc)
         # Bounded recovery checks: probe installation without mutating.
         try:
             recovery = self._call_in_thread(
                 lambda: self.adapter.verify(),
-                min(120.0, timeout_s / 4.0 or 120.0))
+                min(120.0, timeout_s / 4.0 or 120.0),
+                scope_name=self._scope_name("recover"),
+                phase="recover")
             if recovery[0] and recovery[1] is not None:
                 self._record_checks(recovery[1])
                 self.after_version = getattr(
@@ -842,29 +1123,39 @@ class Runner(object):
     def _do_execute(self, plan, timeout_s):
         # type: (Any, float) -> Any
         # Single timeout owner: the runner deadline is the adapter plan step
-        # timeout. Adapters run their mutating run_fixed call with
-        # step_timeout + registry.MUTATION_TIMEOUT_MARGIN_S so this deadline
-        # always fires first; any adapter timeout report funnels here too.
+        # timeout. Adapters run their mutating call with step_timeout +
+        # registry.MUTATION_TIMEOUT_MARGIN_S so this deadline always fires
+        # first; any adapter timeout report funnels here too. The mutation
+        # runs inside the updating scope cgroup (plan.scope_unit) so
+        # reparented children stay killable (R06).
+        try:
+            plan.scope_unit = self._scope_name("updating")
+        except Exception:
+            pass
+        scope = self._scope_name("updating")
         activity_ack = bool((self.job or {}).get("ack", ""))
         finished, value, status = self._call_in_thread(
             lambda: self.adapter.execute(plan, self.job_id, activity_ack=activity_ack),
-            timeout_s)
+            timeout_s, scope_name=scope, phase="updating")
         if status == "timeout":
-            self._hard_timeout_recovery(timeout_s, "runner deadline")
+            self._hard_timeout_recovery(timeout_s, "runner deadline", scope)
             return None
         if status == "interrupted":
             return None
         if status == "error":
             raise value
         if _is_timeout_result(value):
-            self._hard_timeout_recovery(timeout_s, "adapter timeout report")
+            self._hard_timeout_recovery(timeout_s, "adapter timeout report",
+                                        scope)
             return None
         return value
 
-    def _do_verify(self, timeout_s):
-        # type: (float) -> Any
+    def _do_verify(self, timeout_s, required_checks=None):
+        # type: (float, object) -> Any
+        scope = self._scope_name("verifying")
         finished, value, status = self._call_in_thread(
-            lambda: self.adapter.verify(), timeout_s)
+            lambda: self._adapter_verify(required_checks), timeout_s,
+            scope_name=scope, phase="verifying")
         if status == "timeout":
             self._event("verify timed out after %ds" % int(timeout_s))
             return None
@@ -874,15 +1165,85 @@ class Runner(object):
             raise value
         return value
 
+    def _adapter_verify(self, required_checks=None):
+        # type: (object) -> Any
+        """Verify with plan manifest when the adapter supports it (R15/R24:
+        missing required diagnostics fail instead of silently dropping)."""
+        try:
+            return self.adapter.verify(
+                plan=getattr(self, "_plan_obj", None),
+                required_checks=list(required_checks or []))
+        except TypeError:
+            return self.adapter.verify()
+        except Exception:
+            raise
+
+    def _secrets_for_evidence(self):
+        # type: () -> tuple
+        """Known secrets for evidence sanitization (never logged)."""
+        try:
+            if self.log is not None:
+                return tuple(getattr(self.log, "_secrets", ()) or ())
+        except Exception:
+            pass
+        return _known_secrets()
+
+    def _sanitize_evidence_str(self, value, limit):
+        # type: (str, int) -> str
+        try:
+            from ..sanitize import sanitize_text
+            return sanitize_text(value or "", self._secrets_for_evidence())[:limit]
+        except Exception:
+            self._evidence_failed = True
+            return "[redaction failed]"
+
     def _record_checks(self, verify_result):
         # type: (Any) -> None
+        # R11: every check summary is sanitized before SQLite persistence
+        # (a daemon response reflected here must never persist credentials).
+        try:
+            from ..sanitize import sanitize_text
+            _secrets = tuple(self._secrets_for_evidence())
+        except Exception:
+            sanitize_text = None  # type: ignore[assignment]
+            _secrets = ()
         self.checks = []
         for item in getattr(verify_result, "checks", []) or []:
+            try:
+                name = str(getattr(item, "name", ""))[:200]
+            except Exception:
+                name = ""
+            try:
+                result = str(getattr(item, "result", "unknown"))
+            except Exception:
+                result = "unknown"
+            if result not in ("pass", "fail", "unknown",
+                              "not_applicable"):
+                result = "unknown"
+            try:
+                mandatory = bool(getattr(item, "mandatory", True))
+            except Exception:
+                mandatory = True
+            try:
+                summary = str(getattr(item, "summary", ""))
+            except Exception:
+                summary = ""
+            if sanitize_text is not None:
+                try:
+                    name = sanitize_text(name, _secrets)[:200]
+                    summary = sanitize_text(summary, _secrets)[:1000]
+                except Exception:
+                    self._evidence_failed = True
+                    name, summary = "[redaction failed]", ""
+            else:
+                self._evidence_failed = True
+                name, summary = "[redaction failed]", ""
+                continue
             entry = {
-                "name": getattr(item, "name", ""),
-                "result": getattr(item, "result", "unknown"),
-                "mandatory": bool(getattr(item, "mandatory", True)),
-                "summary": getattr(item, "summary", "")[:1000],
+                "name": name,
+                "result": result,
+                "mandatory": mandatory,
+                "summary": summary,
             }
             self.checks.append(entry)
         try:
@@ -906,13 +1267,12 @@ class Runner(object):
         log_dir = getattr(settings, "log_dir", "/var/lib/ega-update/logs")
         return os.path.join(log_dir, "%s.receipt.json" % self.job_id)
 
-    def _write_receipt(self, state):
-        # type: (str) -> bool
-        """Atomically persist the redacted completion receipt. Never raw output.
+    def _write_receipt(self, state, final_seq=-1, recovery_disposition=""):
+        # type: (str, int, str) -> bool
+        """Atomically persist the bound v2 completion receipt (R08).
 
-        Built via receipts.build_receipt so ALL string values are redacted
-        first (known secrets + patterns). Any write failure sets the sticky
-        evidence flag.
+        Built via receipts.build_receipt so ALL string values are
+        sanitized first. Any write failure sets the sticky evidence flag.
         """
         try:
             from ..receipts import build_receipt
@@ -922,6 +1282,15 @@ class Runner(object):
                 self.error_detail, exc))[:2000]
             return False
         try:
+            plan_d = dict(self.plan_row or {})
+        except Exception:
+            plan_d = {}
+        try:
+            expected = list(self._required_checks(getattr(
+                self, "_plan_obj", None)))
+        except Exception:
+            expected = []
+        try:
             receipt = build_receipt(
                 self.job_id, self.tool_id, state,
                 self.before_version, self.after_version,
@@ -930,6 +1299,25 @@ class Runner(object):
                 error_detail=self.error_detail or "",
                 backup_summary=self.backup_summary or "",
                 log_truncated=bool(self.log.truncated) if self.log else False,
+                plan_id=str(plan_d.get("id", "") or ""),
+                plan_hash=str(plan_d.get("plan_hash", "") or ""),
+                attempt_nonce=self.expected_nonce or "",
+                release_path=self._release_path or "",
+                target=str(plan_d.get("target", "") or ""),
+                target_mode=str(plan_d.get("target_mode", "exact")
+                               or "exact"),
+                expected_checks=expected,
+                installer_exit=self.installer_exit,
+                install_outcome=self.install_outcome or "",
+                actual_change=self.actual_change,
+                before_commit=self._before_commit or "",
+                after_commit=self._after_commit or "",
+                cleanup_status="resolved",
+                recovery_disposition=recovery_disposition,
+                evidence_durable=not self._evidence_failed_now(),
+                backup_evidence={"summary": self.backup_summary or ""},
+                final_health={"passed": self.verify_passed,
+                              "version": self.after_version or ""},
             )
         except Exception as exc:
             self._evidence_failed = True
@@ -977,13 +1365,13 @@ class Runner(object):
     def _finish(self, state, exit_code, error_code="", error_detail="",
                 recovery_required=False):
         # type: (str, int, str, str, bool) -> int
-        """Durable terminal record: receipt first, then DB. Returns exit code.
-
-        Any sticky evidence failure (JobLog/check/receipt writes) maps a
-        would-be success to interrupted/storage_failure: never success
-        without durable evidence.
-        """
-        from ..jobs import set_recovery
+        """Durable terminal record (R05/R08/R18): receipt first, then ONE
+        atomic transition (state, recovery, versions, outcome, checks,
+        event, reservation release) via tx.transition_tx. Commit failure
+        preserves the receipt and returns INTERRUPTED without pretending
+        the gate is released. Tools observation is updated from the
+        completed verification whatever the outcome (R18)."""
+        from ..tx import TxError, transition_tx
 
         if state == "succeeded" and self._evidence_failed_now():
             state = "interrupted"
@@ -994,64 +1382,173 @@ class Runner(object):
             recovery_required = True
         self.exit_code = exit_code
         self.error_code = error_code
-        self.error_detail = error_detail
+        self.error_detail = self._sanitize_evidence_str(
+            error_detail or "", 2000)
+        try:
+            expected_req = list(self._required_checks(
+                getattr(self, "_plan_obj", None)))
+        except Exception:
+            expected_req = []
         if self.log is not None:
             self._event("final: state=%s exit=%d error=%s %s" % (
-                state, exit_code, error_code, (error_detail or "")[:300]))
+                state, exit_code, error_code,
+                (self.error_detail or "")[:300]))
             self.log.flush()
             if state == "succeeded" and self._evidence_failed_now():
-                # Final flush failed: same mapping, before any receipt.
                 state = "interrupted"
                 exit_code = EXIT_INTERRUPTED
                 error_code = "storage_failure"
-                error_detail = ("evidence persistence failed; %s"
-                                % (error_detail or ""))[:2000]
+                self.error_detail = ("evidence persistence failed; %s"
+                                     % (error_detail or ""))[:2000]
                 recovery_required = True
                 self.exit_code = exit_code
                 self.error_code = error_code
-                self.error_detail = error_detail
-        receipt_ok = self._write_receipt(state)
+        # final_log_seq publishes the durable cursor (R20): last persisted
+        # seq after the final flush, before the log is closed.
+        final_seq = -1
+        try:
+            if self.log is not None:
+                final_seq = int(self.log.seq) - 1
+        except (TypeError, ValueError):
+            final_seq = -1
+        if self.log is not None:
+            self.log.close()
+        if recovery_required:
+            recovery_disposition = "required"
+        elif state in ("failed", "health_failed", "interrupted"):
+            recovery_disposition = "clear-pending-reconcile"
+        else:
+            recovery_disposition = "none"
+        receipt_ok = self._write_receipt(
+            state, final_seq, recovery_disposition)
         if state == "succeeded" and not receipt_ok:
-            # Never success without a durable completion record.
             state = "interrupted"
             self.exit_code = exit_code = EXIT_INTERRUPTED
             self.error_code = error_code = "storage_failure"
             recovery_required = True
-            self._write_receipt(state)
+            recovery_disposition = "required"
+            self._write_receipt(state, final_seq, recovery_disposition)
+        update = {
+            "error_code": error_code,
+            "error_detail": self.error_detail,
+            "exit_code": exit_code,
+            "installer_exit": int(self.installer_exit or 0),
+            "install_outcome": str(self.install_outcome or "")[:200],
+            "actual_change": 1 if self.actual_change else 0,
+            "after_version": self.after_version or "",
+            "final_log_seq": int(final_seq),
+            "recovery_required": 1 if recovery_required else 0,
+            "unresolved": 0,
+        }
         try:
             assert self.conn is not None
-            self._set_state(state, step=state, error_code=error_code,
-                            error_detail=(error_detail or "")[:2000],
-                            exit_code=exit_code,
-                            after_version=self.after_version or None)
-            if recovery_required:
-                set_recovery(self.conn, self.job_id, True)
-                self.conn.commit()
-            # Best-effort tools observation (independent from job history).
+            transition_tx(
+                self.conn, self.job_id, state, step=state,
+                expect_states=[self._known_state],
+                expect_nonce=self.expected_nonce or "",
+                update=update, event=state,
+                event_detail=("%s %s" % (
+                    error_code, recovery_disposition))[:500],
+                checks=[], tool_id=self.tool_id)
+            self._known_state = state
+        except TxError as exc:
+            # Receipt is already durable; reconciliation repairs the row.
+            # Never pretend admission is safe: leave unresolved set.
             try:
-                if self.after_version and state == "succeeded":
-                    self.conn.execute(
-                        "UPDATE tools SET observed_version=?, updated_at=? WHERE id=?",
-                        (self.after_version, _now_iso(), self.tool_id))
-                    self.conn.commit()
+                self._event("terminal DB write failed: %s" % str(exc)[:300])
             except Exception:
                 pass
-        except Exception as exc:
-            # DB write failure during execution: preserve receipt, require
-            # reconciliation; a pre-mutation failure would already have blocked.
-            self._event("terminal DB write failed: %s" % str(exc)[:300])
-            self._write_receipt(state)
             try:
                 assert self.conn is not None
                 self.conn.rollback()
             except Exception:
                 pass
+            try:
+                self._release_lock()
+            except Exception:
+                pass
             return EXIT_INTERRUPTED
-        finally:
-            if self.log is not None:
-                self.log.close()
+        # R18: current tool observation from the completed verification,
+        # whatever the outcome (never leave old green as current).
+        try:
+            self._record_observation(state)
+        except Exception:
+            pass
+        try:
             self._release_lock()
+        except Exception:
+            pass
         return exit_code
+
+    def _record_observation(self, terminal_state):
+        # type: (str) -> None
+        """Persist current health/version/fingerprint from verification.
+
+        Runs after every completed verification — including installer
+        failure where bounded verification ran. Independent short
+        transaction; failures must not disturb the terminal record.
+        """
+        assert self.conn is not None
+        health = "unknown"
+        detail = ""
+        if terminal_state == "succeeded" and self.verify_passed:
+            health = "healthy"
+            detail = "verified version=%s" % (self.after_version or "")
+        elif terminal_state == "health_failed":
+            health = "unhealthy"
+            detail = "verification failed: %s" % (
+                self.error_detail or "")[:500]
+        elif terminal_state == "failed":
+            # Installer failed: keep version evidence but mark health by
+            # what verification actually proved (else stale green).
+            health = "degraded" if self.checks else "unknown"
+            detail = "installer failed; health %s" % health
+        else:
+            return  # blocked/interrupted: no new observation claimed
+        now = _now_iso()
+        try:
+            fp = ""
+            try:
+                inspection_fp = getattr(
+                    self, "_last_inspection_fingerprint", "")
+                fp = str(inspection_fp or "")
+            except Exception:
+                fp = ""
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tools(id) VALUES(?)",
+                (self.tool_id,))
+            if fp:
+                self.conn.execute(
+                    "UPDATE tools SET observed_version=?, health=?,"
+                    " health_detail=?, observation_time=?, updated_at=?,"
+                    " last_success_at=CASE WHEN ?='healthy' THEN ?"
+                    " ELSE last_success_at END,"
+                    " last_attempt_at=?, last_attempt_error=?,"
+                    " fingerprint=? WHERE id=?",
+                    (self.after_version or self.before_version, health,
+                     self._sanitize_evidence_str(detail, 1000), now, now,
+                     health, now, now,
+                     "" if health == "healthy" else self.error_detail[:500],
+                     fp, self.tool_id))
+            else:
+                self.conn.execute(
+                    "UPDATE tools SET observed_version=?, health=?,"
+                    " health_detail=?, observation_time=?, updated_at=?,"
+                    " last_success_at=CASE WHEN ?='healthy' THEN ?"
+                    " ELSE last_success_at END,"
+                    " last_attempt_at=?, last_attempt_error=? WHERE id=?",
+                    (self.after_version or self.before_version, health,
+                     self._sanitize_evidence_str(detail, 1000), now, now,
+                     health, now, now,
+                     "" if health == "healthy" else self.error_detail[:500],
+                     self.tool_id))
+            self.conn.commit()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     # -- main --------------------------------------------------------------------
 
@@ -1078,6 +1575,25 @@ class Runner(object):
             nonce_ok, nonce_detail = False, "nonce verification crashed"
         if not nonce_ok:
             return self._fail_early("interrupted", nonce_detail)
+        # R03: atomically CONSUME the one-shot claim before opening logs
+        # or acquiring resources. A duplicate same-nonce runner gets
+        # rowcount 0 here and exits 6 without touching anything.
+        try:
+            from ..jobs import consume_attempt
+            assert self.conn is not None
+            consumed = consume_attempt(
+                self.conn, self.job_id, self.expected_nonce or "")
+        except Exception:
+            consumed = False
+        if not consumed:
+            return self._fail_early(
+                "interrupted",
+                "attempt already consumed or not ours; refusing replay")
+        try:
+            self._known_state = str(
+                (self.job or {}).get("state", "preflight") or "preflight")
+        except Exception:
+            self._known_state = "preflight"
         self._open_log()
         self._install_signal_handlers()
         # Runner owns the execution lock for the full procedure.
@@ -1105,8 +1621,21 @@ class Runner(object):
             return self._finish("blocked", EXIT_BLOCKED,
                                 "install_method_unsupported",
                                 "adapter for %s is disabled" % self.tool_id)
+        # R02/R15: canonical owner env + release/config binding BEFORE any
+        # probe that could contend. Mismatch blocks without mutation.
         try:
-            self.adapter._emit = self.emit  # type: ignore[attr-defined]
+            env_ok, env_code, env_detail = self._validate_env_release()
+        except Exception as exc:
+            env_ok, env_code, env_detail = (
+                False, "unavailable", "env validation crashed: %s" % exc)
+        if not env_ok:
+            self._event("env blocked: %s %s" % (env_code, env_detail))
+            return self._finish("blocked", EXIT_BLOCKED, env_code,
+                                env_detail)
+        try:
+            # Adapter evidence sink: drops bytes already streamed live,
+            # keeps novel status lines (R09, no content loss/duplication).
+            self.adapter._emit = self._phase_sink  # type: ignore[attr-defined]
         except Exception:
             pass
         self._event("runner start tool=%s job=%s" % (self.tool_id, self.job_id))
@@ -1117,25 +1646,9 @@ class Runner(object):
         except Exception as exc:
             return self._finish("blocked", EXIT_BLOCKED, "storage_failure",
                                 "preflight record unwritable: %s" % str(exc)[:300])
-        try:
-            pre_ok, pre_code, pre_detail = self._preflight()
-        except Exception as exc:
-            return self._finish("blocked", EXIT_BLOCKED, "unavailable",
-                                "preflight probe crashed: %s" % str(exc)[:300])
-        if not pre_ok:
-            self._event("preflight blocked: %s %s" % (pre_code, pre_detail))
-            return self._finish("blocked", EXIT_BLOCKED, pre_code, pre_detail)
-        if self._stop.is_set():
-            return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
-                                "signal before mutation", recovery_required=True)
-
-        # Fresh timeouts/space for the trusted DB plan.
-        try:
-            fresh = self.adapter.plan()
-        except Exception as exc:
-            return self._finish("blocked", EXIT_BLOCKED, "unavailable",
-                                "plan probe failed: %s" % str(exc)[:300])
-        plan = self._build_plan(fresh)
+        # Immutable plan contract first (R15): all phase budgets come
+        # from the row; fresh probes below may only invalidate it.
+        plan = self._build_plan()
         timeouts = dict(plan.timeouts or {})
         for key, default in (("preflight", 120), ("backup", 600),
                              ("updating", 1800), ("verifying", 300)):
@@ -1143,15 +1656,62 @@ class Runner(object):
                 timeouts[key] = int(timeouts.get(key, default))
             except (TypeError, ValueError):
                 timeouts[key] = default
+        self._fresh_before = ""
+        # Preflight itself runs under the plan preflight deadline in its
+        # own scope (R06): every phase gets a real monotonic deadline.
+        _pre_scope = self._scope_name("preflight")
+        _finished, _pre, _pre_status = self._call_in_thread(
+            lambda: self._preflight(plan), float(timeouts["preflight"]),
+            scope_name=_pre_scope, phase="preflight")
+        if _pre_status == "timeout":
+            self._hard_timeout_recovery(
+                float(timeouts.get("preflight", 120)),
+                "preflight deadline", _pre_scope)
+            return self._finish("blocked", EXIT_BLOCKED, "timeout",
+                                "preflight timed out; retry with fresh plan")
+        if _pre_status == "interrupted":
+            return self._finish("interrupted", EXIT_INTERRUPTED,
+                                "interrupted", "runner stopped in preflight",
+                                recovery_required=False)
+        if _pre_status == "error":
+            return self._finish("blocked", EXIT_BLOCKED, "unavailable",
+                                "preflight probe crashed: %s" % str(_pre)[:300])
+        try:
+            pre_ok, pre_code, pre_detail = _pre
+        except Exception:
+            return self._finish("blocked", EXIT_BLOCKED, "unavailable",
+                                "preflight result unreadable")
+        if not pre_ok:
+            self._event("preflight blocked: %s %s" % (pre_code, pre_detail))
+            return self._finish("blocked", EXIT_BLOCKED, pre_code, pre_detail)
+        # Persist the fresh before-version on the caller thread.
+        try:
+            if self._fresh_before and \
+                    self._fresh_before != self.before_version:
+                assert self.conn is not None
+                self.conn.execute(
+                    "UPDATE jobs SET before_version=? WHERE id=?",
+                    (self._fresh_before, self.job_id))
+                self.conn.commit()
+                self.before_version = self._fresh_before
+        except Exception as exc:
+            return self._finish("blocked", EXIT_BLOCKED, "storage_failure",
+                                "before_version record unwritable: %s"
+                                % str(exc)[:300])
+        if self._stop.is_set():
+            return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
+                                "signal before mutation", recovery_required=True)
 
-        # Backup phase: failure blocks before mutation.
+        # Backup phase: failure blocks before mutation. Bounded by the
+        # plan backup deadline inside its own scope cgroup (R06).
         try:
             self._set_state("backup", step="backup")
         except Exception as exc:
             return self._finish("blocked", EXIT_BLOCKED, "storage_failure",
                                 "backup record unwritable: %s" % str(exc)[:300])
         try:
-            backup_ok, backup_code, backup_detail = self._do_backup()
+            backup_ok, backup_code, backup_detail = self._do_backup(
+                float(timeouts["backup"]))
         except Exception as exc:
             return self._finish("blocked", EXIT_BLOCKED, "backup_failed",
                                 "backup crashed: %s" % str(exc)[:300])
@@ -1163,15 +1723,30 @@ class Runner(object):
                                 "signal after backup, before mutation",
                                 recovery_required=True)
 
-        # Updating phase: the only mutating step.
+        # Updating phase: the only mutating step. Persist the unresolved
+        # marker atomically with the state (R05) so a crash here always
+        # reconciles as possible-mutation.
         try:
-            self._set_state("updating", step="updating")
+            self._set_state("updating", step="updating",
+                            extra={"unresolved": 1})
         except Exception as exc:
             # Backup is done but no mutation ran; still preserve receipt and
             # require reconciliation because backup state is ambiguous.
             return self._finish("interrupted", EXIT_INTERRUPTED, "storage_failure",
                                 "updating record unwritable: %s" % str(exc)[:300],
                                 recovery_required=True)
+        # R28: remeasure AFTER backup, immediately before mutation — the
+        # backup consumed space, so the preflight budget must be re-held.
+        try:
+            re_ok, re_code, re_detail = self._recheck_space(plan)
+        except Exception as exc:
+            re_ok, re_code, re_detail = (
+                False, "disk_blocked", "space recheck crashed: %s" % exc)
+        if not re_ok:
+            self._event("space recheck blocked: %s %s"
+                        % (re_code, re_detail))
+            return self._finish("blocked", EXIT_BLOCKED, re_code, re_detail)
+        self._plan_obj = plan
         try:
             exec_result = self._do_execute(plan, float(timeouts["updating"]))
         except Exception as exc:
@@ -1180,9 +1755,9 @@ class Runner(object):
                                 "execute crashed: %s" % str(exc)[:300],
                                 recovery_required=True)
         if self._stop.is_set() and exec_result is None and not self._timed_out:
-            terminate_tree(5)
+            self._kill_scope(self._scope_name("updating"))
             return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
-                                "signal during mutation; updater tree terminated",
+                                "signal during mutation; updater scope killed",
                                 recovery_required=True)
         if exec_result is None:
             if self._timed_out:
@@ -1196,6 +1771,12 @@ class Runner(object):
         exec_state = getattr(exec_result, "state", "")
         exec_code = getattr(exec_result, "error_code", "")
         exec_detail = getattr(exec_result, "error_detail", "")
+        try:
+            self.installer_exit = int(
+                getattr(exec_result, "exit_code", 0) or 0)
+        except (TypeError, ValueError):
+            self.installer_exit = 0
+        self.install_outcome = str(exec_state or "")[:200]
         self._event("execute done state=%s error=%s before=%s after=%s" % (
             exec_state, exec_code, getattr(exec_result, "before_version", ""),
             self.after_version))
@@ -1204,12 +1785,15 @@ class Runner(object):
             return self._finish("blocked", EXIT_BLOCKED, code, exec_detail[:1000])
         if exec_state == "already_current":
             # Idempotent no-op: still requires verification, never counted as
-            # upgrade evidence.
+            # upgrade evidence (actual_change stays False).
+            self.actual_change = False
             pass
         elif exec_state not in ("succeeded",):
             self._event("install failed; running bounded recovery checks")
             try:
-                recovery = self._do_verify(min(120.0, float(timeouts["verifying"])))
+                recovery = self._do_verify(
+                    min(120.0, float(timeouts["verifying"])),
+                    self._required_checks(plan))
                 if recovery is not None:
                     self._record_checks(recovery)
             except Exception:
@@ -1217,6 +1801,8 @@ class Runner(object):
             return self._finish("failed", EXIT_INSTALL_FAILED,
                                 exec_code or "install_failed",
                                 (exec_detail or "installer failed")[:1000])
+        else:
+            self.actual_change = True
 
         # Verifying phase: zero exit plus mandatory failure is health_failed.
         try:
@@ -1226,7 +1812,8 @@ class Runner(object):
                                 "verifying record unwritable: %s" % str(exc)[:300],
                                 recovery_required=True)
         try:
-            verify_result = self._do_verify(float(timeouts["verifying"]))
+            verify_result = self._do_verify(float(timeouts["verifying"]),
+                                            self._required_checks(plan))
         except Exception as exc:
             return self._finish("interrupted", EXIT_INTERRUPTED, "interrupted",
                                 "verify crashed: %s" % str(exc)[:300],
@@ -1264,7 +1851,47 @@ class Runner(object):
         self._event("job succeeded before=%s after=%s%s" % (
             self.before_version, self.after_version,
             " (already-current; not upgrade evidence)" if exec_state == "already_current" else ""))
+        self.verify_passed = True
         return self._finish("succeeded", EXIT_OK, "", "")
+
+    def _required_checks(self, plan):
+        # type: (Any) -> List[str]
+        """Plan-bound mandatory diagnostics manifest (R24)."""
+        try:
+            req = list(getattr(plan, "required_checks", []) or [])
+            return [str(r) for r in req if str(r).strip()]
+        except Exception:
+            return []
+
+    def _recheck_space(self, plan):
+        # type: (Any) -> Tuple[bool, str, str]
+        """R28: re-hold the space budget after backup consumed space."""
+        try:
+            settings = self._settings()
+            floor = int(getattr(settings, "disk_floor_bytes",
+                                3 * 1024 * 1024 * 1024))
+            reserve = int(getattr(settings, "reserve_bytes",
+                                  1 * 1024 * 1024 * 1024))
+        except (TypeError, ValueError):
+            floor, reserve = 3 * 1024 * 1024 * 1024, 1024 * 1024 * 1024
+        try:
+            footprint = self.adapter.measure_footprint(plan)
+        except Exception as exc:
+            return False, "disk_blocked", \
+                "footprint recheck failed: %s" % str(exc)[:300]
+        need, per_fs, unknown = self._space_need(plan, footprint, floor,
+                                                 reserve)
+        if unknown:
+            return False, "disk_blocked", unknown[:500]
+        try:
+            from ..adapters.registry import check_disk
+            disk_ok, disk_detail, _per = check_disk(per_fs, need)
+        except Exception as exc:
+            return False, "disk_blocked", \
+                "disk recheck failed: %s" % str(exc)[:300]
+        if not disk_ok:
+            return False, "disk_blocked", disk_detail[:500]
+        return True, "", ""
 
     def _fail_early(self, code, detail):
         # type: (str, str) -> int
@@ -1279,6 +1906,10 @@ class Runner(object):
         # type: () -> None
         def _handle(signum, _frame):
             self._stop.set()
+            try:
+                self._cancel.set()
+            except Exception:
+                pass
             try:
                 self._event("signal %d received; no retry, no browser cancel" % signum)
             except Exception:

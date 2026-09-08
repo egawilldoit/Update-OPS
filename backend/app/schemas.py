@@ -62,6 +62,12 @@ class PlanView(BaseModel):
     steps: List[str] = Field(default_factory=list)
     expires_at: str = ""
     restart_impact: str = ""
+    plan_version: int = 2
+    config_hash: str = ""
+    release_path: str = ""
+    activity_ts: str = ""
+    plan_hash: str = ""
+    single_use: bool = True
 
 
 class JobCreate(BaseModel):
@@ -86,6 +92,14 @@ class JobView(BaseModel):
     runner_unit: str = ""
     recovery_required: bool = False
     backup_summary: str = ""
+    # R18 outcome separation: installer exit vs wrapper exit, explicit
+    # installation outcome, actual-change flag (already-current stays
+    # distinguishable). final_log_seq publishes the durable log cursor
+    # (-1 until the final flush); UI drains to it (R20).
+    installer_exit: int = 0
+    install_outcome: str = ""
+    actual_change: bool = False
+    final_log_seq: int = -1
 
 
 class CheckView(BaseModel):
@@ -131,23 +145,38 @@ class ReceiptModel(BaseModel):
     `ts`. Writers populate both pairs identically.
     """
 
-    schema_version: int = 1
+    schema_version: int = 2
     job_id: str = ""
     tool_id: str = ""
     tool: str = ""
+    plan_id: str = ""
+    plan_hash: str = ""
+    attempt_nonce: str = ""
+    release_path: str = ""
+    target: str = ""
+    target_mode: Literal["exact", "native_latest"] = "exact"
     state: Literal[
         "succeeded", "blocked", "failed", "health_failed", "interrupted",
     ] = "interrupted"
     before_version: str = ""
     after_version: str = ""
     exit_code: int = 0
+    installer_exit: int = 0
+    install_outcome: str = ""
+    actual_change: bool = False
+    before_commit: str = ""
+    after_commit: str = ""
     error_code: str = ""
     error_detail: str = ""
     checks: List[ReceiptCheck] = Field(default_factory=list)
+    expected_checks: List[str] = Field(default_factory=list)
     ts: str = ""
     finished_at: str = ""
     backup_summary: str = ""
     log_truncated: bool = False
+    cleanup_status: str = ""
+    recovery_disposition: str = ""
+    evidence_durable: bool = True
 
 
 class HistoryPage(BaseModel):

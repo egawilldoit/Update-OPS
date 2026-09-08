@@ -107,7 +107,7 @@ export function PlanPreview({
         </div>
         <div>
           <dt>Plan expires</dt>
-          <dd>{plan.expires_at} (5-minute server-owned preview)</dd>
+          <dd>{plan.expires_at} (5-minute server-owned preview, single use — a retry needs a fresh preview)</dd>
         </div>
         <div>
           <dt>Steps</dt>

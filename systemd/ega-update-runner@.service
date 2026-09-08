@@ -1,23 +1,29 @@
-# EGA Update Console — per-job runner template (SPEC §8).
+# EGA Update Console — per-job runner template (SPEC §8, CONTRACTS §8-§9).
 #
-# NOT enabled directly. The dispatcher (running as ubuntu) spawns one
-# transient instance per job via the ubuntu USER manager:
+# DOCUMENTATION OF THE TRANSIENT UNIT SHAPE ONLY — DO NOT ENABLE OR START
+# THIS TEMPLATE DIRECTLY. There is exactly one canonical launch mechanism,
+# owned by the dispatcher (running as ubuntu) via the ubuntu USER manager:
 #
 #   systemd-run --user --collect \
-#     --unit=ega-update-job-<shortid> \
-#     --working-directory=/opt/ega-update/current \
-#     ega-update-runner <job-id>
+#     --unit=ega-update-job-<32hex-uuid>.service \
+#     --working-directory=<resolved-release> \
+#     --setenv=EGA_CONFIG_FILE=... \
+#     --setenv=EGA_ATTEMPT_NONCE=... --setenv=<allow-listed owner env> \
+#     --property=KillMode=control-group \
+#     --property=Restart=no \
+#     <release-venv-python> -m backend.app.worker.runner <job-id> <nonce>
 #
-# where <shortid> is the first 8 chars of the job UUID and the unit name is
-# persisted to jobs.runner_unit BEFORE dispatch (dispatch.py claim_or_block).
-# A dispatch retry inspects that recorded unit (`systemctl --user is-active/
+# where <job-id> is the full job UUID and <nonce> is the attempt claim token
+# (jobs.claim_with_nonce; runner refuses mismatches with exit 6 before any
+# mutation). The recorded jobs.runner_unit is the transient
+# ega-update-job-<32hex-uuid>.service name (full UUID hex, never shortid). A
+# dispatch retry inspects that recorded unit (`systemctl --user is-active/
 # show` as ubuntu) instead of spawning a duplicate.
-# User-manager requirement: `loginctl enable-linger ubuntu` must be active
-# (see deploy/scripts/install.sh §4b) or the user manager — and all --user
-# job units — dies with the last SSH session.
-# Preferred user-unit template: systemd/user/ega-update-runner@.service
-# (installed to ubuntu's ~/.config/systemd/user); this system template is
-# retained for sites that run the runner as a system unit instead.
+#
+# This file documents the execution environment (cgroup containment,
+# timeouts, no-restart) for the transient unit above; it is NOT an alternate
+# launch path. `systemctl start ega-update-runner@<anything>` is unsupported
+# and will not carry the canonical <job-id> <nonce> argv.
 #
 # Cgroup containment: updater descendants remain in the job's cgroup.
 # - Runner crash: systemd terminates remaining cgroup processes; the
@@ -32,13 +38,12 @@
 # procedure timeouts come from adapter plan().timeouts (see
 # backend/app/adapters/base.py ADAPTER_TIMEOUT_DEFAULTS).
 #
-# Template identity: instantiated as ega-update-runner@<jobid>.service.
-# The transient systemd-run unit (ega-update-job-<shortid>) is the recorded
-# runner_unit; this template documents the execution environment for sites
-# that prefer a template instance over bare systemd-run properties.
+# User-manager requirement: `loginctl enable-linger ubuntu` must be active
+# (see deploy/scripts/install.sh) or the user manager — and all --user
+# job units — dies with the last SSH session.
 
 [Unit]
-Description=EGA Update Console job runner %i
+Description=EGA Update Console job runner <job-id> <nonce> (transient shape documentation — do not start directly)
 Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
 After=network.target ega-update-worker.service
 Wants=network.target
@@ -49,7 +54,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/ega-update/current
 EnvironmentFile=/etc/ega-update/worker.env
-ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.runner %i
+ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.runner <job-id> <nonce>
 # Graceful stop first, then SIGKILL. KillMode=control-group ensures
 # updater descendants in the job cgroup are terminated together.
 KillMode=control-group
