@@ -110,10 +110,9 @@ binding, and contradiction-free success evidence.
 ## Final pre-runtime surgical addendum (G01–G08, main-agent pass)
 
 Previous baseline `d4b1ba3281db36b626bf03ac4f7c26e7314a7a03`. This
-pass: uncommitted at matrix-update time — exact resulting SHA recorded
-as `PENDING:final-sha` until the implementation commit lands (this
-marker is the explicit placeholder required before a SHA exists; the
-report carries the final SHA). Every row: `implemented-static`,
+pass landed as implementation head
+`be123ddde8944aee864b59846f6c184914c28173` (replacing the
+`PENDING:final-sha` placeholder used while the SHA did not yet exist). Every row: `implemented-static`,
 result `NOT EXECUTED — IMPLEMENTATION PHASE`. No runtime PASS claimed.
 New regression artifacts: `backend/tests/test_final_integration.py`
 (G01–G08 blocks) plus `backend/tests/test_core_corrective.py`
