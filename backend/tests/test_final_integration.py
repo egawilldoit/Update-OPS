@@ -1250,9 +1250,13 @@ def test_g02_dispatcher_holds_with_procs_despite_receipt(
     # Unit itself stopped: only the surviving process may hold the row.
     _stopped_units(monkeypatch)
     monkeypatch.setattr(
-        rc_lib, "job_processes",
-        lambda hex_token, full_id="", exclude_pids=(): [
-            {"pid": 4242, "cmdline": "ega-update-job-abc runner"}])
+        rc_lib, "prove_processes",
+        lambda hex_token, full_id="", exclude_pids=(): {
+            "ok": True,
+            "processes": [
+                {"pid": 4242,
+                 "cmdline": "ega-update-job-abc runner"}],
+            "reason": ""})
     db_row = conn.execute("SELECT * FROM jobs WHERE id=?",
                           (jid,)).fetchone()
     assert dispatch_lib._reconcile_row(conn, db_row) == "unknown-held"

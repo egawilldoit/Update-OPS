@@ -172,8 +172,11 @@ def _prove_launch(conn, job_id, unit, nonce,
         return state
     if state == "confirmed_stopped":
         try:
-            from ..reconcile_core import job_processes, unit_hex
-            if job_processes(unit_hex(job_id), job_id):
+            from ..reconcile_core import prove_processes, unit_hex
+            proof = prove_processes(unit_hex(job_id), job_id)
+            if not proof.get("ok", False):
+                return "unknown"
+            if proof.get("processes"):
                 return "unknown"
         except Exception:
             return "unknown"
@@ -403,8 +406,16 @@ def _reconcile_row(conn, row):
     if not unit:
         unit = _rc.canonical_unit(job_id)
     info = _units.query_unit(unit, timeout_s=5)
+    # H03: structured process proof — an unprovable scan (None) holds
+    # via decide(), exactly like surviving processes. A bare [] is only
+    # ever passed when the scan COMPLETED empty.
     try:
-        procs = _rc.job_processes(_rc.unit_hex(job_id), job_id)
+        _proof = _rc.prove_processes(_rc.unit_hex(job_id), job_id)
+    except Exception:
+        _proof = {"ok": False, "processes": [], "reason": "proof crashed"}
+    try:
+        procs = list(_proof.get("processes", []) or []) \
+            if _proof.get("ok", False) else None
     except Exception:
         procs = None
     # G02/G03: delegated proof is computed only once the unit itself is
@@ -412,7 +423,19 @@ def _reconcile_row(conn, row):
     # no service queries are spent). It is REQUIRED before any receipt
     # application or ownership release.
     delegated = None
+    scopes_quiescent = False
+    scopes_reason = ""
     if str(info.get("state", "")) == "confirmed_stopped":
+        # H03: every job-owned phase scope must itself be confirmed
+        # stopped — hex-less stray children are invisible to the
+        # process scan. A non-quiescent scope holds below (never
+        # applies, never releases) even with a perfect receipt.
+        try:
+            scopes_quiescent, _scope_ev, scopes_reason = \
+                _rc.phase_scopes_quiescence(job_id)
+        except Exception as exc:
+            scopes_quiescent = False
+            scopes_reason = "phase scope proof crashed: %s" % exc
         try:
             quiescent, evidence, reason = _rc.delegated_quiescence(
                 conn, job)
@@ -438,8 +461,14 @@ def _reconcile_row(conn, row):
     receipt_view = dict(receipt_data) if receipt_valid else None
     if receipt_view is not None:
         receipt_view["_valid"] = True
-    action, detail = _rc.decide(job, info, receipt_view, procs,
-                                delegated)
+    if str(info.get("state", "")) == "confirmed_stopped" and \
+            not scopes_quiescent:
+        action, detail = "keep-unknown", \
+            "phase scopes unproven (%s); holding reservation" % (
+                scopes_reason or "scope proof missing")[:200]
+    else:
+        action, detail = _rc.decide(job, info, receipt_view, procs,
+                                    delegated)
     if action in ("live", "starting", "stopping"):
         try:
             conn.execute("UPDATE jobs SET heartbeat=? WHERE id=?",

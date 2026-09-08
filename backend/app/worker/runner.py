@@ -85,12 +85,22 @@ def _job_processes_alive(job_id):
     Matches the canonical unit hex + runner markers (never the bare
     dashed UUID the observer itself carries), so the caller never
     detects itself as a live updater.
+
+    H03: an UNPROVABLE scan returns a synthetic sentinel entry (never
+    []), so callers that treat a non-empty list as "unresolved" fail
+    closed instead of mistaking proof failure for absence.
     """
     try:
-        from ..reconcile_core import job_processes, unit_hex
-        return job_processes(unit_hex(job_id), job_id)
+        from ..reconcile_core import prove_processes, unit_hex
+        proof = prove_processes(unit_hex(job_id), job_id)
+        if not proof.get("ok", False):
+            return [{"pid": -1,
+                     "cmdline": "process proof unprovable: %s"
+                     % str(proof.get("reason", ""))[:150]}]
+        return list(proof.get("processes", []) or [])
     except Exception:
-        return []
+        return [{"pid": -1,
+                 "cmdline": "process proof crashed; treating as live"}]
 
 
 def _is_timeout_result(exec_result):

@@ -335,3 +335,301 @@ def test_h02_adapters_emit_structured_refs():
                                name), "r", encoding="utf-8") as fh:
             src = fh.read()
         assert '"%s:%s" % (scope' in src
+
+
+# -- H03 structured process proof + phase-scope gates --------------------------
+
+def test_h03_prove_empty_token_is_vacuous():
+    from backend.app import reconcile_core as rc_lib
+
+    proof = rc_lib.prove_processes("", "")
+    assert proof["ok"] is True and proof["processes"] == []
+
+
+def test_h03_prove_completes_empty_on_unknown_token():
+    from backend.app import reconcile_core as rc_lib
+
+    token = "deadbeefcafe%032d" % 1
+    proof = rc_lib.prove_processes(token, "")
+    assert proof["ok"] is True
+    assert proof["processes"] == []
+
+
+def test_h03_prove_enumeration_failure_is_not_empty(monkeypatch):
+    """A failed /proc listing is UNPROVABLE (ok False), never []."""
+    from backend.app import reconcile_core as rc_lib
+
+    def _boom(_path):
+        raise OSError("proc unavailable")
+
+    monkeypatch.setattr(rc_lib.os, "listdir", _boom)
+    proof = rc_lib.prove_processes("abcdef1234", "")
+    assert proof["ok"] is False
+    assert proof["processes"] == []
+    assert "enumeration" in proof["reason"]
+
+
+def test_h03_prove_vanished_pid_skips(monkeypatch):
+    """PIDs that exit mid-scan are gone and cannot be survivors."""
+    from backend.app import reconcile_core as rc_lib
+
+    monkeypatch.setattr(rc_lib.os, "listdir",
+                        lambda _path: ["99999991"])
+    proof = rc_lib.prove_processes("abcdef1234", "")
+    assert proof["ok"] is True
+    assert proof["processes"] == []
+
+
+def test_h03_prove_unreadable_pid_blocks(monkeypatch):
+    """A live but unreadable PID (PermissionError) blocks: its
+    membership cannot be ruled out."""
+    import builtins
+    from backend.app import reconcile_core as rc_lib
+
+    real_open = builtins.open
+    monkeypatch.setattr(rc_lib.os, "listdir",
+                        lambda _path: ["424243"])
+
+    def _guarded_open(path, *args, **kwargs):
+        if "424243" in str(path):
+            raise PermissionError("denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _guarded_open)
+    proof = rc_lib.prove_processes("abcdef1234", "")
+    assert proof["ok"] is False
+    assert proof["processes"] == []
+    assert "424243" in proof["reason"]
+
+
+def test_h03_job_processes_wrapper_stays_list():
+    from backend.app import reconcile_core as rc_lib
+
+    assert rc_lib.job_processes("zz-no-such-token-zz", "") == []
+
+
+def test_h03_job_phases_match_supervised_phases():
+    """_JOB_PHASES tracks phase_run.PHASES minus probe (probe scopes
+    are probe-owned, never job-owned)."""
+    from backend.app import reconcile_core as rc_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    assert set(rc_lib._JOB_PHASES) == \
+        set(phase_run_lib.PHASES) - {"probe"}
+
+
+def test_h03_expected_scopes_cover_all_job_phases():
+    from backend.app import reconcile_core as rc_lib
+
+    jid = str(uuid.uuid4())
+    scopes = rc_lib.expected_phase_scopes(jid)
+    assert len(scopes) == 4
+    assert all(s.endswith(".scope") for s in scopes)
+    assert all(rc_lib.unit_hex(jid) in s for s in scopes)
+    assert rc_lib.expected_phase_scopes("") == []
+
+
+def test_h03_scopes_all_stopped_proves():
+    from backend.app import reconcile_core as rc_lib
+
+    jid = str(uuid.uuid4())
+    scopes = rc_lib.expected_phase_scopes(jid)
+    fake = _FakeUnits(
+        user={s: {"state": "confirmed_stopped", "detail": ""}
+              for s in scopes})
+    quiescent, evidence, reason = rc_lib.phase_scopes_quiescence(
+        jid, units_mod=fake)
+    assert quiescent is True and reason == ""
+    assert len(evidence) == 4
+
+
+def test_h03_scopes_live_scope_blocks():
+    from backend.app import reconcile_core as rc_lib
+
+    jid = str(uuid.uuid4())
+    scopes = rc_lib.expected_phase_scopes(jid)
+    units = {s: {"state": "confirmed_stopped", "detail": ""}
+             for s in scopes}
+    units[scopes[2]] = {"state": "live", "detail": "active"}
+    fake = _FakeUnits(user=units)
+    quiescent, _evidence, reason = rc_lib.phase_scopes_quiescence(
+        jid, units_mod=fake)
+    assert quiescent is False
+    assert scopes[2] in reason
+
+
+def test_h03_scopes_query_crash_blocks():
+    from backend.app import reconcile_core as rc_lib
+
+    class _Crash(object):
+        def query_unit(self, unit, timeout_s=5):
+            raise OSError("bus down")
+
+    quiescent, _evidence, _reason = rc_lib.phase_scopes_quiescence(
+        str(uuid.uuid4()), units_mod=_Crash())
+    assert quiescent is False
+
+
+def test_h03_runner_sentinel_on_unprovable_scan(monkeypatch):
+    """_job_processes_alive surfaces proof failure as a truthy
+    sentinel, so timeout-verify treats it as unresolved."""
+    from backend.app import reconcile_core as rc_lib
+    from backend.app.worker import runner as runner_lib
+
+    monkeypatch.setattr(
+        rc_lib, "prove_processes",
+        lambda *a, **k: {"ok": False, "processes": [],
+                         "reason": "proc unavailable"})
+    leftovers = runner_lib._job_processes_alive("any-job")
+    assert leftovers and leftovers[0]["pid"] == -1
+
+
+class _FakePopen(object):
+    """Fake supervised worker spawn: writes the result file the real
+    worker would produce, then reports immediate exit."""
+
+    result_path = ""
+    result_body = {"ok": True, "data": {"done": 1}}
+
+    def __init__(self, *args, **kwargs):
+        self._wrote = False
+
+    def poll(self):
+        if not self._wrote:
+            self._wrote = True
+            try:
+                with open(type(self).result_path, "w",
+                          encoding="utf-8") as fh:
+                    json.dump(type(self).result_body, fh)
+            except Exception:
+                pass
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+    def communicate(self, timeout=None):
+        return b"", b""
+
+    def kill(self):
+        pass
+
+
+def _phase_run_settings(monkeypatch, tmp_path):
+    from backend.app import owner_env as owner_env_lib
+
+    release = str(tmp_path)
+    monkeypatch.setattr(
+        owner_env_lib, "resolved_paths",
+        lambda _s: {"release_root": release,
+                    "venv_python": "/usr/bin/python3",
+                    "config_path": os.path.join(release, "cfg.json")})
+    monkeypatch.setattr(
+        owner_env_lib, "build_owner_contract",
+        lambda _s: object())
+    monkeypatch.setattr(
+        owner_env_lib, "contract_fingerprint",
+        lambda _c: "fp-test")
+    return object()
+
+
+def _patch_phase_spawn(monkeypatch):
+    import subprocess as sp_lib
+
+    monkeypatch.setattr(sp_lib, "Popen", _FakePopen)
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(
+        os.path, "isfile",
+        lambda p: True if p == "/usr/bin/systemd-run" else
+        real_isfile(p))
+
+
+def test_h03_normal_completion_proves_scope_exit(tmp_path, monkeypatch):
+    """Worker rc 0 + result data + already-empty scope delivers."""
+    from backend.app import units as units_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    settings = _phase_run_settings(monkeypatch, tmp_path)
+    _patch_phase_spawn(monkeypatch)
+    killed = []
+
+    monkeypatch.setattr(
+        phase_run_lib, "_kill_scope_wait_empty",
+        lambda scope, grace: killed.append(scope) or True)
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=5: {"state": "confirmed_stopped",
+                                   "unit": unit, "detail": ""})
+    jid = str(uuid.uuid4())
+    emitted = []
+    _FakePopen.result_path = os.path.join(
+        str(tmp_path), "%s.execute.result.json" % jid)
+    _FakePopen.result_body = {"ok": True, "data": {"done": 1}}
+    ok, data, error, timed_out = phase_run_lib.run_supervised_phase(
+        "hermes", jid, "execute", {}, 60.0, settings, str(tmp_path),
+        lambda stream, line: emitted.append((stream, line)),
+        op="test-op", env={"PATH": "/usr/bin:/bin"})
+    assert ok is True and timed_out is False, error
+    assert data.get("done") == 1
+    assert killed == []
+
+
+def test_h03_completion_reaps_lingering_scope(tmp_path, monkeypatch):
+    """Worker done but scope live + kill succeeds: result still
+    delivers (the scope was proven empty before delivery)."""
+    from backend.app import units as units_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    settings = _phase_run_settings(monkeypatch, tmp_path)
+    _patch_phase_spawn(monkeypatch)
+    killed = []
+    monkeypatch.setattr(
+        phase_run_lib, "_kill_scope_wait_empty",
+        lambda scope, grace: killed.append(scope) or True)
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=5: {"state": "live", "unit": unit,
+                                   "active_state": "active",
+                                   "sub_state": "running",
+                                   "detail": ""})
+    jid = str(uuid.uuid4())
+    _FakePopen.result_path = os.path.join(
+        str(tmp_path), "%s.execute.result.json" % jid)
+    _FakePopen.result_body = {"ok": True, "data": {"done": 1}}
+    ok, data, error, timed_out = phase_run_lib.run_supervised_phase(
+        "hermes", jid, "execute", {}, 60.0, settings, str(tmp_path),
+        lambda stream, line: None, op="test-op",
+        env={"PATH": "/usr/bin:/bin"})
+    assert ok is True and timed_out is False, error
+    assert data.get("done") == 1
+    assert len(killed) == 1
+
+
+def test_h03_completion_unreapable_scope_is_timeout(tmp_path,
+                                                   monkeypatch):
+    """Worker done but scope will not empty: timeout — survivors
+    exist, so the caller must keep recovery."""
+    from backend.app import units as units_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    settings = _phase_run_settings(monkeypatch, tmp_path)
+    _patch_phase_spawn(monkeypatch)
+    monkeypatch.setattr(
+        phase_run_lib, "_kill_scope_wait_empty",
+        lambda scope, grace: False)
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=5: {"state": "live", "unit": unit,
+                                   "active_state": "active",
+                                   "sub_state": "running",
+                                   "detail": ""})
+    jid = str(uuid.uuid4())
+    _FakePopen.result_path = os.path.join(
+        str(tmp_path), "%s.execute.result.json" % jid)
+    _FakePopen.result_body = {"ok": True, "data": {"done": 1}}
+    ok, _data, error, timed_out = phase_run_lib.run_supervised_phase(
+        "hermes", jid, "execute", {}, 60.0, settings, str(tmp_path),
+        lambda stream, line: None, op="test-op",
+        env={"PATH": "/usr/bin:/bin"})
+    assert ok is False and timed_out is True
+    assert "not quiescent after completion" in error

@@ -1,14 +1,17 @@
-"""Shared reconciliation decision logic (R04/R07, F02/G02/G03).
+"""Shared reconciliation decision logic (R04/R07, F02/G02/G03, H02/H03).
 
 One algorithm used by the dispatcher loop, the SSH reconcile command, and
 the CLI. Reconciliation ordering (G02 — receipt never overrides a
 surviving updater):
   1. inspect canonical unit;
-  2. inspect execution-marked processes;
-  3. inspect delegated operations (shared delegated_quiescence proof);
-  4. only if all execution proof is quiescent: evaluate receipt;
-  5. then reconcile outcome;
-  6. then release mutation ownership (separate proven step).
+  2. inspect every job-owned phase scope (H03 — stray children that
+     carry no hex marker are invisible to the process scan, so each
+     scope unit itself must be confirmed stopped);
+  3. inspect execution-marked processes via a structured proof (H03);
+  4. inspect delegated operations (shared delegated_quiescence proof);
+  5. only if all execution proof is quiescent: evaluate receipt;
+  6. then reconcile outcome;
+  7. then release mutation ownership (separate proven step).
 
 Unknown at any proof step holds the reservation and the recovery gate.
 Never reruns.
@@ -86,29 +89,48 @@ def parse_service_ref(value):
     return scope, unit
 
 
-def job_processes(hex_token, full_id="", exclude_pids=()):
-    # type: (str, str, object) -> List[Dict[str, Any]]
-    """Legacy raw scan: best-effort list, [] on ANY failure (H03: this
-    ambiguity is why callers must use prove_processes() instead)."""
+def prove_processes(hex_token, full_id="", exclude_pids=()):
+    # type: (str, str, object) -> Dict[str, Any]
+    """Structured execution-process proof (H03).
+
+    Returns {"ok": bool, "processes": [...], "reason": str}.
+
+    - ok True + processes []: the scan COMPLETED and nothing matched —
+      genuine absence.
+    - ok True + processes [..]: survivors; each entry carries pid +
+      cmdline evidence.
+    - ok False: the scan is UNPROVABLE and must hold the reservation:
+      /proc enumeration failed, or a live PID's cmdline could not be
+      read for any reason OTHER than the process having exited
+      (FileNotFoundError/ProcessLookupError/NotADirectoryError mean it
+      is gone and cannot be a survivor; PermissionError or any other
+      read failure means a process EXISTS whose membership we cannot
+      rule out, so absence is unproven). Callers must treat ok False
+      exactly like surviving processes — never like [].
 
     Matches cmdlines containing the hex token AND an execution marker
     (runner module, systemd-run unit, or updater context) so the
     observer (which carries only the dashed UUID) never matches itself.
     Always excludes exclude_pids (default: own pid).
     """
-    found = []  # type: List[Dict[str, Any]]
     try:
-        me = os.getpid()
+        excluded = set(exclude_pids or ())
     except Exception:
-        me = -1
-    excluded = set(exclude_pids or ())
-    excluded.add(me)
+        excluded = set()
+    try:
+        import os as _os_mod
+        excluded.add(_os_mod.getpid())
+    except Exception:
+        pass
     if not hex_token:
-        return found
+        return {"ok": True, "processes": [], "reason": "no token"}
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
-    except Exception:
-        return found
+    except Exception as exc:
+        return {"ok": False, "processes": [],
+                "reason": "process enumeration unavailable: %s"
+                % str(exc)[:150]}
+    found = []  # type: List[Dict[str, Any]]
     for pid in pids:
         try:
             if int(pid) in excluded:
@@ -117,17 +139,143 @@ def job_processes(hex_token, full_id="", exclude_pids=()):
             continue
         try:
             with open("/proc/%s/cmdline" % pid, "rb") as fh:
-                cmd = fh.read().replace(b"\0", b" ").decode(
-                    "utf-8", errors="replace")
-        except Exception:
+                raw = fh.read()
+        except FileNotFoundError:
             continue
+        except ProcessLookupError:
+            continue
+        except NotADirectoryError:
+            continue
+        except PermissionError as exc:
+            return {"ok": False, "processes": [],
+                    "reason": "process %s unreadable (permission): %s"
+                    % (pid, str(exc)[:120])}
+        except Exception as exc:
+            # Any other read failure on an existing PID leaves
+            # membership unprovable: hold, never assume absence.
+            return {"ok": False, "processes": [],
+                    "reason": "process %s unreadable: %s"
+                    % (pid, str(exc)[:120])}
+        try:
+            cmd = raw.replace(b"\0", b" ").decode(
+                "utf-8", errors="replace")
+        except Exception:
+            return {"ok": False, "processes": [],
+                    "reason": "process %s cmdline undecodable" % pid}
         if hex_token not in cmd:
             continue
         if ("backend.app.worker.runner" in cmd
                 or "ega-update-job-" in cmd
                 or "systemd-run" in cmd):
             found.append({"pid": int(pid), "cmdline": cmd[:300]})
-    return found
+    return {"ok": True, "processes": found,
+            "reason": "" if found else "no execution-marked processes"}
+
+
+def job_processes(hex_token, full_id="", exclude_pids=()):
+    # type: (str, str, object) -> List[Dict[str, Any]]
+    """Legacy raw scan: best-effort list of matches.
+
+    H03: an unprovable scan and a completed empty scan BOTH surface as
+    [] here, so reconcile paths must use prove_processes() instead and
+    treat ok False as a hold. Kept for backward-compatible callers that
+    already fail closed on ambiguity.
+    """
+    try:
+        proof = prove_processes(hex_token, full_id, exclude_pids)
+    except Exception:
+        return []
+    try:
+        return list((proof or {}).get("processes", []) or [])
+    except Exception:
+        return []
+
+
+# Job phases that run inside coordinator-owned transient scopes
+# (H03). Must equal set(phase_run.PHASES) - {"probe"}: probe scopes are
+# owned by probe requests, not jobs. A regression test pins the
+# equality so the two definitions cannot drift.
+_JOB_PHASES = ("preflight", "backup", "execute", "verify")
+
+
+def expected_phase_scopes(job_id):
+    # type: (str) -> List[str]
+    """Every transient scope unit a job can own (H03).
+
+    Scope names derive from owner_env.transient_scope_name; a scope
+    that was never created queries as not-found (confirmed stopped),
+    so enumerating the full phase set is always safe. Returns [] only
+    when the job id itself is unusable (callers then hold).
+    """
+    try:
+        from .owner_env import transient_scope_name
+    except Exception:
+        return []
+    try:
+        stem = unit_hex(job_id)
+        if not stem:
+            return []
+        names = []
+        for phase in _JOB_PHASES:
+            try:
+                names.append(transient_scope_name(stem, phase))
+            except Exception:
+                return []
+        return names
+    except Exception:
+        return []
+
+
+def phase_scopes_quiescence(job_id, units_mod=None):
+    # type: (str, object) -> Tuple[bool, List[Dict[str, Any]], str]
+    """Prove every job-owned phase scope is confirmed stopped (H03).
+
+    A stray scope child (e.g. a spawned tool that outlived its worker)
+    carries no hex marker, so the process scan cannot see it — only the
+    scope unit state proves it gone. Returns
+    (quiescent, evidence, reason); any live/starting/stopping/unknown
+    scope, any query failure, or an unbuildable scope list blocks.
+
+    units_mod defaults to backend.app.units (imported lazily so this
+    module stays import-light); tests inject fakes exposing query_unit.
+    """
+    if units_mod is None:
+        try:
+            from . import units as _units_mod
+            units_mod = _units_mod
+        except Exception:
+            return False, [], "unit model unavailable"
+    query = getattr(units_mod, "query_unit", None)
+    if not callable(query):
+        return False, [], "scope query unavailable"
+    try:
+        scopes = expected_phase_scopes(job_id)
+    except Exception as exc:
+        return False, [], "scope list unbuildable: %s" % str(exc)[:150]
+    if not scopes:
+        return False, [], "scope list unbuildable: empty job id"
+    evidence = []  # type: List[Dict[str, Any]]
+    for scope in scopes:
+        try:
+            info = query(scope, timeout_s=5)
+        except Exception as exc:
+            evidence.append({"scope": scope, "state": "unknown",
+                             "detail": "query crashed: %s" % str(exc)[:150]})
+            continue
+        try:
+            state = str((info or {}).get("state", "unknown"))
+            detail = str((info or {}).get("detail", "") or "")[:200]
+        except Exception:
+            state, detail = "unknown", "state unreadable"
+        evidence.append({"scope": scope, "state": state,
+                         "detail": detail})
+    for entry in evidence:
+        if entry.get("state") != "confirmed_stopped":
+            return False, evidence, \
+                "phase scope %s is %s" % (
+                    entry.get("scope", "?"),
+                    entry.get("state", "unknown"))
+    return True, evidence, ""
 
 
 def delegated_quiescence(conn, job, units_mod=None):

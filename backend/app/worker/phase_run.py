@@ -644,10 +644,13 @@ def run_supervised_phase(tool_id, job_id, phase, payload_extra,
     proving preview/apply parity instead of assuming it.
 
     Returns (ok, data, error, timed_out):
-    - ok True + data: worker completed; data is the sanitized result dict.
-    - timed_out True: deadline hit; scope killed + proven empty (or
-      proven NON-empty -> caller must keep recovery). No worker Python
-      survives: it is an OS process in the killed cgroup.
+    - ok True + data: worker completed AND its scope proved empty;
+      data is the sanitized result dict.
+    - timed_out True: deadline hit, or the scope would not empty after
+      the worker ended (H03 — survivors exist, caller must keep
+      recovery); scope killed + proven empty (or proven NON-empty ->
+      caller must keep recovery). No worker Python survives: it is an
+      OS process in the killed cgroup.
     - ok False: launch/refusal/result failure with error reason.
     Stream lines are delivered to emit(stream, line) live while the
     worker runs and drained fully afterwards. Payload/result/stream
@@ -822,6 +825,26 @@ def run_supervised_phase(tool_id, job_id, phase, payload_extra,
             _, err = proc.communicate(timeout=5)
         except Exception:
             err = b""
+        # H03: normal completion must PROVE scope exit, not assume it.
+        # The worker process ended, but stray scope children (which
+        # carry no hex marker, so no later scan can see them) would
+        # otherwise leak into the next phase or past terminalization.
+        # A scope that will not empty is a timeout: survivors exist, so
+        # the caller must keep recovery, exactly as on deadline expiry.
+        try:
+            from .. import units as _units_mod
+            _scope_info = _units_mod.query_unit(scope, timeout_s=5)
+            _scope_state = str(
+                (_scope_info or {}).get("state", "unknown"))
+        except Exception:
+            _scope_state = "unknown"
+        if _scope_state != "confirmed_stopped":
+            if _kill_scope_wait_empty(scope, grace):
+                _tail()
+            else:
+                _tail()
+                return False, {}, \
+                    "phase scope not quiescent after completion", True
         if int(rc or 0) not in (0,):
             detail = ""
             try:

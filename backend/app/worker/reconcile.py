@@ -164,8 +164,16 @@ def main(argv=None):
     if info.get("detail"):
         print("unit detail: %s" % info["detail"])
 
+    # H03: structured process proof — an unprovable scan (None) holds
+    # via decide(), exactly like surviving processes.
     try:
-        procs = _rc.job_processes(_rc.unit_hex(args.job_id), args.job_id)
+        _proof = _rc.prove_processes(_rc.unit_hex(args.job_id),
+                                     args.job_id)
+    except Exception:
+        _proof = {"ok": False, "processes": [], "reason": "proof crashed"}
+    try:
+        procs = list(_proof.get("processes", []) or []) \
+            if _proof.get("ok", False) else None
     except Exception:
         procs = None
     if procs:
@@ -174,7 +182,8 @@ def main(argv=None):
         for item in procs[:20]:
             print("  pid=%s cmd=%s" % (item["pid"], item["cmdline"]))
     elif procs is None:
-        print("live execution-marked processes: UNPROVABLE (scan failed)")
+        print("live execution-marked processes: UNPROVABLE (%s)" % (
+            (_proof.get("reason", "") or "scan failed")[:150]))
     else:
         print("live execution-marked processes: 0")
 
@@ -209,9 +218,39 @@ def main(argv=None):
     else:
         print("receipt: %s" % (reason or "absent"))
 
+    # H03: every job-owned phase scope must itself be confirmed
+    # stopped before any receipt application or ownership release —
+    # hex-less stray children are invisible to the process scan. A
+    # non-quiescent scope forces the keep-unknown verdict below.
+    _scopes_quiescent = False
+    _scopes_reason = "scope proof not computed"
+    if str(info.get("state", "")) == "confirmed_stopped":
+        try:
+            _scopes_quiescent, _scope_ev, _scopes_reason = \
+                _rc.phase_scopes_quiescence(args.job_id)
+        except Exception as exc:
+            _scopes_quiescent = False
+            _scopes_reason = "phase scope proof crashed: %s" % exc
+        try:
+            print("phase scopes: %s" % (
+                "all confirmed stopped" if _scopes_quiescent
+                else "HOLD (%s)" % (_scopes_reason or "?")[:150]))
+            for item in (_scope_ev or [])[:8]:
+                print("  scope=%s state=%s" % (
+                    item.get("scope", "?"), item.get("state", "?")))
+        except Exception:
+            pass
+
     action, detail = _rc.decide(job_d, info, receipt_view, procs,
                                 _delegated_proof(conn, job_d))
-    print("decision: %s — %s" % (action, detail))
+    if str(info.get("state", "")) == "confirmed_stopped" and \
+            not _scopes_quiescent:
+        action, detail = "keep-unknown", \
+            "phase scopes unproven (%s); holding reservation" % (
+                _scopes_reason or "scope proof missing")[:200]
+        print("decision: %s — %s" % (action, detail))
+    else:
+        print("decision: %s — %s" % (action, detail))
     try:
         from backend.app.events import record_event
         if not record_event(
