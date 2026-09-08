@@ -82,10 +82,9 @@ manual checklist below — no jsdom available). Tested commit for every row:
 
 ## Focused integration corrective addendum (N01–N18, main-agent pass)
 
-Previous baseline `2e0f898`. This pass: uncommitted at matrix-update
-time — exact resulting SHA recorded as `PENDING:final-sha` until the
-implementation commit lands (this marker is the explicit placeholder
-required before a SHA exists; the report carries the final SHA).
+Previous baseline `2e0f898`. This pass landed as implementation commit
+`9f2d337cc0be9f227f2371090cc83b67fe0f370a` (replacing the
+`PENDING:final-sha` placeholder used while the SHA did not yet exist).
 Every row: `implemented-static`, result `NOT EXECUTED —
 IMPLEMENTATION PHASE`. No runtime PASS claimed. New regression
 artifact: `backend/tests/test_focused_corrective.py` (N01–N18 blocks)
