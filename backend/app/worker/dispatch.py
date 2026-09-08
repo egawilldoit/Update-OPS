@@ -394,7 +394,7 @@ def _load_receipt_bound(job_id):
 def _reconcile_row(conn, row):
     # type: (sqlite3.Connection, object) -> str
     """One row via reconcile_core.decide + atomic tx outcomes."""
-    from ..receipts import (apply_receipt, check_binding, shows_mutation,
+    from ..receipts import (apply_receipt, check_binding,
                             validate_receipt)
 
     try:
@@ -494,12 +494,16 @@ def _reconcile_row(conn, row):
                    str(exc)[:300])
             return "receipt-error"
         try:
-            needs_recovery = _rc.recovery_for(
-                state, shows_mutation(receipt_data),
-                bool(job.get("unresolved", 0)))
-            if str(receipt_data.get(
-                    "recovery_disposition", "")) == "required":
-                needs_recovery = True
+            # H05: ONE canonical recovery decision. Proven success
+            # (valid bound receipt, disposition none, execution
+            # quiescent — just established by decide()) is resolved
+            # and must NOT set recovery; mutation evidence alone
+            # never implies recovery.
+            needs_recovery, _rec_reason = \
+                _rc.recovery_required_for_outcome(
+                    applied, receipt_data, receipt_valid=True,
+                    unresolved=bool(job.get("unresolved", 0)),
+                    prior_state=state, execution_quiescent=True)
             if needs_recovery and applied in (
                     "failed", "interrupted", "health_failed", "succeeded"):
                 conn.execute(
@@ -531,9 +535,13 @@ def _reconcile_row(conn, row):
         return "applied"
     # mark-interrupted: atomic terminalization, never rerun. Ownership is
     # released only afterwards, and only with quiescence proof (F02).
-    needs_recovery = _rc.recovery_for(
-        state, shows_mutation(receipt_data) if receipt_valid else False,
-        bool(job.get("unresolved", 0)))
+    # H05: the canonical decision — pre-mutation anchors without
+    # mutation evidence resolve; window/interrupted states require.
+    needs_recovery, _rec_reason = _rc.recovery_required_for_outcome(
+        state, receipt_data if receipt_valid else None,
+        receipt_valid=bool(receipt_valid),
+        unresolved=bool(job.get("unresolved", 0)),
+        prior_state=state, execution_quiescent=True)
     if state in ("succeeded", "blocked", "failed", "health_failed",
                  "interrupted"):
         # Already terminal: no state change, prove-and-release only.

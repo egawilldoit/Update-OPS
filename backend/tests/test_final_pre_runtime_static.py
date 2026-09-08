@@ -852,3 +852,189 @@ def test_h04_stopped_probe_service_delivers(tmp_path, monkeypatch):
         env={"PATH": "/usr/bin:/bin"})
     assert ok is True and timed_out is False, error
     assert data.get("activity") == "idle"
+
+
+# -- H05 canonical recovery decision -------------------------------------------
+
+def _success_receipt(after="9.9.9", outcome="succeeded", disp="none"):
+    return {"state": "succeeded", "after_version": after,
+            "install_outcome": outcome, "cleanup_status": "resolved",
+            "evidence_durable": True, "recovery_disposition": disp,
+            "exit_code": 0, "installer_exit": 0,
+            "checks": [{"name": "smoke", "result": "pass",
+                        "mandatory": True}]}
+
+
+def test_h05_proven_success_is_resolved():
+    from backend.app import reconcile_core as rc_lib
+
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(), receipt_valid=True,
+        unresolved=False, prior_state="verifying",
+        execution_quiescent=True)
+    assert required is False
+
+
+def test_h05_already_current_success_is_resolved():
+    from backend.app import reconcile_core as rc_lib
+
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(after="1.0.0",
+                                      outcome="already_current"),
+        receipt_valid=True, unresolved=False,
+        prior_state="verifying", execution_quiescent=True)
+    assert required is False
+
+
+def test_h05_failed_after_mutation_requires_recovery():
+    from backend.app import reconcile_core as rc_lib
+
+    receipt = {"state": "failed", "after_version": "9.9.9",
+               "install_outcome": "install_failed",
+               "recovery_disposition": "required",
+               "evidence_durable": True}
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "failed", receipt, receipt_valid=True, unresolved=False,
+        prior_state="updating", execution_quiescent=True)
+    assert required is True
+
+
+def test_h05_interrupted_in_update_requires_recovery():
+    from backend.app import reconcile_core as rc_lib
+
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "updating", None, receipt_valid=False, unresolved=False,
+        prior_state="updating", execution_quiescent=True)
+    assert required is True
+
+
+def test_h05_blocked_before_mutation_is_resolved():
+    from backend.app import reconcile_core as rc_lib
+
+    receipt = {"state": "blocked", "recovery_disposition": "none",
+               "after_version": "", "install_outcome": "none"}
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "blocked", receipt, receipt_valid=True, unresolved=False,
+        prior_state="preflight", execution_quiescent=True)
+    assert required is False
+
+
+def test_h05_unknown_or_contradictory_requires_recovery():
+    from backend.app import reconcile_core as rc_lib
+
+    # Unproven quiescence on an otherwise clean success.
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(), receipt_valid=True,
+        unresolved=False, prior_state="verifying",
+        execution_quiescent=False)
+    assert required is True
+    # Success receipt contradicting its own disposition.
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(disp="required"),
+        receipt_valid=True, unresolved=False,
+        prior_state="verifying", execution_quiescent=True)
+    assert required is True
+    # Invalid success-looking receipt never resolves.
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "succeeded", _success_receipt(), receipt_valid=False,
+        unresolved=False, prior_state="verifying",
+        execution_quiescent=True)
+    assert required is True
+    # Pre-mutation anchor with no evidence resolves.
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "preflight", None, receipt_valid=False, unresolved=False,
+        prior_state="preflight", execution_quiescent=True)
+    assert required is False
+    # Unresolved flag always survives.
+    required, _reason = rc_lib.recovery_required_for_outcome(
+        "preflight", None, receipt_valid=False, unresolved=True,
+        prior_state="preflight", execution_quiescent=True)
+    assert required is True
+
+
+def test_h05_one_helper_both_reconcilers():
+    """Dispatcher and SSH reconcile decide recovery through the single
+    canonical helper — no separate interpretations."""
+    import inspect
+    from backend.app.worker import dispatch as dispatch_lib
+    import backend.app.worker.reconcile as reconcile_mod
+
+    dispatch_src = inspect.getsource(dispatch_lib._reconcile_row)
+    assert "recovery_required_for_outcome" in dispatch_src
+    assert "recovery_for(" not in dispatch_src
+    reconcile_src = inspect.getsource(reconcile_mod.main)
+    assert "recovery_required_for_outcome" in reconcile_src
+    assert "recovery_for(" not in reconcile_src
+
+
+def _stopped_units(monkeypatch):
+    from backend.app import units as units_lib
+
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=10: {"state": "confirmed_stopped",
+                                    "unit": unit,
+                                    "active_state": "inactive",
+                                    "sub_state": "dead", "main_pid": 0,
+                                    "cgroup": "", "identity_ok": True,
+                                    "detail": "manager=inactive"})
+
+
+def _write_receipt(log_dir, job_id, data):
+    path = os.path.join(log_dir, "%s.receipt.json" % job_id)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    return path
+
+
+def test_h05_success_releases_and_second_admits(tmp_path, monkeypatch):
+    """JOB 1 succeeds with full H02/H03 quiescence: recovery stays 0,
+    ownership releases, and JOB 2 admits on a fresh unique lease —
+    the console is neither one-job-only nor recovery-poisoned."""
+    from backend.app import jobs as jobs_lib
+    from backend.app import receipts as receipts_lib
+    from backend.app.config import settings as settings_lib
+    from backend.app.worker import dispatch as dispatch_lib
+
+    support_lib.use_test_secrets(monkeypatch, tmp_path)
+    log_dir = str(tmp_path / "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    monkeypatch.setattr(settings_lib, "log_dir", log_dir)
+    conn = _fresh_db(tmp_path)
+    # JOB 1: reserve, claim, run to updating, land a bound success.
+    row1 = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid1, created1, err1 = _admit(conn, row1["id"], "k-h05-j1")
+    assert err1 == "" and created1
+    assert jobs_lib.claim_with_nonce(conn, jid1, "n-h05-1") is True
+    conn.execute("UPDATE jobs SET state='updating', step='updating'"
+                 " WHERE id=?", (jid1,))
+    conn.commit()
+    plan1 = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                              (row1["id"],)).fetchone())
+    data1 = receipts_lib.build_receipt(
+        jid1, "hermes", "succeeded", "1.0.0", "9.9.9", 0, "",
+        [{"name": "smoke", "result": "pass", "mandatory": True,
+          "summary": "ok"}], "2026-09-08T00:00:00+00:00",
+        plan_id=row1["id"], plan_hash=plan1["plan_hash"],
+        attempt_nonce="n-h05-1", release_path=plan1["release_path"],
+        target="9.9.9", target_mode=plan1["target_mode"],
+        expected_checks=["smoke"],
+        installer_exit=0, install_outcome="succeeded",
+        actual_change=True, evidence_durable=True,
+        cleanup_status="resolved", recovery_disposition="none")
+    _write_receipt(log_dir, jid1, data1)
+    _stopped_units(monkeypatch)
+    acted = dispatch_lib.reconcile_claimed_jobs(conn)
+    job1 = dict(conn.execute("SELECT * FROM jobs WHERE id=?",
+                             (jid1,)).fetchone())
+    assert acted == 1
+    assert job1["state"] == "succeeded", job1["state"]
+    assert int(job1["recovery_required"]) == 0
+    assert not _lease_held(conn, jid1)
+    # JOB 2: a fresh plan admits on a new unique mutation lease.
+    row2 = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid2, created2, err2 = _admit(conn, row2["id"], "k-h05-j2")
+    assert err2 == "" and created2, err2
+    assert jid2 != jid1
+    assert _lease_held(conn, jid2)
+    conn.close()

@@ -438,11 +438,121 @@ def decide(job, unit_info, receipt=None, procs=None, delegated=None):
         "execution quiescent without completion proof; never rerun"
 
 
+def recovery_required_for_outcome(state, receipt=None,
+                                    receipt_valid=False, unresolved=False,
+                                    prior_state="",
+                                    execution_quiescent=False):
+    # type: (str, object, bool, bool, str, bool) -> Tuple[bool, str]
+    """One canonical reconciliation recovery decision (H05).
+
+    Mutation occurrence alone NEVER implies recovery: a fully proven
+    successful terminal outcome with full quiescence is resolved
+    (recovery_required=0), otherwise a single success would poison
+    admission for every later update. shows_mutation() answers only
+    "may mutation have occurred"; THIS answers "is manual
+    recovery/review required". Returns (required, reason).
+
+    Policy (all callers — dispatcher, SSH, boot — share it):
+    - unresolved prior flag: True (prior uncertainty survives).
+    - valid bound receipt with state=succeeded, disposition none,
+      applied state=succeeded, execution proven quiescent: False.
+      already_current is a success outcome (SUCCESS_OUTCOMES) under
+      the same requirements. Any contradiction (disposition not
+      none, state mismatch, unproven quiescence): True.
+    - valid receipt with state=blocked (mutation positively never
+      started): False.
+    - disposition required, or mutation evidence on a non-success
+      outcome: True.
+    - prior/current stage inside the mutation window
+      (backup/updating/verifying) without resolving success proof:
+      True (interrupted during mutation defaults conservative).
+    - positively pre-mutation anchor (accepted/preflight/blocked)
+      with no mutation evidence and no required disposition: False.
+    - anything else unknown/contradictory: True (fail closed).
+    """
+    try:
+        current = str(state or "")
+    except Exception:
+        current = ""
+    try:
+        anchor = str(prior_state or current or "")
+    except Exception:
+        anchor = current
+    if bool(unresolved):
+        return True, "unresolved flag set; prior uncertainty survives"
+    try:
+        valid = bool(receipt_valid) and isinstance(receipt, dict)
+    except Exception:
+        valid = False
+    try:
+        rstate = str((receipt or {}).get("state", "") or "") \
+            if valid else ""
+        disp = str((receipt or {}).get(
+            "recovery_disposition", "") or "") if valid else ""
+    except Exception:
+        rstate, disp = "", ""
+    mutated = False
+    if valid:
+        try:
+            from .receipts import shows_mutation as _shows
+            mutated = bool(_shows(receipt))
+        except Exception:
+            mutated = False
+    if valid and rstate == "succeeded" and current == "succeeded":
+        if disp != "none":
+            return True, \
+                "success receipt contradicts recovery disposition " \
+                "%r" % disp[:50]
+        if not execution_quiescent:
+            return True, \
+                "success without proven execution quiescence"
+        return False, \
+            "proven success: valid bound receipt, disposition none, " \
+            "execution quiescent"
+    if valid and rstate == "blocked" and current == "blocked" \
+            and disp != "required":
+        return False, "blocked before mutation; nothing to recover"
+    if disp == "required":
+        return True, "receipt requires recovery"
+    if valid and mutated and rstate != "succeeded":
+        return True, "non-success outcome with mutation evidence"
+    if anchor in ("backup", "updating", "verifying"):
+        return True, \
+            "outcome unresolved inside mutation window (%s)" % anchor
+    if anchor in ("accepted", "preflight", "blocked") and \
+            not mutated and disp != "required":
+        return False, \
+            "positively pre-mutation (%s) without mutation evidence" \
+            % anchor
+    return True, "unknown/contradictory outcome; failing closed"
+
+
 def recovery_for(job_state, receipt_shows_mutation, unresolved):
     # type: (str, bool, bool) -> bool
-    """Recovery required when mutation may have occurred."""
-    if unresolved:
+    """Legacy recovery helper (H05: single interpretation preserved).
+
+    Thin wrapper over recovery_required_for_outcome() so the old
+    call signature keeps its pinned semantics: unresolved always
+    requires; the mutation-window states require; pre-mutation states
+    without mutation evidence do not. New code must call the canonical
+    function directly with the proven outcome.
+    """
+    try:
+        required, _reason = recovery_required_for_outcome(
+            job_state, receipt=None, receipt_valid=False,
+            unresolved=bool(unresolved), prior_state=job_state,
+            execution_quiescent=False)
+    except Exception:
         return True
-    if receipt_shows_mutation:
-        return True
-    return job_state in ("backup", "updating", "verifying")
+    if bool(receipt_shows_mutation):
+        # Mutation evidence without a resolving success proof: the
+        # canonical function (no receipt here) already requires for
+        # window states; for pre-mutation anchors evidence
+        # contradicts the anchor, so require as well.
+        try:
+            if str(job_state or "") in (
+                    "accepted", "preflight", "blocked"):
+                return True
+        except Exception:
+            return True
+    return bool(required)

@@ -110,7 +110,7 @@ def main(argv=None):
     from backend.app import reconcile_core as _rc
     from backend.app import units as _units
     from backend.app.receipts import (apply_receipt, check_binding,
-                                      load_receipt_file, shows_mutation,
+                                      load_receipt_file,
                                       validate_receipt)
     from backend.app.tx import TxError, transition_tx
 
@@ -283,11 +283,13 @@ def main(argv=None):
         except ValueError as exc:
             print("ERROR: receipt apply refused: %s" % exc)
             return 1
-        needs_recovery = _rc.recovery_for(
-            state, shows_mutation(receipt_view),
-            bool(job_d.get("unresolved", 0)))
-        if str(receipt_view.get("recovery_disposition", "")) == "required":
-            needs_recovery = True
+        # H05: ONE canonical recovery decision — proven success is
+        # resolved; mutation evidence alone never implies recovery.
+        needs_recovery, _rec_reason = _rc.recovery_required_for_outcome(
+            state, receipt_view, receipt_valid=True,
+            unresolved=bool(job_d.get("unresolved", 0)),
+            prior_state=str(job_d.get("state", "")),
+            execution_quiescent=True)
         if needs_recovery and not recovery:
             try:
                 from backend.app.events import record_event
@@ -323,8 +325,12 @@ def main(argv=None):
                   "admission stays blocked): %s" % exc)
             return 1
     elif action == "mark-interrupted":
-        needs_recovery = _rc.recovery_for(
-            state, False, bool(job_d.get("unresolved", 0)))
+        # H05: the canonical decision (receipt only when bound+valid).
+        needs_recovery, _rec_reason = _rc.recovery_required_for_outcome(
+            state, receipt_view, receipt_valid=bool(receipt_view),
+            unresolved=bool(job_d.get("unresolved", 0)),
+            prior_state=str(job_d.get("state", "")),
+            execution_quiescent=True)
         if state in ("succeeded", "blocked", "failed", "health_failed",
                      "interrupted"):
             # Already terminal: prove-and-release only, no state change.
