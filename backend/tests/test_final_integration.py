@@ -518,3 +518,165 @@ def test_f05_partial_004_not_inferred_then_completed(tmp_path):
         conn.execute("PRAGMA table_info(plans)").fetchall()}
     assert db_lib.migrate(conn) == db_lib.CODE_VERSION
     conn.close()
+
+
+# -- F11 phase evidence durability -------------------------------------------------
+
+def test_f11_stream_sanitizer_creation_failure_recorded(tmp_path, monkeypatch):
+    from backend.app.worker import phase_run as phase_run_lib
+    import backend.app.sanitize as sanitize_lib
+
+    def _boom(secrets=()):
+        raise RuntimeError("no sanitizer")
+
+    monkeypatch.setattr(sanitize_lib, "SanitizingStream", _boom)
+    writer = phase_run_lib._StreamWriter(str(tmp_path / "s.stream"), ())
+    assert writer.evidence_failed is True
+    assert writer.evidence_failure_reason
+    writer.emit("stdout", "hello\n")
+    assert writer.evidence_failed is True
+
+
+def test_f11_stream_feed_failure_recorded(tmp_path):
+    from backend.app.worker import phase_run as phase_run_lib
+
+    writer = phase_run_lib._StreamWriter(str(tmp_path / "s.stream"), ())
+    assert writer.evidence_failed is False
+    target = writer._streams["stdout"]
+
+    def _boom(_chunk):
+        raise RuntimeError("feed exploded")
+
+    target.feed = _boom  # type: ignore[method-assign]
+    writer.emit("stdout", "hello\n")
+    assert writer.evidence_failed is True
+    assert "feed" in writer.evidence_failure_reason
+
+
+def test_f11_stream_write_failure_recorded(tmp_path):
+    from backend.app.worker import phase_run as phase_run_lib
+
+    # /proc is read-only even for root: the write must fail closed on
+    # any uid instead of silently dropping lines.
+    writer = phase_run_lib._StreamWriter(
+        "/proc/ega-nope-xyz-123/stream", ())
+    assert writer.evidence_failed is False
+    writer.emit("stdout", "hello\n")
+    assert writer.evidence_failed is True
+
+
+def test_f11_result_write_failure_returns_false(tmp_path):
+    from backend.app.worker import phase_run as phase_run_lib
+
+    assert phase_run_lib._write_result(
+        "/proc/ega-nope-xyz-123/result.json", True, "verify",
+        {"version": "1.0"}) is False
+
+
+def test_f11_secret_loader_failure_fails_phase_closed(tmp_path, monkeypatch):
+    from backend.app.worker import phase_run as phase_run_lib
+    from backend.app import config as config_lib
+    from backend.app.owner_env import (build_owner_contract,
+                                       contract_fingerprint)
+
+    def _boom(_settings=None):
+        raise OSError("secrets unreadable")
+
+    monkeypatch.setattr(config_lib, "load_secret_values", _boom)
+    support_lib.test_release_root()
+    expected = contract_fingerprint(build_owner_contract(None))
+    payload_path = str(tmp_path / "p.json")
+    result_path = str(tmp_path / "r.json")
+    stream_path = str(tmp_path / "s.stream")
+    with open(payload_path, "w", encoding="utf-8") as fh:
+        json.dump({"tool_id": "hermes", "job_id": "job-1",
+                   "phase": "probe", "op": "inspect",
+                   "env_fingerprint": expected}, fh)
+    import json as _json
+    rc = phase_run_lib.main(
+        ["job-1", "probe", "--payload", payload_path, "--result",
+         result_path, "--stream", stream_path, "--op", "inspect"])
+    assert rc == phase_run_lib.EXIT_OK
+    with open(result_path, "r", encoding="utf-8") as fh:
+        result = _json.load(fh)
+    assert result["ok"] is False
+    assert "secret" in str(result["data"])
+
+
+def test_f11_mutation_evidence_failure_no_success(tmp_path, monkeypatch):
+    """A mutation whose stream evidence failed maps to interrupted with
+    recovery in the coordinator (never success)."""
+    from backend.app.worker import runner as runner_lib
+
+    r = runner_lib.Runner("job-f11", "n-f11")
+    r.job = {"ack": ""}
+    r.log = None
+
+    def _fake_run_phase(phase, payload_extra, timeout_s, op=""):
+        assert phase == "execute"
+        return True, {"state": "succeeded", "error_code": "",
+                      "error_detail": "", "exit_code": 0,
+                      "before_version": "1.0", "after_version": "2.0",
+                      "evidence_durable": False}, "", False
+
+    monkeypatch.setattr(runner_lib.Runner, "_run_phase", _fake_run_phase)
+    out = r._do_execute(__import__("types").SimpleNamespace(), 30.0)
+    assert isinstance(out, dict) and out.get("state") == "interrupted"
+
+
+def test_f11_probe_evidence_failure_safe_error(tmp_path, monkeypatch):
+    """A probe whose result cannot be persisted fails safe: the worker
+    exits OK with no result file (coordinator: missing result means
+    interrupted), never a fabricated success. The fake adapter keeps
+    this hermetic (no live installation touch)."""
+    import types as _types
+    from backend.app.worker import phase_run as phase_run_lib
+    from backend.app.owner_env import (build_owner_contract,
+                                       contract_fingerprint)
+
+    support_lib.test_release_root()
+    expected = contract_fingerprint(build_owner_contract(None))
+    payload_path = str(tmp_path / "p.json")
+    with open(payload_path, "w", encoding="utf-8") as fh:
+        json.dump({"tool_id": "hermes", "job_id": "job-1",
+                   "phase": "probe", "op": "inspect",
+                   "env_fingerprint": expected}, fh)
+
+    def _fake_adapter(tool_id):
+        return _types.SimpleNamespace(
+            enabled=True,
+            inspect=lambda: {"version": "1.0"},
+            discover=lambda: {},
+            activity=lambda: {},
+            verify=lambda: {},
+            plan=lambda: {})
+
+    monkeypatch.setattr(phase_run_lib, "_adapter", _fake_adapter)
+    rc = phase_run_lib.main(
+        ["job-1", "probe", "--payload", payload_path, "--result",
+         "/proc/ega-nope-xyz-123/result.json", "--stream",
+         str(tmp_path / "s.stream"), "--op", "inspect"])
+    assert rc == phase_run_lib.EXIT_OK
+    assert not os.path.exists("/proc/ega-nope-xyz-123/result.json")
+
+
+def test_f11_dispatcher_event_failure_no_raw(tmp_path, monkeypatch):
+    """Sanitizer failure in dispatcher events persists a fixed marker
+    (never raw data) and reports failure instead of crashing."""
+    from backend.app import events as events_lib
+    import backend.app.sanitize as sanitize_lib
+
+    conn = _fresh_db(tmp_path)
+    monkeypatch.setattr(
+        sanitize_lib, "sanitize_text",
+        lambda text, secrets=(): (_ for _ in ()).throw(
+            RuntimeError("sanitizer down")))
+    assert events_lib.record_event(
+        conn, "job-1", "reconcile_unknown",
+        "raw secret-bearing detail") is True
+    rows = conn.execute("SELECT detail FROM events WHERE job_id=?",
+                        ("job-1",)).fetchall()
+    assert len(rows) == 1
+    assert "raw secret-bearing detail" not in rows[0]["detail"]
+    assert "suppressed" in rows[0]["detail"]
+    conn.close()

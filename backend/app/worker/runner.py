@@ -1001,6 +1001,12 @@ class Runner(object):
             return False, "backup_failed", \
                 "backup failed: %s" % (error or "")[:400]
         data = data if isinstance(data, dict) else {}
+        # F11: backup evidence is required job evidence. An undurable
+        # backup record blocks (retryable: artifacts are job-scoped).
+        if data.get("evidence_durable", False) is False:
+            self._event("backup evidence durability failed")
+            return False, "backup_failed", \
+                "backup evidence durability failed"
         if not data.get("supported", False):
             reason = str(data.get("unsupported_reason", "")
                          or "backup unsupported")
@@ -1162,6 +1168,17 @@ class Runner(object):
             self._hard_timeout_recovery(
                 timeout_s, "adapter timeout report")
             return None
+        # F11: a mutation whose evidence Stream failed cannot succeed —
+        # without durable evidence the outcome is unprovable. Return an
+        # interrupted outcome for run() to terminalize (single finish).
+        if data.get("evidence_durable", False) is False:
+            self._event("execute evidence durability failed; no success "
+                        "without durable evidence")
+            return {"state": "interrupted", "error_code": "interrupted",
+                    "error_detail": "execute evidence durability failed",
+                    "exit_code": 6, "timed_out": False,
+                    "before_version": self.before_version,
+                    "after_version": self.after_version}
         return data
 
     def _do_verify(self, timeout_s, required_checks=None):
@@ -1186,7 +1203,14 @@ class Runner(object):
                 return None
             raise RuntimeError("verify worker failed: %s"
                                % (error or "")[:300])
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return None
+        # F11: unverifiable evidence is missing verification (never
+        # success without it; the health_failed path below applies).
+        if data.get("evidence_durable", False) is False:
+            self._event("verify evidence durability failed")
+            return None
+        return data
 
     def _secrets_for_evidence(self):
         # type: () -> tuple
@@ -1721,6 +1745,12 @@ class Runner(object):
             return self._finish("blocked", EXIT_BLOCKED, "unavailable",
                                 "preflight collection failed: %s"
                                 % (_pre_err or "")[:300])
+        if not isinstance(_pre_bundle, dict) or \
+                _pre_bundle.get("evidence_durable", False) is False:
+            # F11: untrusted preflight collection is unusable (blocked,
+            # retryable: no mutation has occurred).
+            return self._finish("blocked", EXIT_BLOCKED, "unavailable",
+                                "preflight evidence durability failed")
         try:
             pre_ok, pre_code, pre_detail = self._preflight(
                 plan, _pre_bundle)
@@ -1844,6 +1874,14 @@ class Runner(object):
             # upgrade evidence (actual_change stays False).
             self.actual_change = False
             pass
+        elif exec_state == "interrupted":
+            # Worker-level failure (crash, supervision loss, evidence
+            # failure): mutation state unknown -> interrupted WITH
+            # recovery, never a plain install failure.
+            return self._finish("interrupted", EXIT_INTERRUPTED,
+                                exec_code or "interrupted",
+                                (exec_detail or "execute interrupted")[:1000],
+                                recovery_required=True)
         elif exec_state not in ("succeeded",):
             self._event("install failed; running bounded recovery checks")
             try:

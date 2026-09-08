@@ -219,22 +219,15 @@ def dispatch_once(conn):
 
 def _event(conn, job_id, event_type, detail):
     # type: (sqlite3.Connection, str, str, str) -> None
+    # F11: central safe event persistence — sanitized, fixed marker on
+    # sanitizer failure, never raw data. Transport failure is best
+    # effort here (diagnostics); state transitions use tx.* which fail
+    # loudly instead.
     try:
-        from ..sanitize import sanitize_text
-        detail = sanitize_text(detail, ())
+        from ..events import record_event
+        record_event(conn, job_id, event_type, detail)
     except Exception:
         pass
-    try:
-        conn.execute(
-            "INSERT INTO events(job_id,created_at,event_type,detail)"
-            " VALUES(?,?,?,?)",
-            (job_id, utcnow_iso(), event_type[:100], detail[:1000]))
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
 
 
 # -- owner probe execution (R01) -------------------------------------------

@@ -67,32 +67,53 @@ def _utcnow():
 
 
 class _StreamWriter(object):
-    """Append-only sanitized stream file for coordinator tailing."""
+    """Append-only sanitized stream file for coordinator tailing (F11).
 
-    def __init__(self, path, secrets):
-        # type: (str, tuple) -> None
+    Sticky evidence_failed + evidence_failure_reason: sanitizer
+    initialization/feed failure, log write failure, and flush failure
+    are RECORDED, never silently ignored. The final phase result
+    carries evidence_durable so the coordinator can refuse success.
+    """
+
+    def __init__(self, path, secrets, secrets_ok=True):
+        # type: (str, tuple, bool) -> None
         self.path = path
         self._secrets = tuple(secrets or ())
+        self.evidence_failed = False
+        self.evidence_failure_reason = ""
+        if not secrets_ok:
+            self._fail("secret source unavailable")
         self._streams = {}
         try:
             from ..sanitize import SanitizingStream
             for name in ("stdout", "stderr", "event"):
                 self._streams[name] = SanitizingStream(
                     tuple(secrets or ()))
-        except Exception:
+        except Exception as exc:
             self._streams = {}
+            self._fail("sanitizer initialization failed: %s" % exc)
+
+    def _fail(self, reason):
+        # type: (str) -> None
+        if not self.evidence_failed:
+            self.evidence_failed = True
+            self.evidence_failure_reason = str(reason or "")[:300]
 
     def emit(self, stream, text):
         # type: (str, str) -> None
+        if self.evidence_failed:
+            return
         if stream not in ("stdout", "stderr", "event"):
             stream = "stdout"
         target = self._streams.get(stream)
         if target is None:
+            self._fail("no sanitizer for stream %s" % stream)
             return
         try:
             chunk = text if text.endswith("\n") else text + "\n"
             lines = target.feed(chunk.encode("utf-8", errors="replace"))
-        except Exception:
+        except Exception as exc:
+            self._fail("sanitizer feed failed: %s" % exc)
             return
         for line in lines:
             self._write(stream, line)
@@ -103,15 +124,18 @@ class _StreamWriter(object):
             record = {"ts": _utcnow(), "stream": stream, "line": line}
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            self._fail("stream file write failed: %s" % exc)
+        except Exception as exc:
+            self._fail("stream record failed: %s" % exc)
 
     def flush_final(self):
         # type: () -> None
         for name, target in self._streams.items():
             try:
                 lines = target.flush_final()
-            except Exception:
+            except Exception as exc:
+                self._fail("final flush failed: %s" % exc)
                 continue
             for line in lines:
                 self._write(name, line)
@@ -271,13 +295,20 @@ def _run_verify(adapter, plan, required_checks):
 
 def _write_result(path, ok, kind, data):
     # type: (str, bool, str, Dict[str, Any]) -> bool
+    # F11: result sanitization without the known-secret source fails
+    # instead of persisting weaker-redacted evidence. Any write failure
+    # returns False (coordinator treats a missing result as interrupted).
     try:
         from ..sanitize import sanitize_json
         try:
             from ..config import load_secret_values, settings
             secrets = load_secret_values(settings)
+            secrets_ok = True
         except Exception:
             secrets = ()
+            secrets_ok = False
+        if not secrets_ok:
+            return False
         clean = sanitize_json(
             {"ok": bool(ok), "kind": kind, "data": data or {},
              "ts": _utcnow()}, secrets)
@@ -290,6 +321,38 @@ def _write_result(path, ok, kind, data):
         tmp = "%s.tmp-%d" % (path, os.getpid())
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(clean, fh, sort_keys=True, default=str)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def _write_fixed_result(path, phase, error_code, error_detail):
+    # type: (str, str, str, str) -> bool
+    """Write a fixed-literal error result with NO external strings.
+
+    Used exactly when sanitization is unavailable: every string below
+    is a coordinator literal, so no secret source is required to write
+    it safely. Returns False when even this cannot be persisted (the
+    coordinator then treats the missing result as interrupted).
+    """
+    try:
+        payload = {"ok": False, "kind": str(phase or ""),
+                   "data": {"error_code": str(error_code or ""),
+                            "error_detail": str(error_detail or "")[:500],
+                            "evidence_durable": False},
+                   "ts": _utcnow()}
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        tmp = "%s.tmp-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True)
             fh.flush()
             try:
                 os.fsync(fh.fileno())
@@ -365,14 +428,27 @@ def main(argv=None):
                        "error_detail": "owner environment mismatch: "
                                        "phase worker contract differs from "
                                        "coordinator expectation"})
-        writer.flush_final()
         return EXIT_OK
+    secrets_ok = True
     try:
         from ..config import load_secret_values
         secrets = load_secret_values(settings)
     except Exception:
         secrets = ()
-    writer = _StreamWriter(args.stream, secrets)
+        secrets_ok = False
+    # F11: a mutating or completion-evidence phase without the required
+    # known-secret source fails closed — never persist tool output with
+    # secrets=() and hope. Probes fail safe with an error result too.
+    if not secrets_ok and args.phase in ("execute", "backup", "verify",
+                                         "preflight", "probe"):
+        _write_fixed_result(
+            args.result, args.phase,
+            "interrupted" if args.phase in ("execute", "verify")
+            else "unavailable",
+            "secret source unavailable: evidence cannot be trusted")
+        return EXIT_OK
+    writer = _StreamWriter(args.stream, secrets,
+                           secrets_ok=secrets_ok)
 
     def _emit(stream, text):
         # type: (str, str) -> None
@@ -434,6 +510,30 @@ def main(argv=None):
             pass
     if _interrupted["flag"]:
         return EXIT_INTERRUPTED
+    # F11: communicate evidence durability. A mutating/completion phase
+    # whose stream evidence failed can never yield success downstream.
+    try:
+        durable = not bool(writer.evidence_failed)
+    except Exception:
+        durable = False
+    if isinstance(data, dict):
+        try:
+            data["evidence_durable"] = bool(durable)
+        except Exception:
+            pass
+    else:
+        data = {"evidence_durable": bool(durable)}
+    if not durable:
+        _write_result(args.result, False, args.phase,
+                      {"error_code": "interrupted" if args.phase in (
+                          "execute", "verify") else "backup_failed"
+                          if args.phase == "backup" else "unavailable",
+                       "error_detail": "phase evidence durability failed: "
+                                       "%s" % str(getattr(
+                                           writer, "evidence_failure_reason",
+                                           "") or "")[:300],
+                       "evidence_durable": False})
+        return EXIT_OK
     _write_result(args.result, True, args.phase, data)
     return EXIT_OK
 

@@ -180,14 +180,13 @@ def main(argv=None):
     action, detail = _rc.decide(job_d, info, receipt_view, procs)
     print("decision: %s — %s" % (action, detail))
     try:
-        conn.execute(
-            "INSERT INTO events(job_id,created_at,event_type,detail)"
-            " VALUES(?,?,?,?)",
-            (args.job_id, _utcnow(), "reconcile",
-             "unit=%s state=%s receipt=%s procs=%d decision=%s" % (
-                 unit, info.get("state"), int(bool(receipt_view)),
-                 len(procs), action)))
-        conn.commit()
+        from backend.app.events import record_event
+        if not record_event(
+                conn, args.job_id, "reconcile",
+                "unit=%s state=%s receipt=%s procs=%d decision=%s" % (
+                    unit, info.get("state"), int(bool(receipt_view)),
+                    len(procs), action)):
+            print("WARN: could not record reconcile event")
     except Exception as exc:
         print("WARN: could not record reconcile event: %s" % exc)
 
@@ -219,17 +218,21 @@ def main(argv=None):
             needs_recovery = True
         if needs_recovery and not recovery:
             try:
+                from backend.app.events import record_event
                 conn.execute(
                     "UPDATE jobs SET recovery_required=1 WHERE id=?",
                     (args.job_id,))
-                conn.execute(
-                    "INSERT INTO events(job_id,created_at,event_type,"
-                    "detail) VALUES(?,?,?,?)",
-                    (args.job_id, _utcnow(), "recovery_required",
-                     "reconciled %s with mutation evidence" % applied))
+                if not record_event(
+                        conn, args.job_id, "recovery_required",
+                        "reconciled %s with mutation evidence" % applied):
+                    raise OSError("event write failed")
                 conn.commit()
                 recovery = True
             except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 print("ERROR: could not set recovery: %s" % exc)
                 return 1
         # F02: ownership release only after the proof above (confirmed
@@ -292,16 +295,20 @@ def main(argv=None):
                   "clear. Nothing to do.")
             return 0
         try:
+            from backend.app.events import record_event
             conn.execute(
                 "UPDATE jobs SET recovery_required=0 WHERE id=?",
                 (args.job_id,))
-            conn.execute(
-                "INSERT INTO events(job_id,created_at,event_type,detail)"
-                " VALUES(?,?,?,?)",
-                (args.job_id, _utcnow(), "recovered",
-                 "ssh reconcile: no updater remains (unit=%s)" % unit))
+            if not record_event(
+                    conn, args.job_id, "recovered",
+                    "ssh reconcile: no updater remains (unit=%s)" % unit):
+                raise OSError("event write failed")
             conn.commit()
         except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             print("ERROR: failed to clear recovery: %s" % exc)
             return 1
         print("VERDICT: recovery_required CLEARED after proving no updater "
