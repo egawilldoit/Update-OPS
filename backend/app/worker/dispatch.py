@@ -286,10 +286,11 @@ def _execute_probe_op(tool_id, op, request_id=""):
 
 def run_probe_queue(conn):
     # type: (sqlite3.Connection) -> int
-    """Execute claimed probe requests with mutation exclusion (R01).
+    """Execute claimed probe requests with mutation exclusion (R01, F12).
 
-    Contending ops (activity/plan/verify/refresh) are deferred while any
-    nonterminal job exists. Returns the number processed.
+    Every installation read holds a bounded probe lease while touching
+    the installation; active mutations defer probes, and the atomic
+    lease acquire closes the residual race. Returns processed count.
     """
     from ..jobs import active_job
 
