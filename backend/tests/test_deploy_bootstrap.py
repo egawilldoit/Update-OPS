@@ -288,3 +288,243 @@ def test_scripts_use_checkout_controller_not_release_cli():
         text = fh.read()
     assert 'STATUS_PY="python3"' not in text
     assert "quiescence-check.py" in text
+
+
+# -- G07/G08 fail-closed quiescence --------------------------------------------------
+
+def _quiescent_env(tmp_path, monkeypatch, name="g78"):
+    """Empty migrated DB + fresh heartbeat + drain + stopped units."""
+    import quiescence_check as qc_lib
+
+    state_dir = str(tmp_path / ("%s-state" % name))
+    os.makedirs(state_dir, exist_ok=True)
+    config_path = str(tmp_path / ("%s-config.json" % name))
+    db_path = os.path.join(state_dir, "state.db")
+    _write_config(config_path, state_dir, db_path)
+    from backend.app import db as db_lib
+
+    conn = db_lib.connect(db_path)
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    conn.commit()
+    conn.close()
+    _heartbeat(state_dir, fresh=True)
+    open(os.path.join(state_dir, "drain"), "w").close()
+    monkeypatch.setattr(
+        qc_lib, "query_user_unit",
+        lambda owner, uid, unit: ("confirmed_stopped",
+                                  "manager=inactive"))
+    monkeypatch.setattr(
+        qc_lib, "query_system_unit",
+        lambda unit: ("confirmed_stopped", "manager=inactive"))
+    monkeypatch.setattr(
+        qc_lib, "list_user_job_units",
+        lambda owner, uid, prefix="ega-update-job-": ([], ""))
+    return state_dir, config_path, db_path
+
+
+def test_g07_jobs_unreadable_not_empty(tmp_path):
+    import quiescence_check as qc_lib
+
+    state_dir = str(tmp_path / "state")
+    os.makedirs(state_dir, exist_ok=True)
+    config_path = str(tmp_path / "config.json")
+    garbage = os.path.join(state_dir, "state.db")
+    with open(garbage, "w", encoding="utf-8") as fh:
+        fh.write("not a database at all")
+    _write_config(config_path, state_dir, garbage)
+    _heartbeat(state_dir, fresh=True)
+    open(os.path.join(state_dir, "drain"), "w").close()
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+    assert any("unreadable" in reason or "unprovable" in reason
+               for reason in report["reasons"])
+
+
+def test_g07_missing_leases_table_blocks(tmp_path, monkeypatch):
+    """A v4-schema DB without execution_leases is corruption, not zero
+    leases (G07): explicit version-aware handling, no silent downgrade."""
+    import quiescence_check as qc_lib
+    from backend.app import db as db_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g07leases")
+    conn = db_lib.connect(db_path)
+    conn.execute("DROP TABLE execution_leases")
+    conn.commit()
+    conn.close()
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+    assert any("execution_leases" in reason
+               for reason in report["reasons"])
+
+
+def test_g08_terminal_held_lease_blocks(tmp_path, monkeypatch):
+    """Terminal job + unreleased mutation lease blocks maintenance
+    even with everything else clean (G08)."""
+    import quiescence_check as qc_lib
+    from backend.app import tx as tx_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g08held")
+    from backend.app import db as db_lib
+
+    conn = db_lib.connect(db_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    from backend.app.admission import admit
+    support_lib.test_release_root()
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g08h", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    tx_lib.transition_tx(conn, jid, "succeeded", step="verifying",
+                         expect_states=["accepted"],
+                         update={"after_version": "9.9.9"},
+                         event="succeeded", event_detail="")
+    conn.close()
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+    assert jid in report["details"]["held_leases"]
+    assert any("lease" in reason for reason in report["reasons"])
+
+
+def test_g08_terminal_held_live_delegated_blocks(tmp_path, monkeypatch):
+    import quiescence_check as qc_lib
+    from backend.app import tx as tx_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g08del")
+    from backend.app import db as db_lib
+    import json as _json
+
+    conn = db_lib.connect(db_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    conn.execute("UPDATE plans SET services=? WHERE id=?",
+                 (_json.dumps(["svc-stuck.service"]), row["id"]))
+    stored = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                               (row["id"],)).fetchone())
+    from backend.app import plans as plans_lib
+    conn.execute("UPDATE plans SET plan_hash=? WHERE id=?",
+                 (plans_lib.canonical_plan_hash(
+                     plans_lib._hash_view(stored)), row["id"]))
+    conn.commit()
+    from backend.app.admission import admit
+    support_lib.test_release_root()
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g08d", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    tx_lib.transition_tx(conn, jid, "failed", step="updating",
+                         expect_states=["accepted"],
+                         update={"error_code": "install_failed"},
+                         event="failed", event_detail="")
+    conn.close()
+    monkeypatch.setattr(
+        qc_lib, "query_user_unit",
+        lambda owner, uid, unit: ("live", "active/running")
+        if unit == "svc-stuck.service"
+        else ("confirmed_stopped", "manager=inactive"))
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+    assert any(e["service"] == "svc-stuck.service"
+               for e in report["details"]["delegated_operations"])
+
+
+def test_g08_terminal_held_unknown_delegated_blocks(tmp_path, monkeypatch):
+    import quiescence_check as qc_lib
+    from backend.app import tx as tx_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g08unk")
+    from backend.app import db as db_lib
+    import json as _json
+
+    conn = db_lib.connect(db_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    conn.execute("UPDATE plans SET services=? WHERE id=?",
+                 (_json.dumps(["svc-mystery.service"]), row["id"]))
+    stored = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                               (row["id"],)).fetchone())
+    from backend.app import plans as plans_lib
+    conn.execute("UPDATE plans SET plan_hash=? WHERE id=?",
+                 (plans_lib.canonical_plan_hash(
+                     plans_lib._hash_view(stored)), row["id"]))
+    conn.commit()
+    from backend.app.admission import admit
+    support_lib.test_release_root()
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g08u", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    tx_lib.transition_tx(conn, jid, "failed", step="updating",
+                         expect_states=["accepted"],
+                         update={"error_code": "install_failed"},
+                         event="failed", event_detail="")
+    conn.close()
+    monkeypatch.setattr(
+        qc_lib, "query_user_unit",
+        lambda owner, uid, unit: ("unknown", "bus down")
+        if unit == "svc-mystery.service"
+        else ("confirmed_stopped", "manager=inactive"))
+    monkeypatch.setattr(
+        qc_lib, "query_system_unit",
+        lambda unit: ("unknown", "bus down"))
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+
+
+def test_g08_clean_state_potentially_quiescent(tmp_path, monkeypatch):
+    import quiescence_check as qc_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g08clean")
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is True, report["reasons"]
+    assert report["reasons"] == []
+
+
+def test_g08_unknown_runner_blocks(tmp_path, monkeypatch):
+    import quiescence_check as qc_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g08ru")
+    from backend.app import db as db_lib
+
+    conn = db_lib.connect(db_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    from backend.app.admission import admit
+    support_lib.test_release_root()
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g08r", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    conn.close()
+    from backend.app.reconcile_core import canonical_unit
+    unit = canonical_unit(jid)
+    monkeypatch.setattr(
+        qc_lib, "query_user_unit",
+        lambda owner, uid, u: ("unknown", "bus down")
+        if u == unit else ("confirmed_stopped", "manager=inactive"))
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+
+
+def test_scripts_use_checkout_controller_not_release_cli():
+    """Quiescence gates must not depend on any installed release CLI
+    (F07/F10): no CURRENT_LINK venv status calls in the gate path, no
+    ambient-interpreter fallback."""
+    path = os.path.join(_REPO_ROOT, "deploy", "scripts", "upgrade.sh")
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    assert 'STATUS_PY="python3"' not in text
+    assert "quiescence-check.py" in text
+
+
+def test_g08_drain_absent_blocks(tmp_path, monkeypatch):
+    import quiescence_check as qc_lib
+
+    state_dir, config_path, db_path = _quiescent_env(
+        tmp_path, monkeypatch, name="g08drain")
+    os.remove(os.path.join(state_dir, "drain"))
+    report = qc_lib.assess(config_path, require_drain=True)
+    assert report["quiescent"] is False
+    assert any("drain" in reason for reason in report["reasons"])

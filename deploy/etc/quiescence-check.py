@@ -78,12 +78,81 @@ def _table_exists(conn, name):
         return False
 
 
+class _InspectionError(Exception):
+    """A required safety query failed: quiescence is unprovable."""
+
+
+def _schema_version(conn):
+    # type: (object) -> int
+    """Read-only schema version (-1 when unreadable)."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='version'").fetchone()
+        if row is None:
+            return -1
+        return int(str(row["value"] or "0").strip() or 0)
+    except Exception:
+        return -1
+
+
+def _updater_processes(hex_tokens):
+    # type: (object) -> tuple
+    """Execution-marked process scan (deploy mirror of the reconciler
+    rule): cmdlines containing a job hex token AND a runner/updater
+    marker, self excluded. Returns (ok, processes): ok False when the
+    scan itself fails (unprovable, never empty).
+    """
+    try:
+        me = os.getpid()
+    except Exception:
+        me = -1
+    try:
+        tokens = [str(t or "") for t in (hex_tokens or []) if str(t or "")]
+    except Exception:
+        return False, []
+    if not tokens:
+        return True, []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception as exc:
+        return False, [{"pid": -1,
+                        "cmdline": "process scan failed: %s" % exc}]
+    found = []
+    for pid in pids:
+        try:
+            if int(pid) == me:
+                continue
+        except Exception:
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode(
+                    "utf-8", errors="replace")
+        except Exception:
+            continue
+        for token in tokens:
+            if token not in cmd:
+                continue
+            if ("backend.app.worker.runner" in cmd
+                    or "ega-update-job-" in cmd
+                    or "systemd-run" in cmd):
+                found.append({"pid": int(pid), "cmdline": cmd[:300]})
+                break
+    return True, found
+
+
 def _job_rows(conn):
     # type: (object) -> list
+    # G07: raises instead of returning [] — callers convert an
+    # unreadable jobs table into "unprovable", never "empty".
     try:
         return [dict(r) for r in conn.execute("SELECT * FROM jobs").fetchall()]
-    except Exception:
-        return []
+    except Exception as exc:
+        raise _InspectionError("jobs unreadable: %s" % exc)
+
+
+class _InspectionError(Exception):
+    """A required safety query failed: quiescence is unprovable."""
 
 
 def _owner_uid(tool_owner):
@@ -327,13 +396,18 @@ def assess(config_path, require_drain=True):
         reasons.append("database unreadable: %s" % exc)
         details["database"] = "unreadable"
         return {"quiescent": False, "reasons": reasons, "details": details}
+    # G07: every required query below either yields positive proof or
+    # appends an "unprovable" reason. No failure path defaults to empty.
     try:
         jobs = _job_rows(conn)
-    finally:
+    except _InspectionError as exc:
+        reasons.append(str(exc))
+        details["jobs"] = "unreadable"
         try:
             conn.close()
         except Exception:
             pass
+        return {"quiescent": False, "reasons": reasons, "details": details}
     active = [j for j in jobs if str(j.get("state", "")) in NONTERMINAL]
     details["active_job"] = str(active[0].get("id", "")) if active else ""
     if active:
@@ -351,31 +425,53 @@ def assess(config_path, require_drain=True):
         if ids:
             reasons.append("%s: %s" % (
                 label, ",".join(i[:8] for i in ids[:5])))
-    # Expected units: nonterminal/unresolved/recovery jobs + any job with
-    # an unreleased mutation lease (terminal-but-owned counts, F02).
-    units = []
+    # Held mutation leases (G08): independently fatal, even when the DB
+    # job row is terminal. Missing execution_leases table is explicit:
+    # pre-lease schemas (version < 4, proven via schema_meta) have no
+    # lease mechanism, so vacuous truth is sound there; anything else
+    # (newer schema, unreadable ledger/version) blocks.
+    leased = []
+    leases_unprovable = False
     try:
-        conn2 = _open_ro(db_path)
-        try:
-            leased = [str(r["job_id"] or "") for r in conn2.execute(
+        if not _table_exists(conn, "execution_leases"):
+            version = _schema_version(conn)
+            if version < 0:
+                raise _InspectionError(
+                    "schema version unreadable: lease state unprovable")
+            if version >= 4:
+                raise _InspectionError(
+                    "execution_leases table missing on schema v%d" % version)
+            details["leases"] = "pre-lease schema (v%d)" % version
+        else:
+            leased = [str(r["job_id"] or "") for r in conn.execute(
                 "SELECT job_id FROM execution_leases WHERE kind='mutation'"
                 " AND released_at=''").fetchall()]
-        except Exception:
-            leased = []
-        try:
-            conn2.close()
-        except Exception:
-            pass
-    except Exception:
+            leased = [jid for jid in leased if jid]
+    except _InspectionError as exc:
+        reasons.append(str(exc))
+        leases_unprovable = True
+        leased = []
+    except Exception as exc:
+        reasons.append("lease query failed: %s" % exc)
+        leases_unprovable = True
         leased = []
     details["held_leases"] = leased
+    if leases_unprovable:
+        pass  # reason already recorded; quiescence decided below.
+    if leased:
+        reasons.append("unreleased mutation leases: %s" % ",".join(
+            jid[:8] for jid in leased[:5]))
+    leased_set = set(leased)
+    # Expected units: nonterminal/unresolved/recovery jobs plus any job
+    # holding an unreleased mutation lease (terminal-but-owned counts).
+    units = []
     for job in jobs:
         try:
             state = str(job.get("state", ""))
             interesting = state in NONTERMINAL or \
                 int(job.get("unresolved", 0) or 0) or \
                 int(job.get("recovery_required", 0) or 0) or \
-                str(job.get("id", "")) in set(leased)
+                str(job.get("id", "")) in leased_set
             if not interesting:
                 continue
             unit = str(job.get("canonical_unit", "")
@@ -414,53 +510,69 @@ def assess(config_path, require_drain=True):
     if live_units:
         reasons.append("runner units not quiescent: %s" % ",".join(
             str(u.get("unit", "?"))[-12:] for u in live_units[:5]))
-    # Delegated operations for jobs under scrutiny.
+    # Delegated operations for jobs under scrutiny: nonterminal,
+    # unresolved, recovery-required, AND terminal-but-owned (held
+    # lease) jobs (G08). A plan lookup/parse failure for a scrutiny
+    # job is unprovable delegated state and blocks (never vacuous).
     delegated = []
-    try:
-        conn3 = _open_ro(db_path)
+    scrutiny_unprovable = False
+    for job in jobs:
         try:
-            for job in jobs:
-                try:
-                    state = str(job.get("state", ""))
-                    if state not in NONTERMINAL and \
-                            not int(job.get("unresolved", 0) or 0):
-                        continue
-                    plan = conn3.execute(
-                        "SELECT services FROM plans WHERE id=?",
-                        (job.get("plan_id", ""),)).fetchone()
-                    services = []
-                    if plan is not None:
-                        try:
-                            services = list(json.loads(
-                                plan["services"] or "[]"))
-                        except Exception:
-                            services = []
-                    for service in services[:20]:
-                        name = str(service or "")
-                        if not name:
-                            continue
-                        state_u, _d = query_user_unit(tool_owner, uid, name)
-                        entry_state = state_u
-                        bus = "user"
-                        if state_u == "unknown":
-                            state_s, _d2 = query_system_unit(name)
-                            if state_s != "unknown":
-                                entry_state, bus = state_s, "system"
-                        delegated.append(
-                            {"service": name, "bus": bus,
-                             "state": entry_state,
-                             "job": str(job.get("id", ""))[:8]})
-                except Exception:
-                    continue
-        finally:
+            state = str(job.get("state", ""))
+            jid = str(job.get("id", ""))
+            if state not in NONTERMINAL and \
+                    not int(job.get("unresolved", 0) or 0) and \
+                    not int(job.get("recovery_required", 0) or 0) and \
+                    jid not in leased_set:
+                continue
             try:
-                conn3.close()
+                plan = conn.execute(
+                    "SELECT services FROM plans WHERE id=?",
+                    (job.get("plan_id", ""),)).fetchone()
+            except Exception as exc:
+                reasons.append(
+                    "delegated proof unprovable for job %s: %s"
+                    % (jid[:8], exc))
+                scrutiny_unprovable = True
+                continue
+            services = []
+            if plan is None:
+                reasons.append(
+                    "delegated proof unprovable for job %s: plan row "
+                    "missing" % jid[:8])
+                scrutiny_unprovable = True
+                continue
+            try:
+                services = list(json.loads(plan["services"] or "[]"))
             except Exception:
-                pass
-    except Exception as exc:
-        reasons.append("delegated inspection failed: %s" % exc)
-        delegated = [{"service": "<inspection>", "bus": "-",
-                      "state": "unknown", "job": "-"}]
+                reasons.append(
+                    "delegated proof unprovable for job %s: services "
+                    "unreadable" % jid[:8])
+                scrutiny_unprovable = True
+                continue
+            for service in services[:20]:
+                name = str(service or "")
+                if not name:
+                    continue
+                state_u, _d = query_user_unit(tool_owner, uid, name)
+                entry_state = state_u
+                bus = "user"
+                if state_u == "unknown":
+                    state_s, _d2 = query_system_unit(name)
+                    if state_s != "unknown":
+                        entry_state, bus = state_s, "system"
+                delegated.append(
+                    {"service": name, "bus": bus,
+                     "state": entry_state,
+                     "job": jid[:8]})
+        except Exception as exc:
+            reasons.append("delegated proof unprovable: %s" % exc)
+            scrutiny_unprovable = True
+            continue
+    try:
+        conn.close()
+    except Exception:
+        pass
     details["delegated_operations"] = [
         e for e in delegated if e.get("state") != "confirmed_stopped"]
     for entry in delegated:
@@ -469,6 +581,36 @@ def assess(config_path, require_drain=True):
                 entry.get("service", "?"), entry.get("job", "?"),
                 entry.get("state", "unknown")))
             break
+    # Execution-marked processes for scrutiny jobs (G08 shared pattern:
+    # unit hex + runner markers, self excluded). An unlistable /proc or
+    # any surviving match blocks; absence must be proved, not assumed.
+    try:
+        hexes = []
+        for job in jobs:
+            try:
+                jid = str(job.get("id", "") or "")
+                state = str(job.get("state", ""))
+                if not jid:
+                    continue
+                if state in NONTERMINAL or \
+                        int(job.get("unresolved", 0) or 0) or \
+                        int(job.get("recovery_required", 0) or 0) or \
+                        jid in leased_set:
+                    token = jid.replace("-", "")
+                    if token:
+                        hexes.append(token)
+            except Exception:
+                continue
+        procs_ok, procs = _updater_processes(hexes)
+    except Exception as exc:
+        procs_ok, procs = False, [
+            {"pid": -1, "cmdline": "process proof crashed: %s" % exc}]
+    details["updater_processes"] = procs
+    if not procs_ok:
+        reasons.append("execution-marked process state unprovable")
+    elif procs:
+        reasons.append("execution-marked processes alive: %s" % ",".join(
+            str(p.get("pid", "?")) for p in procs[:5]))
     drain_path = os.path.join(state_dir, "drain")
     drain = os.path.exists(drain_path)
     details["drain"] = bool(drain)
@@ -477,8 +619,11 @@ def assess(config_path, require_drain=True):
     quiescent = (worker_alive and not details["active_job"]
                  and not details.get("unresolved_jobs")
                  and not details.get("recovery_jobs")
+                 and not leased and not leases_unprovable
                  and not live_units
                  and not details["delegated_operations"]
+                 and not scrutiny_unprovable
+                 and procs_ok and not procs
                  and (drain or not require_drain))
     return {"quiescent": bool(quiescent), "reasons": reasons,
             "details": details}
