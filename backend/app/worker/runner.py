@@ -485,6 +485,23 @@ class Runner(object):
                 pass
             self.log = None
             raise OSError("job log unavailable: %s" % exc)
+        # H06: a JobLog whose sanitizer streams failed to initialize
+        # OPENS successfully but cannot produce trustworthy evidence.
+        # Refuse here — before execution proceeds — through the same
+        # blocked path as above (no mutation has run, so no recovery
+        # is needed). Fixed literal only, never raw exception text.
+        try:
+            broken = bool(getattr(self.log, "persist_failed", False))
+        except Exception:
+            broken = True
+        if broken:
+            try:
+                self.log.close()
+            except Exception:
+                pass
+            self.log = None
+            raise OSError("job log evidence pipeline unavailable: "
+                          "sanitizer initialization failed")
 
     def _verify_nonce(self):
         # type: () -> Tuple[bool, str]
@@ -1170,6 +1187,24 @@ class Runner(object):
         if not ok:
             if self._stop.is_set():
                 return None
+            # H06: the execute worker refused BEFORE any adapter call
+            # (fixed pre-adapter refusal literal from a known-broken
+            # evidence pipeline): mutation positively never began.
+            # Preserve the literal so run() blocks without recovery,
+            # like other pre-mutation refusals — never coerce it into
+            # a generic interrupted-with-recovery.
+            try:
+                _refusal = str((data or {}).get("error_code", "") or "")
+            except Exception:
+                _refusal = ""
+            if _refusal == "evidence_unavailable":
+                return {"state": "blocked",
+                        "error_code": "evidence_unavailable",
+                        "error_detail": "evidence initialization "
+                                        "unavailable",
+                        "exit_code": EXIT_BLOCKED, "timed_out": False,
+                        "before_version": self.before_version,
+                        "after_version": ""}
             # Worker-level failure (no result): treat as interrupted with
             # recovery unless the payload proves otherwise.
             self._event("execute worker failed: %s" % (error or "")[:300])

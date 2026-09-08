@@ -453,6 +453,24 @@ def main(argv=None):
         return EXIT_OK
     writer = _StreamWriter(args.stream, secrets,
                            secrets_ok=secrets_ok)
+    if writer.evidence_failed:
+        # H06: the evidence pipeline is KNOWN broken before any tool
+        # touch — refuse BEFORE any adapter call (backup, execute,
+        # verify, or probe). Mutation must not start when durable
+        # redaction cannot be initialized. Fixed literals only: no
+        # exception text, adapter output, or environment may be
+        # written without a working sanitizer. The coordinator maps
+        # the evidence_unavailable literal (pre-mutation refusal for
+        # execute/backup) to blocked without recovery; a missing
+        # result file stays interrupted with recovery (fail closed).
+        _write_fixed_result(
+            args.result, args.phase, "evidence_unavailable",
+            "evidence initialization unavailable")
+        try:
+            writer.flush_final()
+        except Exception:
+            pass
+        return EXIT_OK
 
     def _emit(stream, text):
         # type: (str, str) -> None

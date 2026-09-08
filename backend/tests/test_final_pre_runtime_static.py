@@ -1038,3 +1038,224 @@ def test_h05_success_releases_and_second_admits(tmp_path, monkeypatch):
     assert jid2 != jid1
     assert _lease_held(conn, jid2)
     conn.close()
+
+
+# -- H06 evidence-init blocks mutation -----------------------------------------
+
+def _boom_sanitizer(*args, **kwargs):
+    raise RuntimeError("no sanitizer")
+
+
+def test_h06_open_log_refuses_broken_pipeline(tmp_path, monkeypatch):
+    """JobLog sanitizer constructor failure makes _open_log() raise
+    (no initialized-looking object continues toward mutation)."""
+    from backend.app import sanitize as sanitize_lib
+    from backend.app.config import settings as settings_lib
+    from backend.app.worker import runner as runner_lib
+
+    support_lib.use_test_secrets(monkeypatch, tmp_path)
+    log_dir = str(tmp_path / "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    monkeypatch.setattr(settings_lib, "log_dir", log_dir)
+    monkeypatch.setattr(sanitize_lib, "SanitizingStream",
+                        _boom_sanitizer)
+    runner = runner_lib.Runner("job-h06-open", "n")
+    try:
+        runner._open_log()
+    except OSError as exc:
+        assert "evidence pipeline unavailable" in str(exc)
+    else:
+        raise AssertionError("_open_log continued on broken evidence")
+    assert runner.log is None
+
+
+def test_h06_open_log_failure_blocks_before_mutation(tmp_path,
+                                                    monkeypatch):
+    """Full runner: broken evidence pipeline blocks with recovery 0,
+    and the tool adapter is never touched."""
+    from backend.app import jobs as jobs_lib
+    from backend.app import sanitize as sanitize_lib
+    from backend.app.adapters import registry as registry_lib
+    from backend.app.config import settings as settings_lib
+    from backend.app.worker import runner as runner_lib
+
+    support_lib.use_test_secrets(monkeypatch, tmp_path)
+    db_path = str(tmp_path / "state.db")
+    conn = _fresh_db(tmp_path, "state.db")
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = _admit(conn, row["id"], "k-h06-run")
+    assert err == "" and created, err
+    assert jobs_lib.claim_with_nonce(conn, jid, "n-h06") is True
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(settings_lib, "db_path", db_path)
+    log_dir = str(tmp_path / "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    monkeypatch.setattr(settings_lib, "log_dir", log_dir)
+    monkeypatch.setattr(settings_lib, "state_dir", str(tmp_path))
+    monkeypatch.setattr(sanitize_lib, "SanitizingStream",
+                        _boom_sanitizer)
+
+    def _guarded_adapter(_tool_id):
+        raise AssertionError("tool adapter must not run")
+
+    monkeypatch.setattr(registry_lib, "get_adapter", _guarded_adapter)
+    runner = runner_lib.Runner(jid, "n-h06")
+    assert runner.run() == runner_lib.EXIT_BLOCKED
+    import sqlite3 as _sqlite
+
+    check = _sqlite.connect(db_path)
+    check.row_factory = _sqlite.Row
+    job = dict(check.execute("SELECT * FROM jobs WHERE id=?",
+                             (jid,)).fetchone())
+    check.close()
+    assert job["state"] == "blocked"
+    assert int(job["recovery_required"]) == 0
+
+
+def _worker_argv(job_id, phase, log_dir, op=""):
+    args = [job_id, phase,
+            "--payload", os.path.join(log_dir, "w.payload.json"),
+            "--result", os.path.join(log_dir, "w.result.json"),
+            "--stream", os.path.join(log_dir, "w.stream")]
+    if op:
+        args += ["--op", op]
+    return args
+
+
+def _worker_settings(tmp_path):
+    import types as _types
+
+    secrets_path = str(tmp_path / "w-secrets.env")
+    with open(secrets_path, "w", encoding="utf-8") as fh:
+        fh.write("")
+    return _types.SimpleNamespace(
+        log_dir=str(tmp_path), node_path="", npm_path="",
+        npx_path="", state_dir=str(tmp_path), tool_owner="ubuntu",
+        secrets_file=secrets_path)
+
+
+def _worker_payload(log_dir, tool_id, phase, fp, op=""):
+    payload = {"tool_id": tool_id, "phase": phase,
+               "env_fingerprint": fp}
+    if op:
+        payload["op"] = op
+    with open(os.path.join(log_dir, "w.payload.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    return payload
+
+
+def _refusing_worker_setup(monkeypatch, tmp_path):
+    """Boom the sanitizer, fake settings/payload/fp, fake adapter that
+    must never run. Returns (settings, expected_fp, calls)."""
+    from backend.app import sanitize as sanitize_lib
+    from backend.app.adapters import registry as registry_lib
+    from backend.app.owner_env import (build_owner_contract,
+                                       contract_fingerprint)
+    from backend.app.worker import phase_run as phase_run_lib
+
+    monkeypatch.setattr(sanitize_lib, "SanitizingStream",
+                        _boom_sanitizer)
+    settings = _worker_settings(tmp_path)
+    monkeypatch.setattr(phase_run_lib, "_load_settings",
+                        lambda: settings)
+    expected_fp = contract_fingerprint(
+        build_owner_contract(settings))
+    assert expected_fp
+    calls = {"execute": 0, "backup": 0, "verify": 0, "probe": 0}
+
+    def _mk(name):
+        def _call(*args, **kwargs):
+            calls[name] += 1
+            raise AssertionError(
+                "adapter %s must not run" % name)
+        return _call
+
+    import types as _types
+
+    fake = _types.SimpleNamespace(
+        execute=_mk("execute"), backup=_mk("backup"),
+        verify=_mk("verify"), inspect=_mk("probe"))
+    monkeypatch.setattr(registry_lib, "get_adapter",
+                        lambda _tool_id: fake)
+    return settings, expected_fp, calls
+
+
+def _assert_fixed_refusal(log_dir, calls):
+    with open(os.path.join(log_dir, "w.result.json"), "r",
+              encoding="utf-8") as fh:
+        raw = fh.read()
+    result = json.loads(raw)
+    assert result.get("ok") is False
+    data = result.get("data", {})
+    assert data.get("error_code") == "evidence_unavailable"
+    assert data.get("error_detail") == \
+        "evidence initialization unavailable"
+    assert "no sanitizer" not in raw
+    assert "Traceback" not in raw
+    assert all(count == 0 for count in calls.values())
+
+
+def test_h06_broken_pipeline_never_calls_execute(tmp_path, monkeypatch):
+    from backend.app.worker import phase_run as phase_run_lib
+
+    log_dir = str(tmp_path)
+    _settings, fp, calls = _refusing_worker_setup(monkeypatch,
+                                                  tmp_path)
+    _worker_payload(log_dir, "hermes", "execute", fp)
+    assert phase_run_lib.main(
+        _worker_argv("job-h06-e", "execute", log_dir)) == 0
+    _assert_fixed_refusal(log_dir, calls)
+
+
+def test_h06_broken_pipeline_never_calls_backup(tmp_path, monkeypatch):
+    from backend.app.worker import phase_run as phase_run_lib
+
+    log_dir = str(tmp_path)
+    _settings, fp, calls = _refusing_worker_setup(monkeypatch,
+                                                  tmp_path)
+    _worker_payload(log_dir, "hermes", "backup", fp)
+    assert phase_run_lib.main(
+        _worker_argv("job-h06-b", "backup", log_dir)) == 0
+    _assert_fixed_refusal(log_dir, calls)
+
+
+def test_h06_broken_pipeline_blocks_verify_and_probe(tmp_path,
+                                                     monkeypatch):
+    from backend.app.worker import phase_run as phase_run_lib
+
+    log_dir = str(tmp_path)
+    _settings, fp, calls = _refusing_worker_setup(monkeypatch,
+                                                  tmp_path)
+    _worker_payload(log_dir, "hermes", "verify", fp)
+    assert phase_run_lib.main(
+        _worker_argv("job-h06-v", "verify", log_dir)) == 0
+    _assert_fixed_refusal(log_dir, calls)
+    _worker_payload(log_dir, "hermes", "probe", fp, op="inspect")
+    assert phase_run_lib.main(
+        _worker_argv("job-h06-p", "probe", log_dir,
+                     op="inspect")) == 0
+    _assert_fixed_refusal(log_dir, calls)
+
+
+def test_h06_mid_execute_evidence_failure_no_success(tmp_path,
+                                                     monkeypatch):
+    """Evidence failing DURING execute still maps to interrupted (the
+    preserved fail-closed path), never success."""
+    import types as _types
+    from backend.app.worker import runner as runner_lib
+
+    runner = runner_lib.Runner("job-h06-mid", "n")
+    runner.job = {"ack": ""}
+
+    def _failed_evidence(self, phase, payload_extra, timeout_s,
+                         op=""):
+        return True, {"evidence_durable": False,
+                      "state": "failed"}, "", False
+
+    monkeypatch.setattr(runner_lib.Runner, "_run_phase",
+                        _failed_evidence)
+    out = runner._do_execute(_types.SimpleNamespace(), 30.0)
+    assert out["state"] == "interrupted"
+    assert out["error_code"] == "interrupted"
