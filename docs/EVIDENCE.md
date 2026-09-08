@@ -138,6 +138,24 @@ G02 hook update in `backend/tests/test_final_integration.py`.
 | H06 | Evidence-init failure refuses before any adapter call (fixed `evidence_unavailable` literal); `_open_log` verifies `persist_failed`; execute refusal blocks without recovery; mid-operation failures stay interrupted-with-recovery | `runner.py`, `phase_run.py` |
 | S01 | install/upgrade provision empty `secrets.env` (0640 `root:ega-update`); validator requires it; example + RUNBOOK agree | `install.sh`, `upgrade.sh`, `validate-release.py`, `config.example.json`, `docs/RUNBOOK.md` |
 
+## H05 final addendum — resolved success clears historical uncertainty
+
+Implementation head `44851b0` (starting from `cff4a4d`). Every row:
+`implemented-static`, result `NOT EXECUTED — IMPLEMENTATION PHASE`.
+No runtime PASS claimed.
+
+Historical `unresolved`/`recovery_required` markers are cleared only
+by a fully validated bound succeeded receipt after complete
+execution-quiescence proof: the canonical helper decides proven
+success before historical uncertainty, and reconciled receipt
+application persists `state=succeeded`, `unresolved=0`,
+`recovery_required=0` atomically before ownership release. Generic
+receipt loads never clear execution uncertainty; manual
+`--clear-recovery` remains for ambiguous failure cases. Regression
+artifact: H05-final block (11) in
+`backend/tests/test_final_pre_runtime_static.py` (write-only),
+including crash-after-success reconciliation → second-job admission.
+
 ## Main-agent core corrective addendum (senior review R01–R36, Gate A–C)
 
 Branch `feat/v1-implementation`, previous baseline `2e0f898`, this pass

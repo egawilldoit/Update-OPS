@@ -145,3 +145,39 @@ Commits (branch `feat/v1-implementation`): H04 `6ebe8a2`, H05 `b4c825d`, H06 `c8
 | H05 | One canonical recovery decision `recovery_required_for_outcome()`: proven success (valid bound succeeded receipt incl. already_current, disposition none, execution quiescent) is resolved (recovery 0) — mutation evidence alone never implies recovery; disposition required / non-success mutation evidence / mutation-window anchors / unknown-contradictory require; positively pre-mutation anchors without evidence resolve. All 4 reconcile sites (dispatcher + SSH, apply + interrupt) share it (source-pinned; legacy `recovery_for()` is a thin wrapper). Runner success finalization already recovers 0; all reconcile flows through the migrated paths (continuous + boot + SSH) | `reconcile_core.py`, `dispatch.py`, `reconcile.py` | H05 block (8) incl. success-release-second-admission integration |
 | H06 | Evidence-init blocks mutation: `_open_log()` raises on `persist_failed` (same pre-mutation blocked path, no recovery); worker refuses with fixed literal `evidence_unavailable` immediately after `_StreamWriter` construction, before backup/execute/verify/probe adapter calls; runner preserves the literal through `_do_execute` to blocked-without-recovery (mutation positively never began); missing results and mid-operation failures keep interrupted-with-recovery | `runner.py`, `phase_run.py` | H06 block (6) |
 | S01 | Fresh installs satisfy the secret-source contract: install/upgrade provision EMPTY `secrets.env` when absent (never overwrite/values/contents); exactly 0640 `root:ega-update` (both service users read via group; 0600 root-owned would fail readiness); validator requires it present at 0640; example + RUNBOOK agree | `install.sh`, `upgrade.sh`, `validate-release.py`, `config.example.json`, `docs/RUNBOOK.md` | S01 block (8) |
+
+# H05 final addendum — resolved success clears historical uncertainty
+
+Commit `44851b0` (branch `feat/v1-implementation`). Status:
+implemented-static. Result: `NOT EXECUTED — IMPLEMENTATION PHASE`.
+
+Defect: the canonical recovery helper preserved `unresolved=1` before
+considering new authoritative evidence, and receipt application
+preserved stale `recovery_required`/`unresolved` flags — a proven
+success could never unblock admission.
+
+Fix (two linked parts, one interpretation):
+- `recovery_required_for_outcome()` decides fully proven success
+  FIRST: a valid bound succeeded receipt (incl. already_current)
+  with disposition none, applied state succeeded, and independently
+  proven execution quiescence returns False even with
+  `unresolved=True`. Historical uncertainty blocks only UNTIL
+  authoritative resolution exists. All non-success/ambiguous paths
+  keep fail-closed recovery.
+- `apply_receipt(..., execution_quiescent=True)` (resolved-success
+  mode, only from reconciliation after full H02/H03 proof) clears
+  `unresolved=0` + `recovery_required=0` atomically in the SAME
+  transaction as the terminal evidence, before ownership release —
+  including a same-state terminal rewrite when stale flags survive.
+  Generic loads (flag False) preserve flags; required dispositions
+  still set recovery. Dispatcher + SSH reconcilers pass the flag;
+  manual `--clear-recovery` stays for ambiguous failure cases.
+
+Regression: H05-final block (11) in
+`backend/tests/test_final_pre_runtime_static.py` — unresolved+success
+clears, unresolved without proof remains, unproven execution remains,
+apply clears both flags (crash + stale-terminal variants), legacy
+apply preserves, failed keeps recovery, tampered refused with
+flags/lease intact, live scope holds everything, live delegated
+service holds, crash-after-success E2E → second-job admission.
+Write-only.
