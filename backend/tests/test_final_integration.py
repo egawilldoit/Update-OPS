@@ -364,3 +364,77 @@ def test_f02_release_failure_keeps_admission_blocked(tmp_path):
     assert err2 == "busy" and not created2
     assert canonical_unit(jid)
     conn.close()
+
+
+# -- F04 contradiction-free success --------------------------------------------
+
+def _f04_good():
+    from backend.app import receipts as receipts_lib
+
+    return receipts_lib.build_receipt(
+        "job-f04", "hermes", "succeeded", "1.0", "9.9.9", 0, "", [
+            {"name": "smoke", "result": "pass", "mandatory": True,
+             "summary": "ok"}], "2026-09-08T00:00:00+00:00",
+        plan_id="plan-f04", plan_hash="ph", attempt_nonce="n",
+        release_path="/rel", target="9.9.9", target_mode="exact",
+        expected_checks=["smoke"], installer_exit=0,
+        install_outcome="succeeded", actual_change=True,
+        cleanup_status="resolved", recovery_disposition="none",
+        evidence_durable=True)
+
+
+def test_f04_success_agreement_matrix():
+    from backend.app import receipts as receipts_lib
+
+    ok, reason = receipts_lib.validate_receipt(_f04_good())
+    assert ok, reason
+    contradictions = [
+        ("exit_code", 6),
+        ("install_outcome", "failed"),
+        ("install_outcome", ""),
+        ("install_outcome", "none"),
+        ("cleanup_status", "unknown"),
+        ("cleanup_status", ""),
+        ("recovery_disposition", "required"),
+        ("after_version", ""),
+        ("installer_exit", 4),
+    ]
+    for key, value in contradictions:
+        mutated = _f04_good()
+        mutated[key] = value
+        valid, _why = receipts_lib.validate_receipt(mutated)
+        assert valid is False, (key, value)
+    # already_current is an explicitly allowed success outcome.
+    already = _f04_good()
+    already["install_outcome"] = "already_current"
+    assert receipts_lib.validate_receipt(already)[0] is True
+    # Weakening an expected check to mandatory=false fails.
+    weakened = _f04_good()
+    weakened["checks"] = [{"name": "smoke", "result": "pass",
+                           "mandatory": False, "summary": ""}]
+    assert receipts_lib.validate_receipt(weakened)[0] is False
+    # Exact target mismatch fails.
+    mismatched = _f04_good()
+    mismatched["after_version"] = "9.9.8"
+    assert receipts_lib.validate_receipt(mismatched)[0] is False
+
+
+def test_f04_strict_exit_parsing():
+    from backend.app import receipts as receipts_lib
+
+    for bad in ("abc", "", None, True, 1.5, "  "):
+        with pytest.raises(ValueError):
+            receipts_lib.build_receipt(
+                "j", "hermes", "failed", "1.0", "1.0", bad, "x", [],
+                "2026-09-08T00:00:00+00:00")
+    for bad in ("abc", "", None, True, 2.5):
+        with pytest.raises(ValueError):
+            receipts_lib.build_receipt(
+                "j", "hermes", "failed", "1.0", "1.0", 4, "x", [],
+                "2026-09-08T00:00:00+00:00", installer_exit=bad)
+    # Integer zero (and string "0") survive strict parsing.
+    receipt = receipts_lib.build_receipt(
+        "j", "hermes", "failed", "1.0", "1.0", 0, "x", [],
+        "2026-09-08T00:00:00+00:00", installer_exit="0")
+    assert receipt["exit_code"] == 0
+    assert receipt["installer_exit"] == 0

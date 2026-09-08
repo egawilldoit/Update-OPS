@@ -34,6 +34,12 @@ TERMINAL_RECEIPT_STATES = (
 
 CHECK_RESULTS = ("pass", "fail", "unknown", "not_applicable")
 
+# Explicit installation-outcome vocabulary (F04). Only these values may
+# accompany state == succeeded; anything else (including "", "none",
+# "failed", "install_failed") contradicts success. This is the complete
+# allowed set — do not accept arbitrary strings.
+SUCCESS_OUTCOMES = ("succeeded", "already_current")
+
 
 def _known_secrets():
     # type: () -> tuple
@@ -107,7 +113,12 @@ def build_receipt(job_id, tool_id, state, before_version, after_version,
                   recovery_disposition="", evidence_durable=True,
                   backup_evidence=None, final_health=None):
     # type: (...) -> Dict[str, Any]
-    """Build a fully-bound redacted receipt dict (every string sanitized)."""
+    """Build a fully-bound redacted receipt dict (every string sanitized).
+
+    Exit values use strict parsing (F04): a malformed explicit
+    exit_code/installer_exit raises ValueError instead of silently
+    becoming zero.
+    """
     norm_checks = []  # type: List[Dict[str, Any]]
     for item in checks or []:
         if not isinstance(item, dict):
@@ -119,13 +130,13 @@ def build_receipt(job_id, tool_id, state, before_version, after_version,
             "summary": _redact_str(str(item.get("summary", "")))[:1000],
         })
     try:
-        code = int(exit_code)
-    except (TypeError, ValueError):
-        code = 0
+        code = _strict_int(exit_code, "exit_code")
+    except ValueError as exc:
+        raise ValueError("receipt build: %s" % exc)
     try:
-        inst_code = int(installer_exit)
-    except (TypeError, ValueError):
-        inst_code = 0
+        inst_code = _strict_int(installer_exit, "installer_exit")
+    except ValueError as exc:
+        raise ValueError("receipt build: %s" % exc)
     return {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "job_id": _redact_str(str(job_id or "")),
@@ -213,22 +224,38 @@ def validate_receipt(data):
     if not isinstance(expected, list):
         return False, "expected_checks must be a list"
     if state == "succeeded":
+        # F04 contradiction-free success: EVERY success field must agree.
+        # Any single contradiction fails the receipt (fail closed).
         if not isinstance(data.get("after_version", ""), str) or \
                 not data.get("after_version", ""):
             return False, "after_version required for succeeded"
+        try:
+            if _strict_int(data.get("exit_code", "missing"),
+                           "exit_code") != 0:
+                return False, "succeeded requires exit_code == 0"
+        except ValueError as exc:
+            return False, "succeeded: %s" % exc
         try:
             if _strict_int(data.get("installer_exit"), "installer_exit") \
                     != 0:
                 return False, "succeeded requires installer_exit == 0"
         except ValueError as exc:
             return False, "succeeded: %s" % exc
+        if str(data.get("install_outcome", "") or "") not in \
+                SUCCESS_OUTCOMES:
+            return False, "succeeded requires install_outcome in %r; got %r" \
+                % (list(SUCCESS_OUTCOMES),
+                   str(data.get("install_outcome", ""))[:50])
         if not data.get("evidence_durable", False):
             return False, "succeeded requires evidence_durable"
+        if str(data.get("cleanup_status", "") or "") != "resolved":
+            return False, "succeeded requires cleanup_status == resolved"
+        if str(data.get("recovery_disposition", "") or "") == "required":
+            return False, "succeeded contradicts recovery_disposition " \
+                "== required"
         if data.get("target_mode") == "exact" and \
                 data.get("after_version") != data.get("target"):
             return False, "exact target not observed"
-        present = {str(c.get("name", "")) for c in checks
-                   if isinstance(c, dict)}
         for name in expected:
             matches = [c for c in checks
                        if isinstance(c, dict)
@@ -236,8 +263,11 @@ def validate_receipt(data):
             if not matches:
                 return False, "expected mandatory check missing: %s" % name
             for match in matches:
-                if not match.get("mandatory", True):
-                    continue
+                # A receipt cannot weaken mandatory=true to false (F04):
+                # expected checks must be mandatory AND passing.
+                if not match.get("mandatory", False):
+                    return False, \
+                        "expected check not mandatory: %s" % name
                 if match.get("result") != "pass":
                     return False, \
                         "expected mandatory check not passing: %s" % name
@@ -323,6 +353,20 @@ def check_binding(data, job_row, plan_row=None, filename_job_id=""):
                 return False, "cleanup not resolved"
             if not data.get("evidence_durable", False):
                 return False, "evidence not durable"
+            try:
+                if _strict_int(data.get("exit_code", "missing"),
+                               "exit_code") != 0:
+                    return False, "succeeded requires exit_code == 0"
+            except ValueError as exc:
+                return False, "succeeded: %s" % exc
+            if str(data.get("install_outcome", "") or "") not in \
+                    SUCCESS_OUTCOMES:
+                return False, "succeeded requires install_outcome in %r" \
+                    % (list(SUCCESS_OUTCOMES),)
+            if str(data.get("recovery_disposition", "") or "") == \
+                    "required":
+                return False, "succeeded contradicts recovery_disposition" \
+                    " == required"
     except Exception as exc:
         return False, "binding check crashed: %s" % exc
     return True, ""
