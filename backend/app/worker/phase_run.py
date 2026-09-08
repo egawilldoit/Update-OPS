@@ -13,7 +13,7 @@ Two halves:
   quiescence, and returns the result.
   No phase Python outlives coordinator-declared termination: the worker
   is an OS process inside the killed cgroup, not a thread.
-"""
+
 Invoked ONLY by the coordinator inside a coordinator-owned scope:
 
   <venv-python> -m backend.app.worker.phase_run <job-id> <phase>
