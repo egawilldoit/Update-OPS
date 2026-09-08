@@ -255,6 +255,13 @@ def test_plan_unknown_without_ack_then_job_requires_ack(tmp_path,
                                                         monkeypatch):
     _auth_ok(monkeypatch)
     _state_dir, db_path, _log_dir = _isolate_settings(monkeypatch, tmp_path)
+    # This test exercises ack/busy semantics, not secret failure: point
+    # the secret source at a real empty file (the shared isolate helper
+    # targets a missing path for fail-closed coverage elsewhere).
+    _secrets_path = os.path.join(tmp_path, "real-secrets.env")
+    with open(_secrets_path, "w", encoding="utf-8") as _sfh:
+        _sfh.write("")
+    monkeypatch.setattr(settings_lib, "secrets_file", _secrets_path)
     _make_db(db_path).close()
     fake = _FakeAdapterBase(fingerprint="fp-ack-1",
                             activity_state="unknown",

@@ -835,7 +835,8 @@ def test_f11_dispatcher_event_failure_no_raw(tmp_path, monkeypatch):
     assert events_lib.record_event(
         conn, jid, "reconcile_unknown",
         "raw secret-bearing detail") is True
-    rows = conn.execute("SELECT detail FROM events WHERE job_id=?",
+    rows = conn.execute("SELECT detail FROM events WHERE job_id=?"
+                        " AND event_type='reconcile_unknown'",
                         (jid,)).fetchall()
     assert len(rows) == 1
     assert "raw secret-bearing detail" not in rows[0]["detail"]

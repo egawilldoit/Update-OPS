@@ -156,9 +156,10 @@ def test_sanitizer_secrets_before_truncation():
     out = stream.feed(("prefix-%s-suffix\n" % secret).encode("utf-8"))
     blob = "\n".join(out)
     # Redaction precedes truncation: the secret never appears, the
-    # replacement visibly starts, then the line cap marker applies.
+    # replacement visibly begins (max_line=16 admits "prefix-" plus
+    # the first 9 replacement chars), then the line cap applies.
     assert secret not in blob
-    assert sanitize_lib.REPLACEMENT[:10] in blob
+    assert "***REDACT" in blob
     assert "[truncated-line]" in blob
 
 
