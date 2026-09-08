@@ -156,6 +156,10 @@ artifact: H05-final block (11) in
 `backend/tests/test_final_pre_runtime_static.py` (write-only),
 including crash-after-success reconciliation → second-job admission.
 
+Evidence pin: implementation SHA
+`6c11ece066219f2aac1b23fbded82bd1aae8f66f` (code + tests +
+substantive docs). This pin commit is docs-only.
+
 ## Main-agent core corrective addendum (senior review R01–R36, Gate A–C)
 
 Branch `feat/v1-implementation`, previous baseline `2e0f898`, this pass
