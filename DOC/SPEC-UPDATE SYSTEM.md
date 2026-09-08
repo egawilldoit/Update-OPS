@@ -2,11 +2,11 @@
 
 Status: implementation contract, pending environment inventory.
 Date: 2026-09-08.
-Companion: [PRD and acceptance criteria](PRD.md).
+Companion: [PRD and acceptance criteria](<PRD-UPDATE SYSTEM.md>).
 
 ## 1. Contract
 
-Implement the PRD's four-tool manual update flow on one Ubuntu VM. This file defines mechanisms; PRD.md defines scope and acceptance. Conflicts must be resolved explicitly before implementation. Repository AGENTS.md still applies.
+Implement the PRD's four-tool manual update flow on one Ubuntu VM. This file defines mechanisms; [PRD-UPDATE SYSTEM.md](<PRD-UPDATE SYSTEM.md>) defines scope and acceptance. Conflicts must be resolved explicitly before implementation. Repository AGENTS.md still applies.
 
 V1 uses React, TypeScript, and Vite for a static frontend; FastAPI for the API and static files; SQLite for durable state; and a separate Python worker under systemd. Pin dependencies and commit lockfiles. Do not introduce Redis, Kubernetes, cloud databases, or an AI execution layer.
 

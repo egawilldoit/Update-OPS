@@ -1,0 +1,45 @@
+# EGA Update Console — singleton dispatcher worker (SPEC §8).
+#
+# Runs under the tool-owner account (ubuntu) because update procedures must
+# execute with the same ownership/environment as the inventoried tool
+# installations. The API account (ega-update) must NOT own tool state.
+#
+# Singleton is enforced in code by backend/app/worker/dispatch.py via an
+# fcntl.flock on /var/lib/ega-update/worker.lock (fail-closed when the lock
+# is unavailable). restart=always keeps exactly one dispatcher alive; the
+# lock prevents duplicates during restarts/overlaps.
+#
+# On (re)start the dispatcher runs reconcile_boot(): nonterminal jobs without
+# a live runner unit AND without a persisted completion receipt become
+# `interrupted` + recovery_required=1. It never re-executes update steps and
+# never clears a lock on heartbeat age.
+
+[Unit]
+Description=EGA Update Console dispatcher worker (tool-owner singleton)
+Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
+After=network.target ega-update-api.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ega-update/current
+# Shared config: /etc/ega-update/config.json is the owner-managed file;
+# /etc/ega-update/worker.env carries per-service overrides + secrets only.
+# Environment defaults come first so keys in worker.env still win.
+Environment=EGA_CONFIG_FILE=/etc/ega-update/config.json
+EnvironmentFile=/etc/ega-update/worker.env
+ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.dispatch
+Restart=always
+RestartSec=5
+# Singleton semantics: at most one dispatcher holds worker.lock; a second
+# instance exits immediately ("another dispatcher holds the worker lock").
+
+# Tool procedures need the owner's HOME, node toolchain, and service access,
+# so this unit is intentionally less sandboxed than the API unit.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

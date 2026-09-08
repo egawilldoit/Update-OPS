@@ -2,7 +2,7 @@
 
 Status: ready for implementation, subject to VM inventory.
 Date: 2026-09-08.
-Companion: [Technical specification](SPEC.md).
+Companion: [Technical specification](<SPEC-UPDATE SYSTEM.md>).
 
 ## Goal
 

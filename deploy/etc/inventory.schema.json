@@ -1,0 +1,180 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ega-update inventory.json",
+  "description": "Per-tool installation inventory (SPEC §3, spec_scripts §11 SC-01). Produced WITHOUT credentials: absolute paths, versions, units, and probes only — never tokens, secrets, or auth material. The console lock cannot protect against unrelated SSH commands or external updaters; overlapping automation is recorded in `overlapping_automation` and only confirmed-conflicting entries are disabled at setup, with prior config saved for restoration.",
+  "type": "object",
+  "required": ["generated_at", "vm", "tools", "overlapping_automation", "limitations"],
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": { "type": "string", "description": "UTC ISO-8601 timestamp of the inventory capture." },
+    "vm": {
+      "type": "object",
+      "required": ["os", "arch", "owner_uid", "node_version"],
+      "additionalProperties": true,
+      "properties": {
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "owner_uid": { "type": "integer" },
+        "tool_owner": { "type": "string", "description": "Expected tool-owner account (verified, e.g. ubuntu)." },
+        "node_version": { "type": "string" },
+        "root_free_bytes": { "type": "integer" }
+      }
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["id", "executable", "install_kind", "owner"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "enum": ["hermes", "opencode", "codex", "t3", "claude"] },
+          "executable": { "type": "string", "description": "Absolute configured executable path (validated, never PATH-resolved at runtime)." },
+          "resolved_target": { "type": "string", "description": "readlink -f of executable / resolved install target." },
+          "install_kind": { "type": "string", "description": "e.g. standalone, curl-installer, native-updater, npm-managed, user-service, source-checkout." },
+          "owner": { "type": "string", "description": "Filesystem owner of the installation (user:group)." },
+          "version": { "type": "string" },
+          "commit": { "type": "string", "description": "VCS commit where applicable (Hermes main-tracking)." },
+          "source_status": {
+            "type": "object",
+            "required": ["state"],
+            "additionalProperties": false,
+            "properties": {
+              "state": { "type": "string", "enum": ["clean", "dirty", "unknown", "not_applicable"] },
+              "detail": { "type": "string" },
+              "repo": { "type": "string" },
+              "branch": { "type": "string" },
+              "remote": { "type": "string" }
+            }
+          },
+          "runtime_paths": {
+            "type": "object",
+            "description": "Absolute runtime/toolchain paths (node/npm/npx, venv, data homes).",
+            "additionalProperties": false,
+            "properties": {
+              "node": { "type": "string" },
+              "npm": { "type": "string" },
+              "npx": { "type": "string" },
+              "state_home": { "type": "string" },
+              "working_directory": { "type": "string" }
+            }
+          },
+          "service_units": {
+            "type": "array",
+            "description": "Inventoried supervisor units (system or user scope + restart authority). Enabled is not proof of running.",
+            "items": {
+              "type": "object",
+              "required": ["name", "scope"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "scope": { "type": "string", "enum": ["system", "user"] },
+                "load_state": { "type": "string" },
+                "active_state": { "type": "string" },
+                "restart_authority": { "type": "string", "description": "Whether the tool-owner account may restart this unit (SC-01 gate for Hermes system units)." },
+                "exec_start": { "type": "string" },
+                "run_user": { "type": "string" }
+              }
+            }
+          },
+          "state_dirs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Config/state directories covered or excluded by backup scope."
+          },
+          "channel": { "type": "string", "description": "Update channel (e.g. main, nightly, stable, unknown)." },
+          "activity_probe": {
+            "type": "object",
+            "required": ["method", "result"],
+            "additionalProperties": false,
+            "properties": {
+              "method": { "type": "string", "description": "How busyness is detected (NOT 'service running' alone)." },
+              "result": { "type": "string", "enum": ["idle", "busy", "unknown"] },
+              "evidence": { "type": "string" },
+              "checked_at": { "type": "string" }
+            }
+          },
+          "verification_probes": {
+            "type": "array",
+            "description": "Mandatory post-update checks (CLI startup, gateway, daemon, HTTP readiness, integration probes).",
+            "items": {
+              "type": "object",
+              "required": ["name", "mandatory"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "mandatory": { "type": "boolean" },
+                "command": { "type": "string", "description": "Fixed argv for reference (exec uses fixed arrays, shell=False)." },
+                "expected": { "type": "string" }
+              }
+            }
+          },
+          "backup_procedure": {
+            "type": "object",
+            "required": ["method", "scope"],
+            "additionalProperties": false,
+            "properties": {
+              "method": { "type": "string", "description": "Consistent backup method; copying a live DB file alone is insufficient." },
+              "scope": { "type": "string" },
+              "exclusions": { "type": "string" },
+              "consistency": { "type": "string" },
+              "estimated_bytes": { "type": "integer" },
+              "supported": { "type": "boolean" },
+              "unsupported_reason": { "type": "string" }
+            }
+          },
+          "launch_method": { "type": "string", "description": "SC-01 gate: exact T3 launch recipe (unit + flags + port + data home), or custom-service adapter reference." },
+          "install_method_supported": { "type": "boolean" },
+          "unsupported_reason": { "type": "string" }
+        }
+      }
+    },
+    "overlapping_automation": {
+      "type": "object",
+      "description": "Cron, systemd timers, and tool self-update flags that could race the console lock.",
+      "additionalProperties": false,
+      "properties": {
+        "cron": { "type": "array", "items": { "type": "string" } },
+        "systemd_timers": { "type": "array", "items": { "type": "string" } },
+        "self_update_flags": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["tool", "setting"],
+            "additionalProperties": false,
+            "properties": {
+              "tool": { "type": "string" },
+              "setting": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        },
+        "disabled": {
+          "type": "array",
+          "description": "Only confirmed-conflicting entries, each with prior config saved for restoration.",
+          "items": {
+            "type": "object",
+            "required": ["entry", "prior_config_path", "restore_command"],
+            "additionalProperties": false,
+            "properties": {
+              "entry": { "type": "string" },
+              "prior_config_path": { "type": "string" },
+              "restore_command": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "limitations": {
+      "type": "object",
+      "required": ["note"],
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "type": "string",
+          "description": "Must state: the console lock cannot protect against unrelated SSH commands or external updaters."
+        }
+      }
+    }
+  }
+}

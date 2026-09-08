@@ -1,0 +1,44 @@
+# EGA Update Console — persistent Cloudflare Tunnel (SPEC §2, §12).
+#
+# Routes ONLY the single dedicated console hostname to the loopback API:
+#   ingress: <dedicated-hostname> -> http://127.0.0.1:8771
+# No other hostname, path, or origin is routed by this tunnel.
+#
+# Protection model:
+# - The whole hostname is gated by a Cloudflare Access policy (owner
+#   identities only). Access is configured BEFORE the hostname is published.
+# - The API additionally validates Cf-Access-Jwt-Assertion itself
+#   (backend/app/auth.py): RS256, fixed audience, configured issuer,
+#   expiry, owner allow-list, fail closed. Never trust an email header alone.
+# - Authenticated API responses carry `Cache-Control: no-store`; the tunnel/
+#   zone config bypasses cache for /api/* (see cloudflared config.yml
+#   originRequest + zone cache rule documented in docs/RUNBOOK.md).
+# - SSH access is preserved independently of this tunnel.
+#
+# Credentials: /etc/ega-update/cloudflared/credentials.json (0600,
+# root:ega-update or ega-update owner per install.sh). The tunnel token, if
+# used instead of a credentials file, lives in /etc/ega-update/tunnel.env
+# (0600) and is never logged.
+
+[Unit]
+Description=EGA Update Console Cloudflare Tunnel (dedicated hostname only)
+Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
+After=network.target ega-update-api.service
+Wants=network.target
+BindsTo=ega-update-api.service
+
+[Service]
+Type=simple
+User=ega-update
+Group=ega-update
+ExecStart=/usr/bin/cloudflared tunnel --config /etc/ega-update/cloudflared/config.yml run
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/ega-update/cloudflared
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+# EGA Update Console — per-job runner template (SPEC §8).
+#
+# NOT enabled directly. The dispatcher spawns one transient instance per job:
+#
+#   systemd-run --collect \
+#     --unit=ega-update-job-<shortid> \
+#     --working-directory=/opt/ega-update/current \
+#     ega-update-runner <job-id>
+#
+# where <shortid> is the first 8 chars of the job UUID and the unit name is
+# persisted to jobs.runner_unit BEFORE dispatch (dispatch.py claim_or_block).
+# A dispatch retry inspects that recorded unit (systemctl is-active/show)
+# instead of spawning a duplicate.
+#
+# Cgroup containment: updater descendants remain in the job's cgroup.
+# - Runner crash: systemd terminates remaining cgroup processes; the
+#   dispatcher/worker reconciles unit state and records `interrupted`
+#   unless a persisted completion receipt proves the outcome.
+# - Hard timeout: the runner terminates the job cgroup gracefully
+#   (SIGTERM), then forcibly (SIGKILL) after the configured grace period;
+#   records possible partial installation + bounded recovery checks.
+#   No retry, no browser cancellation in V1.
+#
+# TimeoutStopSec below bounds graceful stop of the runner itself; per-step
+# procedure timeouts come from adapter plan().timeouts (see
+# backend/app/adapters/base.py ADAPTER_TIMEOUT_DEFAULTS).
+#
+# Template identity: instantiated as ega-update-runner@<jobid>.service.
+# The transient systemd-run unit (ega-update-job-<shortid>) is the recorded
+# runner_unit; this template documents the execution environment for sites
+# that prefer a template instance over bare systemd-run properties.
+
+[Unit]
+Description=EGA Update Console job runner %i
+Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
+After=network.target ega-update-worker.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ega-update/current
+EnvironmentFile=/etc/ega-update/worker.env
+ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.runner %i
+# Graceful stop first, then SIGKILL. KillMode=control-group ensures
+# updater descendants in the job cgroup are terminated together.
+KillMode=control-group
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+TimeoutStopSec=60
+# One-shot jobs must not restart: an exited runner is reconciled, never
+# re-executed (API/dispatcher restart resumes observation only).
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true

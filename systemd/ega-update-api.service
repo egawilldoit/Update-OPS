@@ -1,0 +1,53 @@
+# EGA Update Console — API service (SPEC §2, §12).
+#
+# Binds loopback only: 127.0.0.1:$EGA_LISTEN_PORT (default 8771) via uvicorn.
+# Public reachability comes ONLY from the dedicated Cloudflare Tunnel +
+# Access policy (see cloudflared-ega-update.service). The API never listens
+# on a public interface.
+#
+# Runs as dedicated non-root account ega-update. Shares group access to
+# /var/lib/ega-update with the tool-owner worker account (ubuntu) only.
+
+[Unit]
+Description=EGA Update Console API (loopback only)
+Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ega-update
+Group=ega-update
+WorkingDirectory=/opt/ega-update/current
+# Shared config: /etc/ega-update/config.json is the owner-managed file;
+# /etc/ega-update/api.env carries per-service overrides + secrets only.
+# Environment defaults come first so keys in api.env still win.
+Environment=EGA_CONFIG_FILE=/etc/ega-update/config.json
+Environment=EGA_LISTEN_PORT=8771
+EnvironmentFile=/etc/ega-update/api.env
+# Loopback-only bind. EGA_LISTEN_PORT defaults to 8771 (see Environment
+# above; api.env may override). EGA_LISTEN_HOST must
+# stay 127.0.0.1 (deploy config validates this before start).
+ExecStart=/opt/ega-update/current/venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port $EGA_LISTEN_PORT --workers 1
+Restart=on-failure
+RestartSec=5
+
+# Hardening (dedicated non-root account, no privilege escalation).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# State/config paths explicitly re-exposed (ProtectSystem=strict mounts / as
+# read-only; /etc/ega-update and /var/lib/ega-update need limited write).
+ReadWritePaths=/var/lib/ega-update
+ReadOnlyPaths=/etc/ega-update
+
+# Secrets (CSRF secret, tunnel credentials) stay in /etc/ega-update with
+# 0600/0640 modes and are never logged.
+
+[Install]
+WantedBy=multi-user.target

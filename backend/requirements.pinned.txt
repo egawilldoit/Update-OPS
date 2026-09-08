@@ -1,0 +1,14 @@
+# Deferred dependency resolution (do not invent lockfile contents).
+#
+# Exact pins live in backend/requirements.txt and frontend/package.json.
+# Full transitive lockfiles (pip freeze / package-lock.json) are generated in
+# the deploy/CI environment with network access to official registries:
+#
+#   python3.10 -m venv /opt/ega-update/releases/<commit>/venv
+#   venv/bin/pip install -r backend/requirements.txt
+#   venv/bin/pip freeze > backend/requirements.pinned.txt   # committed at release time
+#   cd frontend && npm install --package-lock-only && npm ci
+#
+# Shared runtimes are never installed or upgraded by this project:
+# Node 24.18.0 and npm 11.19.1 are reused as-is; Python 3.10 runs inside the
+# dedicated application venv only.

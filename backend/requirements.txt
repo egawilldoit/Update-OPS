@@ -1,0 +1,9 @@
+# EGA Update Console — backend pins (verified 2026-09-08).
+# Install: python3.10 -m venv /opt/ega-update/releases/<commit>/venv && venv/bin/pip install -r backend/requirements.txt
+# Lockfile generation (pip freeze) is deferred to the deploy environment; no lockfile contents invented here.
+fastapi==0.136.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
+uvicorn==0.52.4
+PyJWT[crypto]==2.13.0
+requests==2.32.5

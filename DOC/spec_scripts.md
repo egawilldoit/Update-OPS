@@ -5,7 +5,7 @@ Status: implementation specification, not a tested replacement updater.
 
 ## 1. Purpose and scope
 
-Implement reliable per-tool update scripts for the actual Ubuntu VM. The dashboard worker calls these scripts and owns durable jobs, authentication, and crash recovery as defined in SPEC.md. Scripts own installation checks, update execution, and tool verification.
+Implement reliable per-tool update scripts for the actual Ubuntu VM. The dashboard worker calls these scripts and owns durable jobs, authentication, and crash recovery as defined in [SPEC-UPDATE SYSTEM.md](<SPEC-UPDATE SYSTEM.md>). Scripts own installation checks, update execution, and tool verification.
 
 The required V1 tools remain Codex, OpenCode, Hermes, and T3 nightly. Claude Code is inventoried and receives an optional adapter, disabled until its installation ownership is resolved. This document does not silently expand the four-tool PRD or authorize a Claude migration.
 
@@ -68,7 +68,7 @@ Deliver these executable entry points, backed by one shared implementation rathe
 - scripts/update-claude.sh, optional and disabled by default
 - scripts/agent-update, dispatcher
 
-Use thin Bash wrappers around the Python adapter implementation in SPEC.md. Run subprocesses with fixed argument arrays and shell=False. Never use eval or bash -lc with generated command text.
+Use thin Bash wrappers around the Python adapter implementation in [SPEC-UPDATE SYSTEM.md](<SPEC-UPDATE SYSTEM.md>). Run subprocesses with fixed argument arrays and shell=False. Never use eval or bash -lc with generated command text.
 
 Proposed interface, to be implemented:
 
@@ -87,7 +87,7 @@ Every operation returns a JSON result with schema_version, tool, action, job_id,
 
 Use the authenticated worker's existing environment with a configured PATH for child dependencies. Validate Node at /home/ubuntu/.nvm/versions/node/v24.18.0/bin/node and matching npm/npx. Do not source interactive shell profiles or repurpose HOME/CODEX_HOME. Preserve genuine tool state-home settings only when inventoried.
 
-Lock ownership belongs to the job runner. Wrappers must not reacquire and deadlock against the same lock. Direct CLI invocation goes through that same runner. Preserve the job across browser or API restart as specified in SPEC.md.
+Lock ownership belongs to the job runner. Wrappers must not reacquire and deadlock against the same lock. Direct CLI invocation goes through that same runner. Preserve the job across browser or API restart as specified in [SPEC-UPDATE SYSTEM.md](<SPEC-UPDATE SYSTEM.md>).
 
 ## 5. Codex procedure
 
@@ -216,7 +216,7 @@ Source: [Claude setup and update documentation](https://code.claude.com/docs/en/
 
 ## 10. Shared preflight and recovery
 
-Required space is max(3 GiB configured default floor, estimated staging + required backup + 1 GiB reserve), measured on every affected filesystem. This stricter script default supersedes the earlier 2 GiB example in SPEC.md. Include package extraction, cache, DB/WAL, and native snapshots; database extensions alone do not prove backup size. Unknown estimates block until conservatively configured.
+Required space is max(3 GiB configured default floor, estimated staging + required backup + 1 GiB reserve), measured on every affected filesystem. This stricter script default supersedes the earlier 2 GiB example in [SPEC-UPDATE SYSTEM.md](<SPEC-UPDATE SYSTEM.md>). Include package extraction, cache, DB/WAL, and native snapshots; database extensions alone do not prove backup size. Unknown estimates block until conservatively configured.
 
 No blind full-home archives. Every adapter declares backup scope, exclusions, consistency method, required bytes, and recovery limitations. No consistent backup available for a required state migration means blocked. Tool-native rollback is allowed to complete; the console does not add automatic rollback.
 
