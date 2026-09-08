@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 import sys
 import uuid
 
@@ -899,3 +900,61 @@ def test_f12_expired_read_lease_reclaimed_mutation_safe(tmp_path):
         "fp-test-1", True, False)
     assert err == "" and created, err
     conn.close()
+
+
+# -- G01 runner control-flow integrity -------------------------------------------
+
+def _runner_source_lines():
+    path = os.path.join(_REPO_ROOT, "backend", "app", "worker",
+                        "runner.py")
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read().splitlines()
+
+
+def test_g01_no_orphaned_try_in_runner():
+    """The G01 stale fragment (a bare `try:` with no suite, followed by
+    a dedented statement) must never reappear in Runner.run()."""
+    lines = _runner_source_lines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped != "try:":
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        assert index + 1 < len(lines), "try: at EOF"
+        nxt = lines[index + 1]
+        assert nxt.strip() != "", "empty suite after try:"
+        nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+        assert nxt_indent > indent, \
+            "orphaned try: at line %d" % (index + 1)
+
+
+def test_g01_try_except_balance_in_runner():
+    """Every `try:` in runner.py must have a matching `except`/`finally`
+    at the same indent (tripwire against half-deleted blocks)."""
+    stack = []
+    for lineno, line in enumerate(_runner_source_lines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if stripped == "try:" or stripped.startswith("try:"):
+            stack.append((indent, lineno))
+            continue
+        if stripped.startswith("except") or stripped.startswith("finally"):
+            assert stack, \
+                "orphaned %r at line %d" % (stripped[:12], lineno)
+            top_indent, top_line = stack.pop()
+            assert indent == top_indent, \
+                "indent drift: %r at %d vs try: at %d" % (
+                    stripped[:12], lineno, top_line)
+    assert stack == [], \
+        "unclosed try: blocks at lines %s" % [ln for _, ln in stack]
+
+
+def test_g01_no_duplicated_adapter_gate_comment():
+    """The duplicated 'Disabled adapters never mutate' comment that
+    accompanied the stale fragment must not return."""
+    lines = _runner_source_lines()
+    hits = [i for i, line in enumerate(lines)
+            if "Disabled adapters never mutate" in line]
+    assert len(hits) <= 1, hits

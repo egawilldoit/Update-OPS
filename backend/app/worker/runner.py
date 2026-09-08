@@ -1703,10 +1703,6 @@ class Runner(object):
             self._event("env blocked: %s %s" % (env_code, env_detail))
             return self._finish("blocked", EXIT_BLOCKED, env_code,
                                 env_detail)
-        # Disabled adapters never mutate. (Adapter evidence sinks are
-        # owned by the supervised phase worker; the coordinator only
-        # tails the sanitized stream file.)
-        try:
         self._event("runner start tool=%s job=%s" % (self.tool_id, self.job_id))
 
         # Preflight runs before any mutation; DB failure here blocks.
