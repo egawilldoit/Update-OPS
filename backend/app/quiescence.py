@@ -5,7 +5,7 @@ and tests — never reimplemented in shell:
 
   schema_version, action, state, detail{worker_alive, active_job,
   unresolved_jobs, recovery_jobs, unresolved_units, live_units,
-  delegated_operations, drain, quiescent, reasons}, exit mapping.
+  delegated_operations, held_leases, drain, quiescent, reasons}, exit mapping.
 
 Quiescence requires ALL of: worker heartbeat fresh; no active/nonterminal
 job; no unresolved or recovery-required job; every expected runner unit
@@ -77,6 +77,41 @@ def _expected_units(jobs):
                 units.append(unit)
         except Exception:
             continue
+    return units
+
+
+def _held_lease_units(conn):
+    # type: (object) -> List[str]
+    """Canonical units of jobs with unreleased mutation leases (F02).
+
+    A terminal job whose lease was never disposed (missed reconciler
+    pass) must still have its unit proven stopped before deploy
+    proceeds. Never raises; absence of the leases table yields [].
+    """
+    try:
+        from .reconcile_core import canonical_unit
+    except Exception:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT job_id FROM execution_leases WHERE kind='mutation'"
+            " AND released_at=''").fetchall()
+    except Exception:
+        return []
+    units = []
+    for row in rows:
+        try:
+            jid = str(row["job_id"] or "")
+        except Exception:
+            continue
+        if not jid:
+            continue
+        try:
+            unit = canonical_unit(jid)
+        except Exception:
+            continue
+        if unit and unit not in units:
+            units.append(unit)
     return units
 
 
@@ -154,7 +189,11 @@ def assess_quiescence(conn, settings):
         units_ok = False
         reasons.append("unit model unavailable")
     if units_ok:
-        for unit in _expected_units(jobs):
+        check_units = _expected_units(jobs)
+        for held in _held_lease_units(conn):
+            if held not in check_units:
+                check_units.append(held)
+        for unit in check_units:
             try:
                 info = _units.query_unit(unit, timeout_s=5)
                 state = str(info.get("state", "unknown"))
@@ -241,7 +280,20 @@ def assess_quiescence(conn, settings):
         "unresolved_units": [str(u.get("unit", "")) for u in live_units],
         "live_units": live_units,
         "delegated_operations": active_services,
+        "held_leases": _held_lease_job_ids(conn),
         "drain": bool(drain),
         "quiescent": bool(quiescent),
         "reasons": reasons,
     }
+
+
+def _held_lease_job_ids(conn):
+    # type: (object) -> List[str]
+    try:
+        rows = conn.execute(
+            "SELECT job_id FROM execution_leases WHERE kind='mutation'"
+            " AND released_at=''").fetchall()
+        return [str(r["job_id"] or "") for r in rows
+                if str(r["job_id"] or "")]
+    except Exception:
+        return []

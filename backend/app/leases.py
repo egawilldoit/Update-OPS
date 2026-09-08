@@ -1,4 +1,4 @@
-"""Durable execution leases: probe/mutation/maintenance exclusion (N08).
+"""Durable execution leases: probe/mutation exclusion (N08, F02).
 
 One transactional admission/exclusion mechanism replacing the
 check-then-act race between owner probes and update reservation:
@@ -8,9 +8,12 @@ check-then-act race between owner probes and update reservation:
   conflicting maintenance for contending ops). Bounded TTL; expired
   probe leases are safely reclaimable without touching mutation leases.
 - mutation lease: one per job, acquired atomically inside the reservation
-  transaction, released atomically at terminalization. NEVER expires by
-  time (no heartbeat-age release); only explicit release or guarded
-  reconciliation disposes it.
+  transaction. NEVER expires by time (no heartbeat-age release), is NEVER
+  released opportunistically, and is disposed ONLY by tx.release_ownership()
+  after a reconciler positively proves execution quiescence
+  (canonical unit confirmed stopped + no execution-marked processes +
+  no unresolved delegated mutation). Terminal DB state alone never
+  releases it (F02: outcome != ownership).
 - maintenance lease: held while drain-driven deploy work runs (optional;
   the drain file remains the admission signal; leases arbitrate probes).
 
@@ -154,8 +157,12 @@ def acquire_mutation_lease(conn, job_id, holder):
     """Acquire the job's mutation lease INSIDE the caller's reservation
     transaction (admission owns the tx; this issues no COMMIT/ROLLBACK).
 
-    Refused (False, no write) when any unexpired probe lease or another
-    mutation lease exists. Never time-based: release is explicit.
+    Refused (False, no write) when any unexpired probe lease exists or
+    when ANY other unreleased mutation lease exists — regardless of that
+    job's state. In particular a lease attached to a terminal or missing
+    job is NOT silently released here: that cleanup belongs exclusively
+    to reconciliation with execution proof (F02), via
+    tx.release_ownership(). Never time-based.
     """
     if not job_id or not _tables_present(conn):
         return False
@@ -167,35 +174,9 @@ def acquire_mutation_lease(conn, job_id, holder):
             (now,)).fetchone()
         if probes is not None:
             return False
-        # A mutation lease conflicts only while its job is nonterminal
-        # (or the job row is missing, which must not happen inside the
-        # admission tx). Leases orphaned on terminal jobs are tolerated
-        # read-only here AND opportunistically released, so a missed
-        # release can never wedge admission forever (N08).
-        try:
-            stale = conn.execute(
-                "SELECT l.id FROM execution_leases l LEFT JOIN jobs j"
-                " ON j.id=l.job_id WHERE l.kind='mutation'"
-                " AND l.released_at='' AND l.job_id<>?"
-                " AND (j.id IS NULL OR j.state NOT IN"
-                " ('accepted','preflight','backup','updating',"
-                " 'verifying'))").fetchall()
-            for row in stale:
-                try:
-                    conn.execute(
-                        "UPDATE execution_leases SET released_at=?"
-                        " WHERE id=? AND released_at=''",
-                        (now, row["id"]))
-                except Exception:
-                    continue
-        except Exception:
-            pass
         other = conn.execute(
-            "SELECT l.id FROM execution_leases l LEFT JOIN jobs j"
-            " ON j.id=l.job_id WHERE l.kind='mutation'"
-            " AND l.released_at='' AND l.job_id<>?"
-            " AND j.state IN ('accepted','preflight','backup',"
-            "'updating','verifying') LIMIT 1",
+            "SELECT id FROM execution_leases WHERE kind='mutation'"
+            " AND released_at='' AND job_id<>? LIMIT 1",
             (job_id,)).fetchone()
         if other is not None:
             return False
@@ -208,21 +189,6 @@ def acquire_mutation_lease(conn, job_id, holder):
         return True
     except Exception:
         return False
-
-
-def release_mutation_lease(conn, job_id):
-    # type: (sqlite3.Connection, str) -> None
-    """Release a job's mutation lease (caller's transaction owns commit).
-    Never raises; best effort inside terminalization."""
-    try:
-        if not _tables_present(conn):
-            return
-        conn.execute(
-            "UPDATE execution_leases SET released_at=? WHERE kind='mutation'"
-            " AND job_id=? AND released_at=''",
-            (_utcnow(), job_id))
-    except Exception:
-        pass
 
 
 def reclaim_expired_probes(conn):

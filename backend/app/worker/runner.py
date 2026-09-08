@@ -1485,8 +1485,7 @@ class Runner(object):
                 update=update, event=state,
                 event_detail=("%s %s" % (
                     error_code, recovery_disposition))[:500],
-                checks=[], tool_id=self.tool_id,
-                release_mutation=True)
+                checks=[], tool_id=self.tool_id)
             self._known_state = state
         except TxError as exc:
             # Receipt is already durable; reconciliation repairs the row.

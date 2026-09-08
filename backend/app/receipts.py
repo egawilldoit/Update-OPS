@@ -457,8 +457,7 @@ def apply_receipt(conn, data, filename_job_id=""):
             event="receipt_applied",
             event_detail=str(data.get("ts", ""))[:200],
             checks=checks,
-            tool_id=str(data.get("tool_id", "")),
-            release_mutation=True)
+            tool_id=str(data.get("tool_id", "")))
     except TxError as exc:
         raise ValueError("receipt apply failed: %s" % exc)
     return str(new_row.get("state", state))

@@ -49,8 +49,7 @@ def _columns(conn):
 
 def transition_tx(conn, job_id, to_state, step="", expect_states=None,
                   expect_nonce="", update=None, event=None,
-                  event_detail="", checks=None, tool_id="",
-                  release_mutation=False):
+                  event_detail="", checks=None, tool_id=""):
     # type: (...) -> Dict[str, Any]
     """Atomic guarded transition. Returns the new job row as a dict.
 
@@ -58,9 +57,11 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
     the real jobs columns; unknown columns raise TxGuardError).
     checks: list of {name, result, mandatory, summary} inserted atomically.
     event: event_type string (default: to_state).
-    release_mutation: release the job's mutation lease in the SAME
-    transaction (terminalization paths must pass True so the slot and
-    the lease can never disagree).
+
+    F02: this function NEVER releases mutation ownership. Terminal state
+    is operation outcome, not execution quiescence. Only
+    release_ownership() (called by a reconciler after positive
+    quiescence proof) disposes the mutation lease.
     """
     from .schemas import utcnow_iso
 
@@ -155,16 +156,6 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
                 "summary,created_at) VALUES(?,?,?,?,?,?,?)",
                 (tool_id or current.get("tool_id", ""), job_id, name,
                  result, mandatory, summary, now))
-        if release_mutation:
-            # Same-transaction lease release: the admission slot and the
-            # mutation lease can never disagree (N08/N15).
-            try:
-                conn.execute(
-                    "UPDATE execution_leases SET released_at=? WHERE"
-                    " kind='mutation' AND job_id=? AND released_at=''",
-                    (now, job_id))
-            except Exception:
-                pass
         try:
             conn.execute("COMMIT")
         except Exception as exc:
@@ -184,3 +175,102 @@ def transition_tx(conn, job_id, to_state, step="", expect_states=None,
         except Exception:
             pass
         raise TxCommitError("transition failed: %s" % exc)
+
+
+def release_ownership(conn, job_id, expect_states=None, update=None,
+                      event="ownership_released", event_detail=""):
+    # type: (...) -> Dict[str, Any]
+    """Release mutation ownership after external quiescence proof (F02).
+
+    The ONLY legitimate disposer of a mutation lease, called solely by
+    reconciliation paths (dispatcher, SSH) that have positively proven:
+    canonical job unit = confirmed_stopped AND no execution-marked
+    processes remain AND no unresolved delegated mutation remains.
+
+    Commits job update + event + lease release in ONE transaction.
+    Raises TxError/TxCommitError on ANY failure (callers must propagate,
+    never swallow: a failed ownership update keeps admission blocked and
+    is retried on the next reconcile pass). Unknown unit/process state
+    must never reach this function.
+    """
+    from .schemas import utcnow_iso
+
+    if not job_id:
+        raise TxGuardError("job_id is required")
+    expect = tuple(expect_states or ())
+    extra = dict(update or {})
+    try:
+        from .config import load_secret_values, settings
+        from .sanitize import sanitize_text
+        _secrets = load_secret_values(settings)
+    except Exception as exc:
+        raise TxError("secret source unavailable: %s" % exc)
+    try:
+        event_detail = sanitize_text(event_detail or "", _secrets)
+        for key in _SANITIZED_UPDATE_KEYS:
+            if key in extra and isinstance(extra[key], str):
+                extra[key] = sanitize_text(extra[key], _secrets)
+    except Exception as exc:
+        raise TxError("evidence sanitization failed: %s" % exc)
+    now = utcnow_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM jobs WHERE id=?",
+                           (job_id,)).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            raise TxGuardError("unknown job: %s" % job_id)
+        current = dict(row)
+        if expect and current.get("state") not in expect:
+            conn.execute("ROLLBACK")
+            raise TxGuardError(
+                "expected state %r, found %r" % (list(expect),
+                                                 current.get("state")))
+        cols = _columns(conn)
+        if extra:
+            sets = []
+            args = []  # type: List[Any]
+            for key, value in extra.items():
+                if key in ("id", "state", "step"):
+                    conn.execute("ROLLBACK")
+                    raise TxGuardError(
+                        "reserved column in update: %s" % key)
+                if key not in cols:
+                    conn.execute("ROLLBACK")
+                    raise TxGuardError("unknown jobs column: %s" % key)
+                sets.append("%s=?" % key)
+                args.append(value)
+            args.append(job_id)
+            conn.execute("UPDATE jobs SET %s WHERE id=?" % ",".join(sets),
+                         args)
+        conn.execute(
+            "INSERT INTO events(job_id,created_at,event_type,detail)"
+            " VALUES(?,?,?,?)",
+            (job_id, now, str(event or "ownership_released")[:100],
+             str(event_detail or "")[:1000]))
+        cur = conn.execute(
+            "UPDATE execution_leases SET released_at=? WHERE"
+            " kind='mutation' AND job_id=? AND released_at=''",
+            (now, job_id))
+        released = int(cur.rowcount or 0)
+        try:
+            conn.execute("COMMIT")
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise TxCommitError("commit failed: %s" % exc)
+        final = conn.execute("SELECT * FROM jobs WHERE id=?",
+                             (job_id,)).fetchone()
+        result = dict(final) if final is not None else dict(current)
+        result["_ownership_released"] = released
+        return result
+    except TxError:
+        raise
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise TxCommitError("ownership release failed: %s" % exc)

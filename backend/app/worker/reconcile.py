@@ -232,26 +232,58 @@ def main(argv=None):
             except Exception as exc:
                 print("ERROR: could not set recovery: %s" % exc)
                 return 1
+        # F02: ownership release only after the proof above (confirmed
+        # stopped unit + no execution-marked processes). Terminal state
+        # alone never releases; failure stays loud (return 1).
+        try:
+            from backend.app.tx import release_ownership
+            release_ownership(
+                conn, args.job_id, expect_states=[applied],
+                event="ownership_released",
+                event_detail="ssh reconcile: unit confirmed stopped; "
+                             "no updater processes")
+            print("ownership released (mutation lease disposed)")
+        except Exception as exc:
+            print("ERROR: ownership release failed (lease still held; "
+                  "admission stays blocked): %s" % exc)
+            return 1
     elif action == "mark-interrupted":
         needs_recovery = _rc.recovery_for(
             state, False, bool(job_d.get("unresolved", 0)))
+        if state in ("succeeded", "blocked", "failed", "health_failed",
+                     "interrupted"):
+            # Already terminal: prove-and-release only, no state change.
+            pass
+        else:
+            try:
+                transition_tx(
+                    conn, args.job_id, "interrupted", step="interrupted",
+                    expect_states=["accepted", "preflight", "backup",
+                                   "updating", "verifying", "interrupted"],
+                    update={"error_code": "interrupted",
+                            "error_detail": "ssh reconcile: %s" % detail[:400],
+                            "recovery_required": 1 if needs_recovery else 0,
+                            "unresolved": 0},
+                    event="interrupted", event_detail=detail[:500])
+                print("terminalized abandoned job as interrupted "
+                      "(recovery=%s)" % int(needs_recovery))
+                state = "interrupted"
+                recovery = recovery or needs_recovery
+            except TxError as exc:
+                print("ERROR: cannot terminalize: %s" % exc)
+                return 1
+        # F02: ownership release only after the proof above.
         try:
-            transition_tx(
-                conn, args.job_id, "interrupted", step="interrupted",
-                expect_states=["accepted", "preflight", "backup",
-                               "updating", "verifying", "interrupted"],
-                update={"error_code": "interrupted",
-                        "error_detail": "ssh reconcile: %s" % detail[:400],
-                        "recovery_required": 1 if needs_recovery else 0,
-                        "unresolved": 0},
-                event="interrupted", event_detail=detail[:500],
-                release_mutation=True)
-            print("terminalized abandoned job as interrupted "
-                  "(recovery=%s)" % int(needs_recovery))
-            state = "interrupted"
-            recovery = recovery or needs_recovery
-        except TxError as exc:
-            print("ERROR: cannot terminalize: %s" % exc)
+            from backend.app.tx import release_ownership
+            release_ownership(
+                conn, args.job_id, expect_states=[state],
+                event="ownership_released",
+                event_detail="ssh reconcile: unit confirmed stopped; "
+                             "no updater processes")
+            print("ownership released (mutation lease disposed)")
+        except Exception as exc:
+            print("ERROR: ownership release failed (lease still held; "
+                  "admission stays blocked): %s" % exc)
             return 1
 
     if args.clear_recovery:

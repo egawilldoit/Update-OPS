@@ -459,11 +459,42 @@ def _reconcile_row(conn, row):
                 conn.commit()
         except Exception:
             pass
+        # F02: ownership release ONLY after the proof above (decide()
+        # returned apply-receipt solely for confirmed-stopped units with
+        # no execution-marked processes). Terminal state alone never
+        # releases; a failed release stays loud and is retried.
+        try:
+            from ..tx import release_ownership
+            release_ownership(
+                conn, job_id, expect_states=[applied],
+                event="ownership_released",
+                event_detail="unit confirmed stopped; receipt %s; "
+                             "no updater processes" % applied)
+        except Exception as exc:
+            _event(conn, job_id, "ownership_release_failed",
+                   str(exc)[:300])
+            return "ownership-release-failed"
         return "applied"
-    # mark-interrupted: atomic terminalization, never rerun.
+    # mark-interrupted: atomic terminalization, never rerun. Ownership is
+    # released only afterwards, and only with quiescence proof (F02).
     needs_recovery = _rc.recovery_for(
         state, shows_mutation(receipt_data) if receipt_valid else False,
         bool(job.get("unresolved", 0)))
+    if state in ("succeeded", "blocked", "failed", "health_failed",
+                 "interrupted"):
+        # Already terminal: no state change, prove-and-release only.
+        try:
+            from ..tx import release_ownership
+            release_ownership(
+                conn, job_id, expect_states=[state],
+                event="ownership_released",
+                event_detail="unit confirmed stopped; no updater "
+                             "processes")
+        except Exception as exc:
+            _event(conn, job_id, "ownership_release_failed",
+                   str(exc)[:300])
+            return "ownership-release-failed"
+        return "ownership-released"
     try:
         transition_tx(
             conn, job_id, "interrupted", step="interrupted",
@@ -472,31 +503,64 @@ def _reconcile_row(conn, row):
                     "error_detail": "dispatcher reconcile: %s" % detail[:400],
                     "recovery_required": 1 if needs_recovery else 0,
                     "unresolved": 0},
-            event="interrupted", event_detail=detail[:500],
-            release_mutation=True)
+            event="interrupted", event_detail=detail[:500])
     except TxError as exc:
         _event(conn, job_id, "reconcile_guard", str(exc)[:300])
         return "skipped"
+    try:
+        from ..tx import release_ownership
+        release_ownership(
+            conn, job_id, expect_states=["interrupted"],
+            event="ownership_released",
+            event_detail="unit confirmed stopped; no updater processes")
+    except Exception as exc:
+        _event(conn, job_id, "ownership_release_failed",
+               str(exc)[:300])
+        return "ownership-release-failed"
     return "interrupted-recovery" if needs_recovery else "interrupted"
+
+
+def _reconcile_candidates(conn):
+    # type: (sqlite3.Connection) -> list
+    """Rows needing reconcile: nonterminals, unresolved markers, and
+    terminal jobs whose mutation lease is still held (F02: otherwise a
+    terminal+held-lease row would never be revisited and its lease never
+    released)."""
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT jobs.* FROM jobs LEFT JOIN execution_leases"
+            " ON execution_leases.kind='mutation'"
+            " AND execution_leases.job_id=jobs.id"
+            " AND execution_leases.released_at=''"
+            " WHERE jobs.state IN (?,?,?,?,?) OR jobs.unresolved=1"
+            " OR execution_leases.id IS NOT NULL").fetchall()
+        return list(rows)
+    except Exception:
+        pass
+    try:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)"
+            " OR unresolved=1").fetchall()
+        return list(rows)
+    except Exception:
+        pass
+    # Pre-migration schema without unresolved: nonterminals only.
+    try:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)",
+            NONTERMINAL).fetchall()
+        return list(rows)
+    except Exception:
+        return []
 
 
 def reconcile_claimed_jobs(conn):
     # type: (sqlite3.Connection) -> int
     """Continuous reconcile for nonterminal claimed rows + terminal rows
     with possibly unresolved runners (R04: reconcile unresolved terminals
-    too). Unknown unit state always holds the reservation."""
-    try:
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)"
-            " OR unresolved=1").fetchall()
-    except Exception:
-        # Pre-migration schema without unresolved: nonterminals only.
-        try:
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)",
-                NONTERMINAL).fetchall()
-        except Exception:
-            return 0
+    too) + terminal rows with held mutation leases (F02). Unknown unit
+    state always holds the reservation."""
+    rows = _reconcile_candidates(conn)
     acted = 0
     for row in rows:
         try:
@@ -525,18 +589,7 @@ def reconcile_claimed_jobs(conn):
 def reconcile_boot(conn):
     # type: (sqlite3.Connection) -> None
     """On start: same per-row reconcile. Never auto-resumes work."""
-    try:
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)"
-            " OR unresolved=1").fetchall()
-    except Exception:
-        try:
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)",
-                NONTERMINAL).fetchall()
-        except Exception:
-            return
-    for row in rows:
+    for row in _reconcile_candidates(conn):
         try:
             _reconcile_row(conn, row)
         except Exception:
