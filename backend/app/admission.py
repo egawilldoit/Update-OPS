@@ -137,14 +137,20 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
         return "", False, "activity_blocked"
     if activity == "unknown" and not ack:
         return "", False, "ack_required"
-    # Step 3 — atomic reservation (N15): job + plan-used + mutation
-    # lease + event in ONE transaction. ROLLBACK on anything.
+    # Step 3 — atomic reservation (N15, H01): ONE transaction rechecks
+    # plan unused + no active mutation + no probe lease, then creates the
+    # job with its REAL UUID first and acquires the mutation lease under
+    # that identity (mutation-<job-uuid>). No placeholder lease is ever
+    # inserted or repaired: historical released rows can never collide
+    # with future jobs. ROLLBACK on anything.
     try:
         from .schemas import utcnow_iso
         now = utcnow_iso()
     except Exception:
         return "", False, "unavailable"
     try:
+        import uuid as _uuid
+        job_id = str(_uuid.uuid4())
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             "SELECT used_at FROM plans WHERE id=?", (plan_id,)).fetchone()
@@ -161,11 +167,9 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
         if busy is not None:
             conn.execute("ROLLBACK")
             return "", False, "busy"
-        if not _leases.acquire_mutation_lease(conn, "__pending__", subject):
+        if not _leases.acquire_mutation_lease(conn, job_id, subject):
             conn.execute("ROLLBACK")
             return "", False, "busy"
-        import uuid as _uuid
-        job_id = str(_uuid.uuid4())
         try:
             from .config import settings as _settings
             window = float(getattr(_settings, "worker_claim_s", 10) or 10)
@@ -187,9 +191,6 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
              "accepted", "accepted", before, now,
              "ack" if ack else "", claim_deadline))
         conn.execute("UPDATE plans SET used_at=? WHERE id=?", (now, plan_id))
-        conn.execute(
-            "UPDATE execution_leases SET job_id=? WHERE id=?",
-            (job_id, "mutation-__pending__"))
         conn.execute(
             "INSERT INTO events(job_id,created_at,event_type,detail)"
             " VALUES(?,?,?,?)", (job_id, now, "accepted", "reserved"))
