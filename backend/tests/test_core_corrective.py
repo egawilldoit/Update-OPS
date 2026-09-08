@@ -402,6 +402,44 @@ def test_migrations_dir_resolves_to_backend_migrations():
         assert os.path.isfile(resolved), filename
 
 
+def test_split_statements_ignores_comment_semicolons():
+    """A1/A2: semicolons inside full-line -- comments (even several)
+    never produce fake statements."""
+    sql = ("-- harmless comment; still comment\n"
+           "ALTER TABLE tools ADD COLUMN x TEXT DEFAULT '';\n"
+           "-- another; comment; with; semicolons\n")
+    statements = db_lib._split_statements(sql)
+    assert len(statements) == 1
+    assert statements[0].startswith("ALTER TABLE")
+    assert "harmless comment" not in statements[0]
+
+
+def test_split_statements_keeps_real_splitting():
+    """A3: real statements still split; blank lines, multiline
+    statements, and a missing trailing semicolon are preserved."""
+    sql = ("-- lead comment\n"
+           "\n"
+           "ALTER TABLE a ADD COLUMN x TEXT\n"
+           "  DEFAULT '';\n"
+           "ALTER TABLE b ADD COLUMN y INTEGER DEFAULT 0")
+    statements = db_lib._split_statements(sql)
+    assert len(statements) == 2
+    assert statements[0].startswith("ALTER TABLE a")
+    assert "DEFAULT ''" in statements[0]
+    assert statements[1].startswith("ALTER TABLE b")
+
+
+def test_migration_002_parses_to_intended_alters():
+    """A4: the actual 002 file parses to exactly its two ALTERs."""
+    path = db_lib._migration_path("002_execution_hardening.sql")
+    with open(path, "r", encoding="utf-8") as fh:
+        statements = db_lib._split_statements(fh.read())
+    assert len(statements) == 2
+    assert all(s.startswith("ALTER TABLE") for s in statements)
+    assert "fingerprint" in statements[0]
+    assert "dispatch_nonce" in statements[1]
+
+
 def test_migrate_fresh_rerun_and_newer_rejected(tmp_path):
     path = str(tmp_path / "m.db")
     conn = db_lib.connect(path)

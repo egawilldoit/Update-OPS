@@ -340,21 +340,29 @@ def _verify_objects(conn, upto):
 
 def _split_statements(sql):
     # type: (str) -> list
-    """Split migration SQL into statements (N05).
+    """Split migration SQL into statements (N05, A).
 
     Our migration files contain only simple DDL/DML (no triggers, no
-    semicolons inside string literals); splitting on semicolons with
-    comment/empty filtering is exact for this corpus. If a future
-    migration needs procedural logic, implement it in Python instead.
+    semicolons inside string literals); full-line `--` comments are
+    non-SQL and are removed BEFORE splitting, so a semicolon inside a
+    comment (e.g. migration 002's header) can never fuse prose into a
+    statement. Splitting the uncommented remainder on semicolons is
+    exact for this corpus. If a future migration needs procedural
+    logic, implement it in Python instead. Not a general SQL parser
+    by design: blank lines skipped, multiline statements kept whole,
+    final statement needs no trailing semicolon.
     """
-    statements = []
-    for chunk in sql.split(";"):
-        text = chunk.strip()
-        if not text:
+    uncommented_lines = []
+    for line in sql.splitlines():
+        if not line.strip():
             continue
-        lines = [line for line in text.splitlines()
-                 if line.strip() and not line.strip().startswith("--")]
-        clean = "\n".join(lines).strip()
+        if line.lstrip().startswith("--"):
+            continue
+        uncommented_lines.append(line)
+    uncommented = "\n".join(uncommented_lines)
+    statements = []
+    for chunk in uncommented.split(";"):
+        clean = chunk.strip()
         if clean:
             statements.append(clean)
     return statements
