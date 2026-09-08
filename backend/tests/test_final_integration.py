@@ -680,3 +680,87 @@ def test_f11_dispatcher_event_failure_no_raw(tmp_path, monkeypatch):
     assert "raw secret-bearing detail" not in rows[0]["detail"]
     assert "suppressed" in rows[0]["detail"]
     conn.close()
+
+
+# -- F12 complete probe/mutation exclusion ---------------------------------------
+
+def test_f12_all_installation_reads_classified(tmp_path):
+    """Every op reading installation state belongs to
+    INSTALLATION_READ_OPS (F12): no silent non-leased reader."""
+    from backend.app import owner_probes as owner_probes_lib
+
+    for op in ("inspect", "discover", "activity", "plan", "verify",
+               "refresh"):
+        assert op in owner_probes_lib.INSTALLATION_READ_OPS, op
+        assert op in owner_probes_lib.OPS, op
+    assert owner_probes_lib.CACHE_ONLY_OPS == ()
+
+
+def test_f12_each_read_op_blocks_mutation(tmp_path):
+    """A held probe lease — however the read op was classified —
+    refuses reservation for inspect/discover/verify/activity/plan."""
+    from backend.app import leases as leases_lib
+    from backend.app.admission import admit
+
+    for op in ("inspect", "discover", "verify"):
+        conn = _fresh_db(tmp_path, name="f12-%s.db" % op)
+        row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+        # The dispatcher acquires exactly one probe lease per
+        # INSTALLATION_READ_OP before touching the installation.
+        lease = leases_lib.acquire_probe_lease(
+            conn, "hermes", "dispatcher-test")
+        assert lease, op
+        jid, created, err = admit(
+            conn, "owner@example.invalid", "k-f12-%s" % op, row["id"],
+            False, "fp-test-1", True, False)
+        assert err == "busy" and not created, (op, err)
+        assert leases_lib.release_lease(conn, lease) is True
+        conn.close()
+
+
+def test_f12_mutation_blocks_all_reads(tmp_path):
+    """A held mutation lease refuses every probe-lease acquisition."""
+    from backend.app import leases as leases_lib
+    from backend.app.admission import admit
+
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-f12-m", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    for tool_id in ("hermes", "codex", "t3", "opencode"):
+        assert leases_lib.acquire_probe_lease(
+            conn, tool_id, "dispatcher-test") is None, tool_id
+    conn.close()
+
+
+def test_f12_lease_ttl_covers_probe_deadline_with_margin():
+    """A bounded probe lease is only acceptable because the operation
+    deadline is shorter than the TTL with safety margin (F12)."""
+    from backend.app import leases as leases_lib
+    from backend.app.worker import dispatch as dispatch_lib
+
+    assert leases_lib.PROBE_LEASE_TTL_S > \
+        dispatch_lib.PROBE_OP_TIMEOUT_S + 30
+
+
+def test_f12_expired_read_lease_reclaimed_mutation_safe(tmp_path):
+    """Expired abandoned read leases are reclaimable; mutation leases
+    are never touched by expiry."""
+    from backend.app import leases as leases_lib
+    from backend.app.admission import admit
+
+    conn = _fresh_db(tmp_path)
+    lease = leases_lib.acquire_probe_lease(conn, "hermes", "tester")
+    assert lease
+    conn.execute("UPDATE execution_leases SET expires_at=?"
+                 " WHERE id=?", ("2000-01-01T00:00:00+00:00", lease))
+    conn.commit()
+    assert leases_lib.reclaim_expired_probes(conn) == 1
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-f12-r", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created, err
+    conn.close()

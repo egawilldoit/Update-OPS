@@ -33,7 +33,7 @@ from .. import units as _units
 from ..config import settings
 from ..db import connect, validate_schema
 from ..jobs import (NONTERMINAL, claim_with_nonce, expire_stale_accepted)
-from ..owner_probes import (CONTENDING_OPS, claim_probe, expire_probes,
+from ..owner_probes import (claim_probe, expire_probes,
                             finish_probe)
 from ..schemas import utcnow_iso
 from ..tx import TxError, transition_tx
@@ -43,6 +43,13 @@ LOCK_PATH = os.path.join(
     or "/var/lib/ega-update", "worker.lock")
 POLL_INTERVAL_S = 2
 LAUNCH_PROVE_TIMEOUT_S = 10
+# F12 lease/TTL relationship (explicit, guarded by test): a supervised
+# probe op runs at most PROBE_OP_TIMEOUT_S while its probe lease lives
+# leases.PROBE_LEASE_TTL_S (180s). The 60s margin guarantees a
+# long-running read can never outlive its exclusion lease; the worker
+# backstop (deadline+300s alarm) bounds only crash cleanup, and a lease
+# that somehow expires mid-probe is reclaimed without touching mutation
+# leases (the mutation side re-checks inside its own transaction).
 PROBE_OP_TIMEOUT_S = 120
 HEARTBEAT_FILENAME = "dispatcher.heartbeat"
 RETENTION_STAMP = "retention.lastdate"
@@ -300,12 +307,16 @@ def run_probe_queue(conn):
             op = str(req["op"] or "")
         except Exception:
             continue
-        defer = False
-        if op in CONTENDING_OPS:
-            try:
-                defer = active_job(conn) is not None
-            except Exception:
-                defer = True
+        # F12: EVERY installation read holds a probe lease while touching
+        # the installation (INSTALLATION_READ_OPS == all current ops).
+        # Fast path first: an active mutation defers without taking a
+        # lease; then the atomic lease acquire closes the residual race
+        # (a mutation admitted between the check and the acquire makes
+        # the acquire fail and the probe defers).
+        try:
+            defer = active_job(conn) is not None
+        except Exception:
+            defer = True
         if defer:
             try:
                 finish_probe(conn, req_id, "deferred", {})
@@ -313,24 +324,20 @@ def run_probe_queue(conn):
                 pass
             done += 1
             continue
-        # N08: durable probe lease around the installation touch. The
-        # atomic acquire fails when a mutation lease is held, closing
-        # the check-then-act race between this probe and reservation.
         lease_id = None
-        if op in CONTENDING_OPS:
+        try:
+            from ..leases import acquire_probe_lease
+            lease_id = acquire_probe_lease(
+                conn, tool_id, "dispatcher-%d" % os.getpid())
+        except Exception:
+            lease_id = None
+        if not lease_id:
             try:
-                from ..leases import acquire_probe_lease, release_lease
-                lease_id = acquire_probe_lease(
-                    conn, tool_id, "dispatcher-%d" % os.getpid())
+                finish_probe(conn, req_id, "deferred", {})
             except Exception:
-                lease_id = None
-            if not lease_id:
-                try:
-                    finish_probe(conn, req_id, "deferred", {})
-                except Exception:
-                    pass
-                done += 1
-                continue
+                pass
+            done += 1
+            continue
         try:
             status, payload = _execute_probe_op(tool_id, op, req_id)
         except Exception as exc:

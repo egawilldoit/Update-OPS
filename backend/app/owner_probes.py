@@ -8,8 +8,17 @@ in a worker thread (never the event loop) and falls back to cached+stale.
 
 Ops: inspect | discover | activity | plan | verify | refresh
 (refresh = inspect+discover+activity+verify bundle for Check again).
-Contending ops (activity/plan/verify/refresh) are deferred while any
-nonterminal job exists — probes must not race mutation.
+
+Operation classification (F12) — exactly one authority:
+- CACHE_ONLY_OPS: pure dashboard reads needing no lease (none of the
+  current ops; reserved for future explicitly-safe reads).
+- INSTALLATION_READ_OPS: every op reading mutable installation, service,
+  or tool state (ALL current ops). Each acquires a bounded probe lease
+  before touching the installation; no installation read may overlap
+  mutation unless proven safe and documented here (none is).
+- MUTATION_OPS / MAINTENANCE_OPS: job reservation+mutation and drain
+  lifecycle (enforced via mutation leases + drain file, see leases.py
+  and admission.py).
 
 Tables live in migration 003; helpers tolerate their absence (return
 unavailable) so older DBs fail closed instead of crashing.
@@ -23,7 +32,14 @@ import uuid
 from typing import Any, Dict, Tuple
 
 OPS = ("inspect", "discover", "activity", "plan", "verify", "refresh")
-CONTENDING_OPS = ("activity", "plan", "verify", "refresh")
+CACHE_ONLY_OPS = ()  # type: tuple
+INSTALLATION_READ_OPS = ("inspect", "discover", "activity", "plan",
+                         "verify", "refresh")
+MUTATION_OPS = ("reserve", "mutate")
+MAINTENANCE_OPS = ("drain",)
+# Legacy alias: every installation read contends (F12 collapsed the old
+# narrow subset into INSTALLATION_READ_OPS).
+CONTENDING_OPS = INSTALLATION_READ_OPS
 
 
 def _utcnow():
