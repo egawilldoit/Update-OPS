@@ -80,5 +80,28 @@ Statuses: implemented-static only. No verified/accepted/passed.
 
 Cleanup disposition:
 - duplicate `_prove_launch`: removed (single implementation kept).
-- transient unit/documentation parity: `owner_env.build_transient_cmd` (+ scope names) is the single source; both templates match (KillMode/Restart/env/wd/interpreter/job+nonce); dispatch delegates; RUNBOOK already full-UUID.
+- transient unit/documentation parity: `owner_env.build_transient_cmd` (+ scope names, env fingerprint) is the single source; both templates match (KillMode/Restart/env/wd/interpreter/job+nonce); dispatch delegates; RUNBOOK already full-UUID.
 - atomic claim deadline: single-statement predicate (`claim_deadline>now`, empty refuses); Python pre-read removed.
+
+# Final static integration corrections (F01–F16, this pass)
+
+Statuses: implemented-static only. No verified/accepted/passed.
+
+| ID | Root-cause fix | Files | Regression tests |
+| --- | --- | --- | --- |
+| F01 | One canonical hash view (`_hash_view` at build and load); fixture repair removed | `plans.py`, `tests/support.py` | `test_final_integration.py` F01 block (2) |
+| F02 | Terminal state decoupled from ownership; `tx.release_ownership` after quiescence proof; no opportunistic release; sweep covers terminal-held-lease rows | `tx.py`, `leases.py`, `runner.py`, `receipts.py`, `dispatch.py`, `reconcile.py`, `quiescence.py` | F02 block (5) |
+| F03 | `OwnerExecutionContract` (uid/gid/user/home/path/config/release/venv/node/bus/locale/nnp/scope/authority); contract env for probes+phases; worker parity proof; templates parity | `owner_env.py`, `phase_run.py`, `runner.py`, `dispatch.py`, templates | F03 block (4) |
+| F04 | Strict exits, explicit outcome vocabulary, cleanup/recovery/checks agreement, no weakening, build-time strictness | `receipts.py` | F04 block (2) |
+| F05 | Full cumulative structural contracts; proof-gated inference; complete verification | `db.py` | F05 block (5) |
+| F06 | Checkout-based bootstrap (`REPO_ROOT`); no candidate dependency | `install.sh`, `upgrade.sh` | deploy bootstrap tests |
+| F07 | `deploy/etc/quiescence-check.py` version-independent controller; scripts consume exits | `quiescence-check.py`, scripts | deploy bootstrap tests |
+| F08 | Detection after trusted config parse; unparsable config blocks | `install.sh` | deploy bootstrap tests |
+| F09 | Controller-only quiescence; direct-stop fallback removed | `install.sh`, `upgrade.sh` | deploy bootstrap tests |
+| F10 | Coherent interpreter+CWD+source tuples; no ambient fallback | `upgrade.sh` | deploy bootstrap tests |
+| F11 | Worker evidence flags + durability result; secret gate; coordinator mapping; central events | `phase_run.py`, `runner.py`, `events.py`, `dispatch.py`, `reconcile.py` | F11 block (7) |
+| F12 | Operation classification; leases for all installation reads; explicit TTL/deadline margin | `owner_probes.py`, `dispatch.py` | F12 block (4) |
+| F13 | Typed CLI detail preserved (no Python-repr stringification) | `cli.py` | F13 test |
+| F14 | Plan/tool resolved before probe enqueue (no repair UPDATE) | `cli.py` | F14 test |
+| F15 | Immutable staging + digest + validate + re-verify + extract staged + digest record | `install.sh`, `upgrade.sh` | F15 test |
+| F16 | Stale architecture sweep (docstring, dead flag, source-scan test) | `runner.py`, tests | F16 test |

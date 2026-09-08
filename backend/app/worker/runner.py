@@ -15,29 +15,34 @@ Rules honored:
   ack), disk floor, git cleanliness, install-method support, and backup
   capability; refreshes jobs.before_version from the live inspect version
   (H-02). Any failure yields blocked with a reason; files/Git stay intact.
-- Backup runs via adapter.backup; failure blocks before mutation.
-- Execute runs via adapter.execute under the runner-owned hard deadline. Any
-  timeout (thread deadline, ProcResult.timed_out, ExecuteResult.timed_out, or
-  error_code=='timeout') funnels into the hard-timeout path: SIGTERM/SIGKILL
-  the tree, best-effort ``systemctl --user stop/kill`` of the runner's own
-  unit, /proc survivor verification, bounded read-only recovery checks, then
-  terminal failed/interrupted + recovery_required whenever completion is not
-  fully proved.
-- Verify runs via adapter.verify. Installer nonzero exit yields failed even
-  when the old version stays healthy. Zero exit plus mandatory check failure
-  yields health_failed. Exact-target plans (target_mode=='exact') yield
-  health_failed/exact_target_mismatch when after_version != plan target,
-  regardless of adapter opinion. Missing required verification never yields
-  success.
-- stdout/stderr stream through redaction.StreamRedactor with per-job sequence
-  numbers starting at 1, JSONL flush at least every second, and a 20 MiB/job
-  cap (persisting stops but pipes keep draining, with the unchanged
-  truncation marker). A partial final record after a crash is tolerated. A
-  persisted redacted completion receipt (receipts.build_receipt) is required;
-  success is never returned without durable evidence: JobLog, check, and
-  receipt write failures set a sticky flag that finalize maps to
-  interrupted/storage_failure.
-- A DB write failure before mutation blocks. During execution the redacted
+- Backup runs in a supervised phase worker; failure blocks before mutation.
+- Execute runs in a supervised phase worker (phase_run) inside a
+  coordinator-owned transient scope under the plan step deadline. Any
+  timeout (coordinator deadline, adapter timeout report, or
+  error_code=='timeout') funnels into the hard-timeout path: the scope
+  cgroup is killed (never the coordinator's own unit), quiescence is
+  proven, delegated services are inspected, bounded read-only recovery
+  checks run, then terminal failed/interrupted + recovery_required
+  whenever completion is not fully proved. No supervised worker Python
+  survives a declared timeout.
+- Verify runs in a supervised phase worker. Installer nonzero exit yields
+  failed even when the old version stays healthy. Zero exit plus mandatory
+  check failure yields health_failed. Exact-target plans
+  (target_mode=='exact') yield health_failed/exact_target_mismatch when
+  after_version != plan target, regardless of adapter opinion. Missing
+  required verification never yields success.
+- stdout/stderr stream live from the phase worker's sanitized stream file
+  with per-job sequence numbers starting at 1, JSONL flush at least every
+  second, and a 20 MiB/job cap (persisting stops but pipes keep draining,
+  with the unchanged truncation marker). A partial final record after a
+  crash is tolerated. A persisted bound completion receipt
+  (receipts.build_receipt v2) is required; success is never returned
+  without durable evidence: JobLog, check, and receipt write failures set
+  a sticky flag that finalize maps to interrupted/storage_failure.
+- Terminal state is operation outcome only: the runner never releases
+  mutation ownership (F02). The dispatcher/SSH reconciler disposes the
+  mutation lease after proving execution quiescence.
+- A DB write failure before mutation blocks. During execution the bound
   receipt is preserved where possible and recovery_required is marked after
   reconciliation. No retry, no browser cancellation.
 
@@ -373,7 +378,6 @@ class Runner(object):
         self.verify_passed = False
         # Guarded-transition cursor (R05): every _set_state expects this.
         self._known_state = "accepted"
-        self._cancel = threading.Event()
         self._release_path = ""
         self._before_commit = ""
         self._after_commit = ""
@@ -1760,7 +1764,8 @@ class Runner(object):
         if not pre_ok:
             self._event("preflight blocked: %s %s" % (pre_code, pre_detail))
             return self._finish("blocked", EXIT_BLOCKED, pre_code, pre_detail)
-        # Persist the fresh before-version on the caller thread.
+        # Persist the fresh before-version (coordinator-side write; the
+        # supervised collection worker never touches the database).
         try:
             if self._fresh_before and \
                     self._fresh_before != self.before_version:
@@ -2032,11 +2037,9 @@ class Runner(object):
     def _install_signal_handlers(self):
         # type: () -> None
         def _handle(signum, _frame):
+            # Cancellation flows to supervised phases via self._stop,
+            # passed as cancel_event (no separate flag; single model).
             self._stop.set()
-            try:
-                self._cancel.set()
-            except Exception:
-                pass
             try:
                 self._event("signal %d received; no retry, no browser cancel" % signum)
             except Exception:

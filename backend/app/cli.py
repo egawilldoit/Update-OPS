@@ -65,6 +65,20 @@ def _emit_envelope(tool, action, job_id="", state="", exit_mapped=0,
         detail = sanitize_json(detail, ())
     except Exception:
         detail = "detail withheld: sanitization failed"
+    # F13: preserve typed detail. After sanitization, allow JSON-safe
+    # dict/list/string/number/bool/null through untouched so machine
+    # readers (deploy quiescence) see real structure. Only stringify
+    # values that are not JSON-serializable — never a Python repr of a
+    # dict (quiescence responses must contain {"quiescent": ...}).
+    if isinstance(detail, (dict, list, str, int, float, bool)) or \
+            detail is None:
+        typed_detail = detail
+    else:
+        try:
+            json.dumps(detail)
+            typed_detail = detail
+        except Exception:
+            typed_detail = str(detail)
     payload = {
         "schema_version": 1,
         "tool": tool or "",
@@ -73,7 +87,7 @@ def _emit_envelope(tool, action, job_id="", state="", exit_mapped=0,
         "state": state or "",
         "exit_code_mapped": int(exit_mapped),
         "error_code": error_code or "",
-        "detail": detail if isinstance(detail, str) else str(detail),
+        "detail": typed_detail,
         "ts": _utcnow(),
     }
     try:
@@ -231,42 +245,45 @@ def cmd_apply(args):
         # (dispatcher canonical env — never this SSH login environment).
         from .admission import admit
         from .owner_probes import await_probe, enqueue_probe
+        # F14: resolve plan/tool/subject FIRST, then enqueue one complete
+        # probe request. The dispatcher must never observe a visible row
+        # with an empty tool id that a later UPDATE repairs.
+        try:
+            _plan_probe = conn.execute(
+                "SELECT tool_id, subject FROM plans WHERE id=?",
+                (plan_id,)).fetchone()
+        except Exception:
+            _plan_probe = None
+        if _plan_probe is None:
+            _emit_envelope(args.tool, "apply", error_code="invalid_request",
+                           detail="unknown plan",
+                           exit_mapped=EXIT_INVALID)
+            return EXIT_INVALID
+        try:
+            _tool_probe = str(dict(_plan_probe).get("tool_id", "") or "")
+            _plan_subject = str(dict(_plan_probe).get("subject", "") or "")
+        except Exception:
+            _tool_probe, _plan_subject = "", ""
+        if args.tool and _tool_probe and args.tool != _tool_probe:
+            _emit_envelope(args.tool, "apply", error_code="invalid_request",
+                           detail="tool/plan mismatch",
+                           exit_mapped=EXIT_INVALID)
+            return EXIT_INVALID
         try:
             subject = ",".join(
-                getattr(settings, "owner_emails", []) or [])
-            if not subject:
-                _prow = conn.execute(
-                    "SELECT subject FROM plans WHERE id=?",
-                    (plan_id,)).fetchone()
-                subject = str(dict(_prow).get("subject", "")) \
-                    if _prow else ""
+                getattr(settings, "owner_emails", []) or []) \
+                or _plan_subject
         except Exception:
-            subject = ""
+            subject = _plan_subject
         try:
-            request_id = enqueue_probe(conn, subject, "", "inspect")
+            request_id = enqueue_probe(conn, subject, _tool_probe,
+                                       "inspect")
         except Exception:
             request_id = ""
         _fp_status, _fp_payload = ("error", {})
-        _tool_probe = ""
         if request_id:
-            try:
-                plan_probe = conn.execute(
-                    "SELECT tool_id FROM plans WHERE id=?",
-                    (plan_id,)).fetchone()
-                _tool_probe = str(dict(plan_probe).get("tool_id", "")
-                                  ) if plan_probe else ""
-            except Exception:
-                _tool_probe = ""
-            if _tool_probe:
-                try:
-                    conn.execute(
-                        "UPDATE probe_requests SET tool_id=? WHERE id=?",
-                        (_tool_probe, request_id))
-                    conn.commit()
-                except Exception:
-                    pass
-                _fp_status, _fp_payload = await_probe(
-                    conn, request_id, timeout_s=30.0)
+            _fp_status, _fp_payload = await_probe(
+                conn, request_id, timeout_s=30.0)
         if _fp_status != "ok":
             _emit_envelope(args.tool, "apply", error_code="unavailable",
                            detail="installation revalidation unavailable",

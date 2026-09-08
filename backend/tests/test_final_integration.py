@@ -7,6 +7,7 @@ mocked away. Python 3.10 compatible, pytest style, stdlib + backend.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import uuid
@@ -518,6 +519,140 @@ def test_f05_partial_004_not_inferred_then_completed(tmp_path):
         conn.execute("PRAGMA table_info(plans)").fetchall()}
     assert db_lib.migrate(conn) == db_lib.CODE_VERSION
     conn.close()
+
+
+# -- F13 typed CLI detail ------------------------------------------------------
+
+def test_f13_cli_detail_stays_typed():
+    """Quiescence envelopes keep detail as a JSON object (F13): no
+    Python-repr stringification of machine-readable payloads."""
+    import io as _io
+    import contextlib as _ctx
+    from backend.app import cli as cli_lib
+
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        cli_lib._emit_envelope(
+            "", "status", state="blocked", error_code="not_quiescent",
+            detail={"quiescent": False, "reasons": ["busy"],
+                    "count": 2, "ok": True, "nothing": None},
+            exit_mapped=3)
+    payload = json.loads(buf.getvalue())
+    detail = payload["detail"]
+    assert isinstance(detail, dict), type(detail)
+    assert detail["quiescent"] is False
+    assert detail["reasons"] == ["busy"]
+    assert detail["count"] == 2 and detail["ok"] is True
+    assert detail["nothing"] is None
+    # Failure path still collapses to the fixed safe string.
+    buf2 = _io.StringIO()
+    with _ctx.redirect_stdout(buf2):
+        cli_lib._emit_envelope("", "status", detail=object(),
+                               exit_mapped=0)
+    assert isinstance(json.loads(buf2.getvalue())["detail"], str)
+
+
+# -- F14 complete probe enqueue --------------------------------------------------
+
+def test_f14_unknown_plan_creates_no_probe_row(tmp_path):
+    """Plan/tool resolution precedes enqueue (F14): an unknown plan is
+    refused without leaving a visible incomplete probe request behind."""
+    import types as _types
+    from backend.app import cli as cli_lib
+    from backend.app.config import settings as settings_lib
+
+    conn = _fresh_db(tmp_path)
+    conn.close()
+    args = _types.SimpleNamespace(
+        tool="", plan_id=str(uuid.uuid4()), ack=False,
+        idempotency_key="k-f14", wait_secs=0, db_path="")
+    # Minimal seam: point settings at the test DB without touching prod.
+    old_db = settings_lib.db_path
+    settings_lib.db_path = str(tmp_path / "f.db")
+    try:
+        rc = cli_lib.cmd_apply(args)
+    finally:
+        settings_lib.db_path = old_db
+    assert rc == cli_lib.EXIT_INVALID
+    check = db_lib.connect(str(tmp_path / "f.db"))
+    try:
+        rows = check.execute("SELECT * FROM probe_requests").fetchall()
+        assert list(rows) == []
+    finally:
+        check.close()
+
+
+# -- F15 immutable staging order -------------------------------------------------
+
+def test_f15_stage_digest_validate_reextract_order():
+    """Deploy scripts implement stage → digest → validate → re-verify →
+    extract on the staged copy (F15 TOCTOU safety), and record the
+    candidate digest."""
+    for name in ("install.sh", "upgrade.sh"):
+        path = os.path.join(_REPO_ROOT, "deploy", "scripts", name)
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        stage = text.find("STAGED_ARCHIVE")
+        assert stage != -1, name
+        digest = text.find("CANDIDATE_SHA256")
+        assert digest > stage, name
+        validate = text.find("validate-archive.py")
+        assert validate > stage, name
+        first_extract = text.find("tar -xzf")
+        assert first_extract > validate, name
+        # Extraction consumes the staged copy, never the operator path.
+        assert "tar -xzf \"$STAGED_ARCHIVE\"" in text, name
+        assert "tar -xzf \"$TARBALL\"" not in text, name
+        # Digest is re-verified after validation, before extraction.
+        reverify = text.find("changed after validation")
+        assert reverify != -1 and reverify < first_extract, name
+        # Candidate digest is bound into the release metadata.
+        assert "CANDIDATE_SHA256" in text, name
+
+
+# -- F16 no stale architecture -----------------------------------------------------
+
+def test_f16_no_stale_runtime_references():
+    """Removed mechanisms leave no live references in runtime code
+    (F16): single admission path, reconciler-owned release, supervised
+    phases, full-UUID units."""
+    import re as _re
+
+    roots = [os.path.join(_REPO_ROOT, "backend", "app"),
+             os.path.join(_REPO_ROOT, "scripts")]
+    banned = ("reserve_job(", "release_mutation", "_call_in_thread",
+              "terminate_tree(", "_unit_active(", "shortid")
+    hits = []
+    for root in roots:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.endswith((".py", ".sh")) \
+                        and "agent-update" not in filename:
+                    continue
+                if "agent-update" in filename and \
+                        not filename.endswith((".sh",)):
+                    # agent-update has no extension; check it too.
+                    pass
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        text = fh.read()
+                except OSError:
+                    continue
+                for marker in banned:
+                    for match in _re.finditer(_re.escape(marker), text):
+                        line = text.count("\n", 0, match.start()) + 1
+                        hits.append("%s:%d:%s" % (path, line, marker))
+    # agent-update (extensionless) is covered explicitly.
+    agent = os.path.join(_REPO_ROOT, "scripts", "agent-update")
+    try:
+        with open(agent, "r", encoding="utf-8") as fh:
+            agent_text = fh.read()
+        for marker in banned:
+            assert marker not in agent_text, marker
+    except OSError:
+        pass
+    assert hits == [], hits
 
 
 # -- F11 phase evidence durability -------------------------------------------------
