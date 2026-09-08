@@ -442,9 +442,12 @@ def test_log_cursor_pagination_ordering(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_lib, "log_dir", log_dir)
     monkeypatch.setattr(settings_lib, "per_job_log_cap_bytes",
                         20 * 1024 * 1024)
-    # No secrets file in tmp: redaction falls back to patterns only.
-    monkeypatch.setattr(settings_lib, "secrets_file",
-                        str(tmp_path / "missing-secrets.env"))
+    # G05: an explicit secrets file (patterns still apply to these
+    # secret-free lines; a missing source would fail closed instead).
+    _secrets_path = str(tmp_path / "test-secrets.env")
+    with open(_secrets_path, "w", encoding="utf-8") as _sfh:
+        _sfh.write("TEST_DUMMY_SECRET_KEY=dummy-secret-value-12345\n")
+    monkeypatch.setattr(settings_lib, "secrets_file", _secrets_path)
     job_id = str(uuid.uuid4())
     path = os.path.join(log_dir, job_id + ".jsonl")
     with open(path, "w", encoding="utf-8") as fh:
@@ -480,8 +483,11 @@ def test_log_truncation_marker_only(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_lib, "log_dir", log_dir)
     monkeypatch.setattr(settings_lib, "per_job_log_cap_bytes",
                         20 * 1024 * 1024)
-    monkeypatch.setattr(settings_lib, "secrets_file",
-                        str(tmp_path / "missing-secrets.env"))
+    # G05: explicit secrets file (a missing source would fail closed).
+    _secrets_path = str(tmp_path / "test-secrets.env")
+    with open(_secrets_path, "w", encoding="utf-8") as _sfh:
+        _sfh.write("TEST_DUMMY_SECRET_KEY=dummy-secret-value-12345\n")
+    monkeypatch.setattr(settings_lib, "secrets_file", _secrets_path)
     job_id = str(uuid.uuid4())
     path = os.path.join(log_dir, job_id + ".jsonl")
     with open(path, "w", encoding="utf-8") as fh:

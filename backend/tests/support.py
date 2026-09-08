@@ -28,6 +28,24 @@ def test_release_root():
     return path
 
 
+def use_test_secrets(monkeypatch, tmp_path, name="test-secrets.env"):
+    # type: (...) -> str
+    """Provision an explicit secrets file for tests that exercise
+    transactional/secret-loading paths (G05 strictness).
+
+    Without this, tx.transition_tx / release_ownership / receipts /
+    JobLog fail closed on the missing default secrets path — by design.
+    Returns the secrets file path.
+    """
+    from backend.app.config import settings as settings_lib
+
+    path = str(tmp_path / name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("TEST_DUMMY_SECRET_KEY=dummy-secret-value-12345\n")
+    monkeypatch.setattr(settings_lib, "secrets_file", path)
+    return path
+
+
 def live_identities():
     # type: () -> tuple
     """(config_hash, release_path, env_fingerprint) from live helpers."""
