@@ -960,6 +960,84 @@ def test_g01_no_duplicated_adapter_gate_comment():
     assert len(hits) <= 1, hits
 
 
+# -- G04 privilege profile truth ---------------------------------------------------
+
+def test_g04_privilege_fields_in_fingerprint():
+    """The execution fingerprint binds the actual privilege profile:
+    flipping any privilege field changes it (F04)."""
+    from backend.app.owner_env import (build_owner_contract,
+                                       contract_fingerprint)
+
+    support_lib.test_release_root()
+    baseline = contract_fingerprint(build_owner_contract(None))
+    assert baseline
+    contract = build_owner_contract(None)
+    assert contract.get("runner_no_new_privileges") == "false"
+    assert contract.get("scope_no_new_privileges") == "false"
+    assert contract.get("privilege_profile") == "owner-exec-nnp-off"
+    for key, value in (("runner_no_new_privileges", "true"),
+                       ("scope_no_new_privileges", "true"),
+                       ("privilege_profile", "owner-exec-nnp-on")):
+        altered = dict(contract)
+        altered[key] = value
+        assert contract_fingerprint(altered) not in ("", baseline), key
+
+
+def test_g04_launch_argv_matches_fingerprint():
+    """The canonical launch argv states NoNewPrivileges=no, matching the
+    fingerprinted contract value (one source of truth, F04)."""
+    from backend.app.owner_env import (TRANSIENT_RUNNER_PROPERTIES,
+                                       build_owner_contract,
+                                       build_transient_cmd,
+                                       contract_env)
+
+    support_lib.test_release_root()
+    contract = build_owner_contract(None)
+    assert dict(TRANSIENT_RUNNER_PROPERTIES).get("NoNewPrivileges") == "no"
+    env = contract_env(contract, nonce="n-g04")
+    cmd = build_transient_cmd("ega-update-job-abc.service", "/rel", env,
+                              "/rel/venv/bin/python", "job-id", "n-g04")
+    assert "--property=NoNewPrivileges=no" in cmd
+    assert contract.get("runner_no_new_privileges") == "false"
+
+
+def test_g04_probe_apply_share_privilege_profile():
+    """Probe scopes and runner units launch from the same contract env
+    keys: no profile divergence between preview and apply (F04)."""
+    import inspect
+    from backend.app.owner_env import TRANSIENT_SETENV_KEYS
+    from backend.app.worker import phase_run as phase_run_lib
+
+    scope_src = inspect.getsource(phase_run_lib._scope_argv)
+    assert "TRANSIENT_SETENV_KEYS" in scope_src
+    for key in ("PATH", "HOME", "USER", "XDG_RUNTIME_DIR",
+                "DBUS_SESSION_BUS_ADDRESS"):
+        assert key in TRANSIENT_SETENV_KEYS, key
+
+
+def test_g04_hermes_profile_is_possible():
+    """The claimed combination must be executable: NNP-off job
+    execution plus the narrow Hermes sudo path — never NNP-on together
+    with a sudo requirement (F04)."""
+    from backend.app.owner_env import build_owner_contract
+
+    support_lib.test_release_root()
+    contract = build_owner_contract(None)
+    assert contract.get("runner_no_new_privileges") == "false"
+    hermes_path = os.path.join(_REPO_ROOT, "backend", "app", "adapters",
+                               "hermes.py")
+    with open(hermes_path, "r", encoding="utf-8") as fh:
+        hermes_src = fh.read()
+    assert "sudo" in hermes_src and "restart" in hermes_src
+    for template in ("systemd/ega-update-runner@.service",
+                     "systemd/user/ega-update-runner@.service"):
+        with open(os.path.join(_REPO_ROOT, template), "r",
+                  encoding="utf-8") as fh:
+            template_src = fh.read()
+        assert "NoNewPrivileges=true" not in template_src, template
+        assert "NoNewPrivileges=no" in template_src, template
+
+
 # -- G02/G03 quiescence-ordered reconciliation -----------------------------------
 
 def _stopped_units(monkeypatch, live=(), unknown=(), stopped_extra=()):

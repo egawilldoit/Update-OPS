@@ -14,6 +14,7 @@
 #     LC_ALL, LC_CTYPE, TZ — identical keys for probes and phases) \
 #     --property=KillMode=control-group \
 #     --property=Restart=no \
+#     --property=NoNewPrivileges=no \
 #     <release-venv-python> -m backend.app.worker.runner <job-id> <nonce>
 #
 # where <job-id> is the full job UUID and <nonce> is the attempt claim token
@@ -30,11 +31,13 @@
 #
 # Cgroup containment: updater descendants remain in the job's cgroup.
 # - Runner crash: systemd terminates remaining cgroup processes; the
-#   dispatcher/worker reconciles unit state and records `interrupted`
+#   dispatcher reconciles unit state and records `interrupted`
 #   unless a persisted completion receipt proves the outcome.
-# - Hard timeout: the runner terminates the job cgroup gracefully
-#   (SIGTERM), then forcibly (SIGKILL) after the configured grace period;
-#   records possible partial installation + bounded recovery checks.
+# - Hard timeout: the coordinator kills the supervised phase scope
+#   cgroup (SIGTERM, grace, SIGKILL), proves it empty, runs bounded
+#   recovery checks, then terminalizes failed/interrupted + recovery
+#   whenever completion is not fully proved. The coordinator itself is
+#   never inside the killed scope.
 #   No retry, no browser cancellation in V1.
 #
 # TimeoutStopSec below bounds graceful stop of the runner itself; per-step
@@ -67,5 +70,13 @@ TimeoutStopSec=60
 # One-shot jobs must not restart: an exited runner is reconciled, never
 # re-executed (API/dispatcher restart resumes observation only).
 Restart=no
-NoNewPrivileges=true
+# F04 privilege truth: job execution runs WITHOUT NoNewPrivileges so the
+# inventoried Hermes sudo path (`sudo -n systemctl restart <unit>` under
+# the narrow sudoers allow-list in deploy/etc/sudoers.d/) can elevate.
+# no_new_privs would ignore setuid and break every Hermes system-unit
+# restart. The API/worker services (which never elevate) keep
+# NoNewPrivileges=true; only job execution is NNP-off, and the owner
+# contract fingerprint binds runner_no_new_privileges=false (plus
+# privilege_profile=owner-exec-nnp-off) so any change invalidates plans.
+NoNewPrivileges=no
 PrivateTmp=true

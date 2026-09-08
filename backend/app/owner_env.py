@@ -284,7 +284,18 @@ def build_owner_contract(settings=None, inventory=None, release_path="",
         "lc_all": str(environ.get("LC_ALL", "") or ""),
         "lc_ctype": str(environ.get("LC_CTYPE", "") or ""),
         "tz": str(environ.get("TZ", "") or ""),
-        "no_new_privileges": "true",
+        # F04 privilege truth: job execution runs WITHOUT
+        # NoNewPrivileges so the inventoried Hermes sudo path
+        # (`sudo -n systemctl restart <unit>` under the narrow
+        # sudoers allow-list) can elevate. With no_new_privs set,
+        # setuid elevation is blocked and every Hermes system-unit
+        # restart would fail. The API/worker services (which never
+        # elevate) keep NoNewPrivileges=true; only job execution —
+        # transient runner units and phase scopes — is NNP-off. The
+        # fingerprint describes this reality, not the reverse.
+        "runner_no_new_privileges": "false",
+        "scope_no_new_privileges": "false",
+        "privilege_profile": "owner-exec-nnp-off",
         "manager_scope": "user",
         "config_identity": str(config_id or ""),
         "sudo_profile": _sudo_profile_id(inventory),
@@ -428,6 +439,13 @@ def env_fingerprint(env):
 TRANSIENT_RUNNER_PROPERTIES = (
     ("KillMode", "control-group"),
     ("Restart", "no"),
+    # F04: explicit NoNewPrivileges=no. The default is already off, but
+    # the fingerprint binds runner_no_new_privileges=false, so the
+    # launch argv states it outright: job execution must be able to use
+    # the inventoried Hermes sudo path, which no_new_privs would block
+    # (setuid elevation ignored -> sudo fails -> every Hermes system
+    # restart becomes BLOCKED_RESTART_AUTHORITY). Templates mirror this.
+    ("NoNewPrivileges", "no"),
 )
 
 TRANSIENT_SETENV_KEYS = (

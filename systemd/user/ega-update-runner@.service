@@ -18,6 +18,7 @@
 #     LC_ALL, LC_CTYPE, TZ — identical keys for probes and phases) \
 #     --property=KillMode=control-group \
 #     --property=Restart=no \
+#     --property=NoNewPrivileges=no \
 #     <release-venv-python> -m backend.app.worker.runner <job-id> <nonce>
 #
 # where <job-id> is the full job UUID and <nonce> is the attempt claim token
@@ -45,7 +46,15 @@ KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 TimeoutStopSec=60
 Restart=no
-NoNewPrivileges=true
+# F04 privilege truth: job execution runs WITHOUT NoNewPrivileges so the
+# inventoried Hermes sudo path (`sudo -n systemctl restart <unit>` under
+# the narrow sudoers allow-list in deploy/etc/sudoers.d/) can elevate.
+# no_new_privs would ignore setuid and break every Hermes system-unit
+# restart. The API/worker services (which never elevate) keep
+# NoNewPrivileges=true; only job execution is NNP-off, and the owner
+# contract fingerprint binds runner_no_new_privileges=false (plus
+# privilege_profile=owner-exec-nnp-off) so any change invalidates plans.
+NoNewPrivileges=no
 PrivateTmp=true
 
 [Install]
