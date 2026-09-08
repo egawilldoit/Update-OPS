@@ -481,13 +481,19 @@ def test_n09_fingerprint_stable_and_release_sensitive(tmp_path):
     assert a != c
 
 
-def test_n09_changed_env_invalidates_plan(tmp_path):
+def test_n09_changed_env_invalidates_plan(tmp_path, monkeypatch):
+    """True runtime drift: the stored plan stays valid/untouched while
+    the CURRENT environment fingerprint changes (T02). Tampering the
+    row instead would (correctly) yield stale_plan — that is TRACE 8,
+    not TRACE 7."""
+    from backend.app import owner_env as owner_env_lib
+
     conn = _fresh_db(tmp_path)
     support_lib.test_release_root()
     row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
-    conn.execute("UPDATE plans SET env_fingerprint=? WHERE id=?",
-                 ("stale-env", row["id"]))
-    conn.commit()
+    monkeypatch.setattr(
+        owner_env_lib, "canonical_fingerprint",
+        lambda *args, **kwargs: "drifted-env-fingerprint")
     jid, created, err = admit_lib(
         conn, "owner@example.invalid", "k-n09", row["id"], False,
         "fp-test-1", True, False)
@@ -630,8 +636,10 @@ def test_n15_plan_consume_atomic_rollback(tmp_path):
             self._real = real
 
         def execute(self, sql, params=()):
-            if isinstance(sql, str) and sql.strip().upper().startswith(
-                    "UPDATE plans SET used_at"):
+            # T01: normalize BOTH sides (see H01 rollback test).
+            normalized = sql.strip().upper() \
+                if isinstance(sql, str) else ""
+            if normalized.startswith("UPDATE PLANS SET USED_AT"):
                 raise sqlite3.OperationalError("injected plan failure")
             return self._real.execute(sql, params)
 
@@ -709,7 +717,13 @@ def test_n16_no_inline_config_parsers_in_scripts():
             text = fh.read()
         assert "python3 -c 'import json" not in text, name
         assert "python -c 'import json" not in text, name
-        assert "config_cli get" in text, name
+        # N16 (T04): config reads go through the canonical config CLI
+        # — directly (`config_cli get`) or via the cfg_cli wrapper
+        # whose body delegates to backend.app.config_cli. The literal
+        # spelling of the call site is not the contract; the chain is.
+        assert "backend.app.config_cli" in text, name
+        assert "config_cli get" in text or "cfg_cli get" in text, \
+            name
 
 
 def _write_tar(path, members):

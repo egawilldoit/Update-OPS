@@ -223,7 +223,8 @@ def test_jwt_malformed_and_bad_alg_rejected(monkeypatch):
                         "exp": int(time.time()) + 600,
                         "iss": "https://team.example",
                         "aud": "aud-1"},
-                       "insecure-secret", algorithm="HS256")
+                       "insecure-secret-synthetic-32B-minimum",
+                       algorithm="HS256")
     if isinstance(tok, bytes):
         tok = tok.decode("utf-8")
     claims, err = auth_lib.validate_access_token(

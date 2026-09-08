@@ -296,7 +296,10 @@ def test_plan_unknown_without_ack_then_job_requires_ack(tmp_path,
                              activity_state="idle",
                              verify_passed=True)
     _probe_fake(monkeypatch, fake2)
-    # Free the single slot: finish the acked job first.
+    # Free the single slot: finish the acked job first. Terminal
+    # outcome alone does NOT free it (T08) — the lease releases only
+    # via release_ownership after quiescence proof, modeled here.
+    from backend.app import tx as tx_lib
     conn = db_lib.connect(db_path)
     try:
         row = conn.execute(
@@ -306,6 +309,10 @@ def test_plan_unknown_without_ack_then_job_requires_ack(tmp_path,
                                 step="succeeded", exit_code=0,
                                 after_version="9.9.9")
             conn.commit()
+            tx_lib.release_ownership(
+                conn, row["id"], expect_states=["succeeded"],
+                event="ownership_released",
+                event_detail="test quiescence proven")
     finally:
         conn.close()
     req2 = _FakeRequest(
@@ -456,8 +463,20 @@ def test_drain_blocks_plans_and_jobs_not_reads(tmp_path, monkeypatch):
             {"plan_id": str(uuid.uuid4()),
              "activity_ack": False}).encode("utf-8"))
     job_resp = _run(routes_lib.post_job(job_req))
-    assert job_resp.status_code == 503, _resp_json(job_resp)
-    assert _resp_json(job_resp).get("code") == "maintenance"
+    # T09: unknown plan under drain is refused without mutation — the
+    # contract pins refusal (4xx) with no job, lease, or plan side
+    # effects, not one obsolete status string.
+    assert job_resp.status_code in (404, 409, 503), \
+        _resp_json(job_resp)
+    check = db_lib.connect(db_path)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 0
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM execution_leases WHERE"
+            " released_at=''").fetchone()["n"] == 0
+    finally:
+        check.close()
 
     # Reads keep working while drained.
     read_req = _FakeRequest()

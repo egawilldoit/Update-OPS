@@ -129,7 +129,7 @@ def test_sanitizer_pem_split_across_feeds():
     assert out1 == ["start"]
     out2 = stream.feed(b"BBB\n-----END RSA PRIVATE KEY-----\nend\n")
     blob = "\n".join(out2)
-    assert "***REDACTED***" in blob
+    assert sanitize_lib.SUPPRESSED_MARKER in blob
     assert "AAA" not in blob and "BBB" not in blob
 
 
@@ -155,8 +155,11 @@ def test_sanitizer_secrets_before_truncation():
     stream = sanitize_lib.SanitizingStream((secret,), max_line=16)
     out = stream.feed(("prefix-%s-suffix\n" % secret).encode("utf-8"))
     blob = "\n".join(out)
+    # Redaction precedes truncation: the secret never appears, the
+    # replacement visibly starts, then the line cap marker applies.
     assert secret not in blob
-    assert "***REDACTED***" in blob
+    assert sanitize_lib.REPLACEMENT[:10] in blob
+    assert "[truncated-line]" in blob
 
 
 def test_sanitizer_invalid_utf8_fails_closed():

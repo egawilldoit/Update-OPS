@@ -154,7 +154,7 @@ def test_canonical_launch_argv():
     assert "--setenv=EGA_ATTEMPT_NONCE=nonceABC" in cmd
     assert "--property=KillMode=control-group" in cmd
     assert "--property=Restart=no" in cmd
-    assert cmd[-4:] == ["/opt/ega-update/releases/abc/venv/bin/python",
+    assert cmd[-5:] == ["/opt/ega-update/releases/abc/venv/bin/python",
                         "-m", "backend.app.worker.runner",
                         job_id, "nonceABC"]
     assert not any("sudo" in part for part in cmd)
@@ -183,10 +183,17 @@ def test_claim_with_nonce_atomic_and_single_use(tmp_path):
     assert jobs_lib.claim_with_nonce(conn, job_id, "other-nonce") is False
     # Same-nonce retry also fails once claimed (state moved on).
     assert jobs_lib.claim_with_nonce(conn, job_id, nonce) is False
-    # Empty nonce never claims (terminate the first job to free the slot).
+    # Empty nonce never claims. Terminating the row alone does NOT
+    # free the slot (T08: terminal outcome is not quiescence) — the
+    # lease releases only via release_ownership after quiescence
+    # proof, which the test models explicitly here.
+    from backend.app import tx as tx_lib
     jobs_lib.transition(conn, job_id, "succeeded", step="succeeded",
                         exit_code=0, after_version="1.0.0")
     conn.commit()
+    tx_lib.release_ownership(conn, job_id, expect_states=["succeeded"],
+                             event="ownership_released",
+                             event_detail="test quiescence proven")
     job2 = _reserve(conn, idem_key="k-second")
     assert jobs_lib.claim_with_nonce(conn, job2, "") is False
     conn.close()
@@ -450,7 +457,7 @@ def test_adapter_timeout_funnels_to_hard_timeout(monkeypatch):
 
     def _fake_supervised(tool_id, job_id, phase, payload, timeout_s,
                          settings, log_dir, emit, op="",
-                         cancel_event=None):
+                         cancel_event=None, env=None):
         calls["phases"].append(phase)
         if phase == "execute":
             return False, {}, "phase deadline exceeded", True

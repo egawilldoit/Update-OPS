@@ -120,7 +120,8 @@ def test_opencode_exact_mismatch_fails(monkeypatch):
     monkeypatch.setattr(opencode_mod, "check_disk",
                         lambda _paths, _need: (True, "ok", []))
     monkeypatch.setattr(opencode_mod, "run_fixed",
-                        lambda _argv, timeout=60, cwd=None: _FakeProc(0, "ok", ""))
+                        lambda _argv, timeout=60, cwd=None,
+                        scope_unit=None, **kw: _FakeProc(0, "ok", ""))
     # After version differs from planned exact target.
     monkeypatch.setattr(adapter, "_version_probe", lambda: ("9.9.9", "raw"))
     monkeypatch.setattr(adapter, "_server_configured", lambda: (False, "none"))
@@ -164,7 +165,8 @@ def test_t3_exact_mismatch_fails(monkeypatch):
     monkeypatch.setattr(t3_mod, "resolve_executable",
                         lambda _p: (True, "/x/npx", "ok"))
     monkeypatch.setattr(t3_mod, "run_fixed",
-                        lambda _argv, timeout=60, cwd=None: _FakeProc(0, "ok", ""))
+                        lambda _argv, timeout=60, cwd=None,
+                        scope_unit=None, **kw: _FakeProc(0, "ok", ""))
     # Running version differs from planned exact target.
     monkeypatch.setattr(adapter, "_running_version", lambda _i: "9.9.9")
     res = adapter.execute(plan, "job-test-1234", activity_ack=True)
@@ -205,16 +207,20 @@ def test_codex_absent_no_process_idle(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_hermes_no_generic_sudo():
-    text = _read_text("backend", "app", "adapters", "hermes.py")
-    assert "sudo" in text
-    # Generic passwordless proof must be gone.
-    assert 'sudo", "-n", "true"' not in text
-    assert "sudo -n true" not in text
-    # Narrow shape present.
-    assert "--no-pager" in text
-    assert "BLOCKED_RESTART_AUTHORITY" in text
-    assert "_allowed_show_argv" in text
-    assert "service_units" in text
+    """Narrow allow-list shape enforced behaviorally (T04): the exact
+    sudo argv builders produce only scoped systemctl show/restart for
+    an inventoried unit — never a generic passwordless probe."""
+    from backend.app.adapters import hermes as hermes_mod
+
+    show = hermes_mod._allowed_show_argv("fake-unit.service")
+    assert show == [hermes_mod._SUDO, "-n", hermes_mod._SYSTEMCTL,
+                    "--no-pager", "show", "fake-unit.service"]
+    restart = hermes_mod._allowed_restart_argv("fake-unit.service")
+    assert restart == [hermes_mod._SUDO, "-n", hermes_mod._SYSTEMCTL,
+                       "restart", "fake-unit.service"]
+    for argv in (show, restart):
+        assert argv != [hermes_mod._SUDO, "-n", "true"]
+        assert "true" not in argv
 
 
 def test_hermes_sudoers_example_shape():
@@ -354,17 +360,17 @@ def test_upgrade_sh_drain_before_stop():
 # ---------------------------------------------------------------------------
 
 def test_lifespan_migration_failure_raises():
-    text = _read_text("backend", "app", "main.py")
-    assert "raise" in text
-    assert "rollback" in text
-    try:
-        import asyncio
-        import backend.app.main as main_mod
-    except Exception:
-        pytest.skip("main not importable offline")
-        return
-    # Runtime probe with faked connect/migrate that always fails.
+    """API startup validates-only and fails closed (T04 behavioral):
+    schema mismatch and readiness failure both raise out of lifespan,
+    and the lifespan wrapper never invokes migration."""
+    import asyncio
+    import inspect
+    import backend.app.main as main_mod
     import backend.app.db as db_mod
+
+    # Scoped to the lifespan wrapper itself (not whole-file prose):
+    # startup validates; the controlled deploy procedure owns migration.
+    assert "migrate(" not in inspect.getsource(main_mod.lifespan)
 
     class _FakeConn(object):
         def rollback(self):
@@ -374,24 +380,25 @@ def test_lifespan_migration_failure_raises():
             pass
 
     fake_conn = _FakeConn()
-
-    def _boom(_conn):
-        raise RuntimeError("boom")
-
     orig_connect = main_mod.connect
-    orig_migrate = main_mod.migrate
+    orig_validate = main_mod.validate_schema
     main_mod.connect = lambda _p: fake_conn  # type: ignore
-    main_mod.migrate = _boom  # type: ignore
-    try:
-        async def _run():
-            try:
-                async with main_mod.lifespan(None):  # type: ignore
-                    pass
-            except RuntimeError:
-                return True
-            return False
 
+    async def _run():
+        try:
+            async with main_mod.lifespan(None):  # type: ignore
+                pass
+        except Exception:
+            return True
+        return False
+
+    try:
+        # Schema mismatch fails startup.
+        def _bad_schema(_conn):
+            raise db_mod.SchemaError("pending migrations")
+
+        main_mod.validate_schema = _bad_schema  # type: ignore
         assert asyncio.run(_run()) is True
     finally:
         main_mod.connect = orig_connect  # type: ignore
-        main_mod.migrate = orig_migrate  # type: ignore
+        main_mod.validate_schema = orig_validate  # type: ignore

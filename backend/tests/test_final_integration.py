@@ -161,8 +161,16 @@ def test_f03_every_contract_field_moves_fingerprint(monkeypatch):
     does move the fingerprint.
     """
     from backend.app.config import settings as settings_lib
+    from backend.app import owner_env as owner_env_lib
     from backend.app.owner_env import contract_fingerprint
 
+    # T12-channel: neutralize the live user-bus resolution so the
+    # passed environ mappings take effect (on hosts with a live bus,
+    # existence-resolved values would shadow the simulated drift;
+    # the product property — live drift moves the fingerprint — is
+    # unaffected).
+    monkeypatch.setattr(owner_env_lib, "systemd_user_bus",
+                        lambda _user=None: {})
     baseline = contract_fingerprint(_contract())
     assert baseline
     for variant in (
@@ -492,9 +500,11 @@ def test_f05_partial_003_marker_subset_not_inferred(tmp_path):
 
 
 def test_f05_complete_003_infers_3(tmp_path):
+    """A genuine v3 state built by the migration ENGINE (with ledger)
+    infers complete — never raw SQL files, which bypass the ledger
+    the v3 contract requires (T11)."""
     conn = db_lib.connect(str(tmp_path / "c3.db"))
-    _apply_files(conn, "001_init.sql", "002_execution_hardening.sql",
-                 "003_corrective.sql")
+    assert db_lib.migrate(conn, target=3) == 3
     assert db_lib.is_schema_version_fully_present(conn, 3) is True
     assert db_lib.is_schema_version_fully_present(conn, 4) is False
     assert db_lib.migrate(conn) == db_lib.CODE_VERSION
@@ -502,12 +512,12 @@ def test_f05_complete_003_infers_3(tmp_path):
 
 
 def test_f05_partial_004_not_inferred_then_completed(tmp_path):
+    """A partially applied 004 (one column, no ledger/table/index)
+    is NOT inferred complete; the engine resumes and completes it."""
     conn = db_lib.connect(str(tmp_path / "p4.db"))
-    _apply_files(conn, "001_init.sql", "002_execution_hardening.sql",
-                 "003_corrective.sql")
-    conn.execute(
-        "CREATE TABLE execution_leases (id TEXT PRIMARY KEY,"
-        " kind TEXT NOT NULL DEFAULT '')")
+    assert db_lib.migrate(conn, target=3) == 3
+    conn.execute("ALTER TABLE plans ADD COLUMN env_fingerprint"
+                 " TEXT NOT NULL DEFAULT ''")
     conn.commit()
     assert db_lib.is_schema_version_fully_present(conn, 3) is True
     assert db_lib.is_schema_version_fully_present(conn, 4) is False
@@ -555,25 +565,27 @@ def test_f13_cli_detail_stays_typed():
 
 # -- F14 complete probe enqueue --------------------------------------------------
 
-def test_f14_unknown_plan_creates_no_probe_row(tmp_path):
+def test_f14_unknown_plan_creates_no_probe_row(tmp_path, monkeypatch):
     """Plan/tool resolution precedes enqueue (F14): an unknown plan is
     refused without leaving a visible incomplete probe request behind."""
     import types as _types
     from backend.app import cli as cli_lib
-    from backend.app.config import settings as settings_lib
 
     conn = _fresh_db(tmp_path)
     conn.close()
     args = _types.SimpleNamespace(
         tool="", plan_id=str(uuid.uuid4()), ack=False,
         idempotency_key="k-f14", wait_secs=0, db_path="")
-    # Minimal seam: point settings at the test DB without touching prod.
-    old_db = settings_lib.db_path
-    settings_lib.db_path = str(tmp_path / "f.db")
-    try:
-        rc = cli_lib.cmd_apply(args)
-    finally:
-        settings_lib.db_path = old_db
+    # Hermetic seam: the CLI reloads settings fresh per invocation, so
+    # patch the loader (not the singleton) to tmp-backed paths. Never
+    # touches /var/lib, /etc, or any production path.
+    fake_settings = _types.SimpleNamespace(
+        db_path=str(tmp_path / "f.db"),
+        state_dir=str(tmp_path / "state"),
+        log_dir=str(tmp_path / "logs"))
+    monkeypatch.setattr(cli_lib, "_load_settings",
+                        lambda: fake_settings)
+    rc = cli_lib.cmd_apply(args)
     assert rc == cli_lib.EXIT_INVALID
     check = db_lib.connect(str(tmp_path / "f.db"))
     try:
@@ -593,13 +605,16 @@ def test_f15_stage_digest_validate_reextract_order():
         path = os.path.join(_REPO_ROOT, "deploy", "scripts", name)
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
-        stage = text.find("STAGED_ARCHIVE")
+        # T04: order COMMANDS, not prose — header comments mention
+        # filenames in any order. Stage assignment, validator
+        # invocation, and extraction of the staged copy must sequence.
+        stage = text.find('STAGED_ARCHIVE="$STAGE_DIR/release.tar.gz"')
         assert stage != -1, name
         digest = text.find("CANDIDATE_SHA256")
         assert digest > stage, name
-        validate = text.find("validate-archive.py")
+        validate = text.find('"$VALIDATE_ARCHIVE" --archive')
         assert validate > stage, name
-        first_extract = text.find("tar -xzf")
+        first_extract = text.find('tar -xzf "$STAGED_ARCHIVE"')
         assert first_extract > validate, name
         # Extraction consumes the staged copy, never the operator path.
         assert "tar -xzf \"$STAGED_ARCHIVE\"" in text, name
@@ -748,7 +763,8 @@ def test_f11_mutation_evidence_failure_no_success(tmp_path, monkeypatch):
     r.job = {"ack": ""}
     r.log = None
 
-    def _fake_run_phase(phase, payload_extra, timeout_s, op=""):
+    def _fake_run_phase(self, phase, payload_extra, timeout_s,
+                        op=""):
         assert phase == "execute"
         return True, {"state": "succeeded", "error_code": "",
                       "error_detail": "", "exit_code": 0,
@@ -798,20 +814,29 @@ def test_f11_probe_evidence_failure_safe_error(tmp_path, monkeypatch):
 
 def test_f11_dispatcher_event_failure_no_raw(tmp_path, monkeypatch):
     """Sanitizer failure in dispatcher events persists a fixed marker
-    (never raw data) and reports failure instead of crashing."""
+    (never raw data) and reports failure instead of crashing. Uses a
+    real admitted job: production enforces FK integrity (T07)."""
     from backend.app import events as events_lib
+    from backend.app.admission import admit
     import backend.app.sanitize as sanitize_lib
+    import uuid as _uuid
 
     conn = _fresh_db(tmp_path)
+    support_lib.test_release_root()
+    row = support_lib.v2_plan_row(conn, _uuid.uuid4().hex)
+    jid, created, err = admit(conn, "owner@example.invalid",
+                              "k-f11ev", row["id"], False,
+                              "fp-test-1", True, False)
+    assert err == "" and created, err
     monkeypatch.setattr(
         sanitize_lib, "sanitize_text",
         lambda text, secrets=(): (_ for _ in ()).throw(
             RuntimeError("sanitizer down")))
     assert events_lib.record_event(
-        conn, "job-1", "reconcile_unknown",
+        conn, jid, "reconcile_unknown",
         "raw secret-bearing detail") is True
     rows = conn.execute("SELECT detail FROM events WHERE job_id=?",
-                        ("job-1",)).fetchall()
+                        (jid,)).fetchall()
     assert len(rows) == 1
     assert "raw secret-bearing detail" not in rows[0]["detail"]
     assert "suppressed" in rows[0]["detail"]
@@ -1186,24 +1211,39 @@ def test_g04_probe_apply_share_privilege_profile():
 def test_g04_hermes_profile_is_possible():
     """The claimed combination must be executable: NNP-off job
     execution plus the narrow Hermes sudo path — never NNP-on together
-    with a sudo requirement (F04)."""
+    with a sudo requirement (F04). Template shape is asserted on
+    parsed [Service] DIRECTIVES (T04): explanatory comments may
+    discuss either value, only the enforced directive matters."""
+    from backend.app.adapters import hermes as hermes_mod
     from backend.app.owner_env import build_owner_contract
 
     support_lib.test_release_root()
     contract = build_owner_contract(None)
     assert contract.get("runner_no_new_privileges") == "false"
-    hermes_path = os.path.join(_REPO_ROOT, "backend", "app", "adapters",
-                               "hermes.py")
-    with open(hermes_path, "r", encoding="utf-8") as fh:
-        hermes_src = fh.read()
-    assert "sudo" in hermes_src and "restart" in hermes_src
+    assert contract.get("probe_no_new_privileges") == "false"
+    restart = hermes_mod._allowed_restart_argv("fake-unit.service")
+    assert restart[0:3] == [hermes_mod._SUDO, "-n",
+                            hermes_mod._SYSTEMCTL]
+    assert restart[3] == "restart"
+
+    def _service_directives(text):
+        directives = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" in stripped:
+                directives.append(stripped)
+        return directives
+
     for template in ("systemd/ega-update-runner@.service",
                      "systemd/user/ega-update-runner@.service"):
         with open(os.path.join(_REPO_ROOT, template), "r",
                   encoding="utf-8") as fh:
-            template_src = fh.read()
-        assert "NoNewPrivileges=true" not in template_src, template
-        assert "NoNewPrivileges=no" in template_src, template
+            directives = _service_directives(fh.read())
+        assert "NoNewPrivileges=no" in directives, template
+        assert not any(
+            d == "NoNewPrivileges=true" for d in directives), template
 
 
 # -- G02/G03 quiescence-ordered reconciliation -----------------------------------

@@ -279,7 +279,13 @@ def test_retention_90d_metadata(tmp_path):
     db_path = str(tmp_path / "state.db")
     conn = _seed_db(db_path)
     old_job = str(uuid.uuid4())
-    plan_id = _insert_job(conn, old_job, finished_days_ago=91)
+    # T14: the plan must actually model expired-unused (past expiry,
+    # never consumed) for the orphan-collection rule to apply; fresh
+    # plans stay protected by design.
+    expired_plan = str(uuid.uuid4())
+    _insert_plan(conn, expired_plan, expired=True, used=False)
+    plan_id = _insert_job(conn, old_job, plan_id=expired_plan,
+                          finished_days_ago=91)
     _write_log(log_dir, old_job)
     conn.commit()
     out = retention_lib.run_retention(conn, _settings(log_dir, bdir))
@@ -436,23 +442,34 @@ def test_retention_tombstones(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_validator_placeholders_port_manifest(tmp_path):
+    import tempfile as _tempfile
+
     mod = _load_validator()
-    # Placeholders block; clean config passes the placeholder gate.
-    bad_cfg = tmp_path / "bad.json"
-    bad_cfg.write_text(json.dumps({
-        "team_domain": "https://t.example", "audience": "aud",
-        "owner_emails": ["o@example.invalid"], "public_origin": "https://h.example",
-        "listen_port": 8771, "csrf_secret": "CHANGEME-secret",
-        "state_dir": str(tmp_path)}), encoding="utf-8")
-    assert "placeholder" in mod.check_config_placeholders(str(bad_cfg)).lower() \
-        or "CHANGEME" in mod.check_config_placeholders(str(bad_cfg))
-    good_cfg = tmp_path / "good.json"
-    good_cfg.write_text(json.dumps({
-        "team_domain": "https://team.example", "audience": "aud-1",
-        "owner_emails": ["owner@example.org"], "public_origin": "https://h.example.org",
-        "listen_port": 8771, "csrf_secret": "a-very-long-real-secret-value-12345",
-        "state_dir": str(tmp_path)}), encoding="utf-8")
-    assert mod.check_config_placeholders(str(good_cfg)) == ""
+    # T13: neutral scratch dir — pytest's own tmp_path embeds this
+    # test's name ("...placeholders..."), which the placeholder
+    # patterns would match as product input. Placeholders belong in
+    # the config CONTENT, never in ancestor directory names.
+    cfg_root = _tempfile.mkdtemp(prefix="ega-vr-")
+    try:
+        # Placeholders block; clean config passes the placeholder gate.
+        bad_cfg = tmp_path / "bad.json"
+        bad_cfg.write_text(json.dumps({
+            "team_domain": "https://t.example", "audience": "aud",
+            "owner_emails": ["o@example.invalid"], "public_origin": "https://h.example",
+            "listen_port": 8771, "csrf_secret": "CHANGEME-secret",
+            "state_dir": cfg_root}), encoding="utf-8")
+        assert "placeholder" in mod.check_config_placeholders(str(bad_cfg)).lower() \
+            or "CHANGEME" in mod.check_config_placeholders(str(bad_cfg))
+        good_cfg = tmp_path / "good.json"
+        good_cfg.write_text(json.dumps({
+            "team_domain": "https://team.example", "audience": "aud-1",
+            "owner_emails": ["owner@example.org"], "public_origin": "https://h.example.org",
+            "listen_port": 8771, "csrf_secret": "a-very-long-real-secret-value-12345",
+            "state_dir": cfg_root}), encoding="utf-8")
+        assert mod.check_config_placeholders(str(good_cfg)) == ""
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(cfg_root, ignore_errors=True)
     # Port: unit default vs config, honoring the drop-in override.
     rel = tmp_path / "rel"
     (rel / "systemd").mkdir(parents=True)
@@ -520,9 +537,13 @@ def test_install_upgrade_ordering():
         assert "40" in text and "0-9a-f" in text, name
         assert "MANIFEST" in text and "sha256sum" in text, name
         assert "validate-release.py" in text, name
-        # N16: state paths come ONLY from config_cli (no inline python
-        # config parsers); quiescence relies on exit codes, not parsing.
-        assert "config_cli get" in text, name
+        # N16: state paths come ONLY from the canonical config CLI
+        # (no inline python config parsers) — directly or via the
+        # cfg_cli wrapper that delegates to backend.app.config_cli;
+        # quiescence relies on exit codes, not parsing.
+        assert "backend.app.config_cli" in text, name
+        assert "config_cli get" in text or "cfg_cli get" in text, \
+            name
         assert "python3 -c 'import json" not in text, name
         assert "python -c 'import json" not in text, name
         assert "status --require-quiescent" in text or \
