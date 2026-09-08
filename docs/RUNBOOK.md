@@ -259,16 +259,19 @@ cd /opt/ega-update/current && EGA_CONFIG_FILE=/etc/ega-update/config.json venv/b
   hardcoded in deploy scripts) blocks new plans/jobs (API refuses while
   present with 503). Absent by default. Admission stop:
   `sudo touch /var/lib/ega-update/drain`. Re-admit ONLY after quiescence
-  (`venv/bin/python -m backend.app.cli status` proves no `active_job` and
-  no `unresolved_runners`, bounded 120s, fail closed) + proven stop +
+  (`python3 deploy/etc/quiescence-check.py --config
+  /etc/ega-update/config.json` proves worker alive, no
+  active/unresolved/recovery work, no live/unknown runner units, no
+  active delegated operations, drain present — bounded 120s, fail
+  closed; version-independent, needs no installed release) + proven stop +
   consistent backup + stage + validator + migrate + atomic switch + units
   (+ port drop-in) + start + bounded readiness (curl localhost health +
-  `cli status` heartbeat fresh):
+  `cli status --require-ready` worker alive):
   `sudo rm -f /var/lib/ega-update/drain`. install.sh (existing-deploy
-  path) and upgrade.sh create the drain FIRST, prove quiescence via
-  `cli status`, prove services stopped (fail closed, abort, keep drain),
-  and remove the drain only on the success path. Failures keep the drain;
-  the PRIOR release symlink is restored ONLY when
+  path) and upgrade.sh create the drain FIRST, prove quiescence via the
+  deploy controller, prove services stopped (fail closed, abort, keep
+  drain), and remove the drain only on the success path. Failures keep
+  the drain; the PRIOR release symlink is restored ONLY when
   `validate-release.py --check-compat OLD NEW` passes, else the host stays
   in manual-recovery state (never "start same broken release" as
   rollback).

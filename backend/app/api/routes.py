@@ -1212,20 +1212,27 @@ async def post_tool_plan(tool_id: str, request: Request):
         _artifact = {}
     try:
         _row = build_plan_row(
-            tool_id, subject or "", install_identity, fingerprint,
-            target, target_mode, channel, services,
-            _planned.get("launch", {}) or {},
-            _planned.get("state_homes", []) or [],
-            backup_scope, _planned.get("backup_policy", {}) or {},
-            _planned.get("required_probes", []) or [],
-            _planned.get("required_checks", []) or [],
-            _planned.get("budgets", {}) or {},
-            _planned.get("space_fs", {}) or {},
-            steps, _deadlines, restart_impact,
-            _planned.get("restart_detail", "") or "",
-            activity_state, activity_ts, activity_evidence,
-            required_space, _config_hash, _release_path,
-            now.isoformat(), expires.isoformat(), _artifact, _env_fp)
+            tool_id=tool_id, subject=subject or "",
+            install_identity=install_identity, fingerprint=fingerprint,
+            target=target, target_mode=target_mode, channel=channel,
+            services=services,
+            launch=_planned.get("launch", {}) or {},
+            state_homes=_planned.get("state_homes", []) or [],
+            backup_scope=backup_scope,
+            backup_policy=_planned.get("backup_policy", {}) or {},
+            required_probes=_planned.get("required_probes", []) or [],
+            required_checks=_planned.get("required_checks", []) or [],
+            budgets=_planned.get("budgets", {}) or {},
+            space_fs=_planned.get("space_fs", {}) or {},
+            steps=steps, deadlines=_deadlines,
+            restart_impact=restart_impact,
+            restart_detail=_planned.get("restart_detail", "") or "",
+            activity_state=activity_state, activity_ts=activity_ts,
+            activity_evidence=activity_evidence,
+            required_space_bytes=required_space,
+            config_hash=_config_hash, release_path=_release_path,
+            created_at=now.isoformat(), expires_at=expires.isoformat(),
+            artifact=_artifact, env_fingerprint=_env_fp)
     except Exception as exc:
         return deps.error_envelope(
             503, "unavailable",

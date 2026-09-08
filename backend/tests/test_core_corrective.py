@@ -41,9 +41,6 @@ from backend.app import units as units_lib
 from backend.app.admission import admit as admit_lib
 
 import support as support_lib
-from backend.app.admission import admit as admit_lib
-
-import support as support_lib
 
 
 def _fresh_db(tmp_path, name="s.db"):
@@ -55,14 +52,28 @@ def _fresh_db(tmp_path, name="s.db"):
 
 def _plan_row(tool_id="hermes", subject="o@x.invalid", fp="fp-1",
               target="9.9.9"):
+    # Build-only v2 row with live identities (F01: the production hash
+    # path; callers INSERT it themselves).
     from datetime import datetime, timedelta, timezone
+
     now = datetime.now(timezone.utc)
+    cfg, rel, envfp = support_lib.live_identities()
     return plans_lib.build_plan_row(
-        tool_id, subject, "ident", fp, target, "exact", "c", [], {}, [],
-        {}, {}, [], ["smoke"], {}, {}, ["preflight"],
-        {"preflight": 120}, "none", "", "idle", now.isoformat(), "",
-        1024, "cfghash", "/rel", now.isoformat(),
-        (now + timedelta(seconds=300)).isoformat())
+        tool_id=tool_id, subject=subject,
+        install_identity="display-identity-%s" % tool_id,
+        fingerprint=fp, target=target, target_mode="exact",
+        channel="test-channel", services=[], launch={}, state_homes=[],
+        backup_scope={}, backup_policy={}, required_probes=[],
+        required_checks=["smoke"], budgets={}, space_fs={},
+        steps=["preflight", "backup", "updating", "verifying"],
+        deadlines={"preflight": 120, "backup": 600, "updating": 1800,
+                   "verifying": 300},
+        restart_impact="none", restart_detail="", activity_state="idle",
+        activity_ts=now.isoformat(), activity_evidence="evidence-idle",
+        required_space_bytes=1024, config_hash=cfg, release_path=rel,
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(seconds=300)).isoformat(), artifact={},
+        env_fingerprint=envfp)
 
 
 # -- executor ------------------------------------------------------------

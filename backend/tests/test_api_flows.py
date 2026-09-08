@@ -352,16 +352,35 @@ def test_fingerprint_column_compare(tmp_path, monkeypatch):
     cfg_hash = config_identity(settings_lib)
     release = resolve_release()
     assert cfg_hash and release
+    from backend.app.owner_env import canonical_fingerprint
+    envfp = canonical_fingerprint(settings_lib, None, release)
+    assert envfp
     plan_match = plans_lib.build_plan_row(
-        "hermes", "owner@example.invalid", "display-human-identity",
-        "fp-real-1", "9.9.9", "exact", "c", [], {}, [], {}, [], [],
-        {}, {}, ["preflight"], {"preflight": 120}, "none", "", "idle",
-        now.isoformat(), "", 1024, cfg_hash, release, now.isoformat(), exp)
+        tool_id="hermes", subject="owner@example.invalid",
+        install_identity="display-human-identity",
+        fingerprint="fp-real-1", target="9.9.9", target_mode="exact",
+        channel="c", services=[], launch={}, state_homes=[],
+        backup_scope={}, backup_policy={}, required_probes=[],
+        required_checks=["smoke"], budgets={}, space_fs={},
+        steps=["preflight"], deadlines={"preflight": 120},
+        restart_impact="none", restart_detail="", activity_state="idle",
+        activity_ts=now.isoformat(), activity_evidence="",
+        required_space_bytes=1024, config_hash=cfg_hash,
+        release_path=release, created_at=now.isoformat(),
+        expires_at=exp, artifact={}, env_fingerprint=envfp)
     plan_changed = plans_lib.build_plan_row(
-        "hermes", "owner@example.invalid", "display-human-identity",
-        "fp-other-2", "9.9.9", "exact", "c", [], {}, [], {}, [], [],
-        {}, {}, ["preflight"], {"preflight": 120}, "none", "", "idle",
-        now.isoformat(), "", 1024, cfg_hash, release, now.isoformat(), exp)
+        tool_id="hermes", subject="owner@example.invalid",
+        install_identity="display-human-identity",
+        fingerprint="fp-other-2", target="9.9.9", target_mode="exact",
+        channel="c", services=[], launch={}, state_homes=[],
+        backup_scope={}, backup_policy={}, required_probes=[],
+        required_checks=["smoke"], budgets={}, space_fs={},
+        steps=["preflight"], deadlines={"preflight": 120},
+        restart_impact="none", restart_detail="", activity_state="idle",
+        activity_ts=now.isoformat(), activity_evidence="",
+        required_space_bytes=1024, config_hash=cfg_hash,
+        release_path=release, created_at=now.isoformat(),
+        expires_at=exp, artifact={}, env_fingerprint=envfp)
     conn.execute("BEGIN IMMEDIATE")
     plans_lib.insert_plan(conn, plan_match)
     plans_lib.insert_plan(conn, plan_changed)

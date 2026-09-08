@@ -100,6 +100,13 @@ as `PENDING:final-sha` until the implementation commit lands (this
 marker is the explicit placeholder required before a SHA exists; the
 report carries the final SHA). Every row: `implemented-static`,
 result `NOT EXECUTED — IMPLEMENTATION PHASE`. No runtime PASS claimed.
+New regression artifacts: `backend/tests/test_final_integration.py`
+(F01–F16 blocks), `backend/tests/test_deploy_bootstrap.py` (F06–F10
+controller and script behavior), `backend/tests/support.py`
+(`bound_receipt`, keyword-built v2 fixtures), plus conversions of
+`test_execution.py`, `test_api_flows.py`, `test_update_console.py`,
+and `test_core_corrective.py` to shared admission, receipts v2
+binding, and contradiction-free success evidence.
 New regression artifact: `backend/tests/test_final_integration.py`
 (F01–F16 blocks) plus `backend/tests/support.py` shared admission
 fixtures, `backend/tests/test_deploy_bootstrap.py` (F06–F10 script and
@@ -118,19 +125,19 @@ result `NOT EXECUTED — IMPLEMENTATION PHASE`. No runtime PASS claimed.
 | R02 | Canonical allow-list env + per-job immutable release binding; preview/apply share it | `owner_env.py`, `plans.release_path`, `worker/runner.py::_validate_env_release` | disposable-verification gate (env equivalence), not unit-testable offline |
 | R03 | Lock handle held for life; atomic nonce claim with unit+release+deadline; one-shot consume; full-UUID units; guarded transitions | `dispatch.py::main`, `jobs.py::claim_with_nonce/consume_attempt`, `tx.py`, `runner.py` | `test_claim_deadline_enforced`, `test_consume_attempt_single_use` |
 | R04 | Five-state unit model from bounded show; unknown holds reservation; terminal unresolved rows reconciled | `units.py`, `reconcile_core.py::decide`, `dispatch.py::_reconcile_row` | `test_units_*`, `test_decide_matrix`, `test_reconcile_unknown_holds_reservation` |
-| R05 | `tx.transition_tx`: one explicit transaction per transition incl. recovery/checks/event; unresolved marker pre-mutation; synchronous=FULL | `tx.py`, `db.py`, `runner.py::_finish`, `dispatch.py`, `reconcile.py` | `test_tx_guard_and_atomic_terminal` |
-| R06 | Scope-supervised phases + ambient cancel; coordinator never inside killed scope; delegated services read from plan | `executor.py::phase_context`, `runner.py::_call_in_thread/_kill_scope`, adapters via `run_stream` | `test_executor_timeout_kills_and_reports`, `test_executor_cancel_event`, adapter timeout-funnel tests |
+| R05 | `tx.transition_tx`: one explicit transaction per transition incl. recovery/checks/event; unresolved marker pre-mutation; synchronous=FULL; ownership release only via `tx.release_ownership` after quiescence proof | `tx.py`, `db.py`, `runner.py::_finish`, `dispatch.py`, `reconcile.py` | `test_tx_guard_and_atomic_terminal` |
+| R06 | Supervised phase-worker processes in coordinator-owned scopes; coordinator kills scope, proves empty; delegated services read from plan | `executor.py` (streaming Popen), `phase_run.py::run_supervised_phase`, `runner.py::_run_phase/_hard_timeout_recovery`, adapters via `run_stream` | `test_executor_timeout_kills_and_reports`, `test_executor_cancel_event`, adapter timeout-funnel tests |
 | R07 | Shared `reconcile_core` + `units` + v2 receipts + tx in SSH CLI; hex self-exclusion; JSON-first validation, no fallback promotion; abandoned rows terminalized | `reconcile_core.py`, `worker/reconcile.py` | `test_decide_matrix`, observer-exclusion by construction (hex never in observer argv) |
 | R08 | Receipts v2: full binding + strict success criteria + atomic apply + contradiction refusal | `receipts.py`, `schemas.py::ReceiptModel` | validate matrix, apply/idempotency/binding/contradiction tests |
-| R09 | Streaming Popen executor: concurrent drains, incremental decode, live sink, bounded tails, true exits, scope containment | `executor.py`, `runner.py::_live_on_line/_phase_sink` | `test_executor_*` (live line <5s gate at runtime) |
+| R09 | Streaming Popen executor: concurrent drains, incremental decode, live sink, bounded tails, true exits, scope containment | `executor.py`, `runner.py::_live_on_line`, `phase_run.py` stream tailing | `test_executor_*` (live line <5s gate at runtime) |
 | R10 | `SanitizingStream`: withheld blocks, tick-safe, oversized suppression, fail-closed, secrets-before-truncation | `sanitize.py`, `runner.py::JobLog` | `test_sanitizer_*` |
-| R11 | One sanitizer for DB/API/receipt/CLI surfaces; mutation gated on log init; mid-op failure stops to recovery | `sanitize.py`, `runner.py::_record_checks/_sanitize_evidence_str`, `receipts.py`, `dispatch.py::_event` | seeded-secret scan gate at runtime |
-| R13 | Packaged `cli.py` (reserve+observe, never direct runner); thin `exec` scripts | `app/cli.py`, `scripts/*` | `test_shell_wrappers_thin_exec`, exit-mapping review |
-| R14 | Replay-first admission; subject/expiry/one-use; worker-readiness 503 | `api/routes.py::post_job`, `jobs.py::find_replay` | `test_find_replay_precedes_admission`, replay-matrix tests |
+| R11 | One sanitizer for DB/API/receipt/CLI surfaces; mutation gated on log init; mid-op failure stops to recovery | `sanitize.py`, `runner.py::_record_checks_dict`, `receipts.py`, `events.py::record_event` | seeded-secret scan gate at runtime |
+| R13 | Packaged `cli.py` (shared admission + observe, never direct runner); thin `exec` scripts | `app/cli.py`, `scripts/*` | `test_shell_wrappers_thin_exec`, exit-mapping review |
+| R14 | Shared admission service, replay-first; subject/expiry/one-use; worker-readiness 503 | `admission.py::admit`, `api/routes.py::post_job`, `app/cli.py::cmd_apply` | `test_find_replay_precedes_admission`, replay-matrix tests |
 | R15 | Immutable v2 plans (hash-bound, config+release bound); authoritative revalidation; invalidation never silent alteration | `plans.py`, `api/routes.py`, `runner.py::_build_plan/_validate_env_release` | `test_plan_hash_tamper_rejected`, fingerprint/config tests |
 | R16 | Probes off-loop (queue + worker-thread wait); streaming size guard; small plan schema | `owner_probes.py`, `api/routes.py`, `api/deps.py::check_body_limit` | slow-probe responsiveness gate at runtime |
 | R17 | Heartbeat admission gate 503; atomic claim deadline; safe sweep (accepted+empty-nonce only) | `api/routes.py`, `jobs.py::claim_with_nonce/expire_stale_accepted` | `test_claim_deadline_enforced`, worker-down 503 tests |
 | R18 | installer_exit/install_outcome/actual_change/final_log_seq; observation after every verification; already-current distinct | `runner.py::_finish/_record_observation`, `schemas.py`, `api/routes.py::_job_view` | observation/health-failed replaces-green tests |
 | R19 | Success vs attempt timestamps separated; force bypasses cache; unknown preserves last-known | `api/routes.py` check handler, `frontend/src/app.tsx::handleCheck(force=true)` | check-again/failed-check tests |
-| R31 | Ordered ledger migrations + validation-only startup + rollback compat | `db.py`, `migrations/001..003` | `test_migrate_fresh_rerun_and_newer_rejected`, `test_migrate_001_to_003_upgrade` |
+| R31 | Ordered ledger migrations + validation-only startup + rollback compat | `db.py`, `migrations/001..004` | `test_migrate_fresh_rerun_and_newer_rejected`, `test_migrate_001_to_current_upgrade` |
 | R34 | Placeholder-fails-readiness; per-service secret files; one env-style parser | `readiness.py`, `sanitize.py::parse_secrets_file`, `config.py` | `test_parse_secrets_file_formats`, readability matrix gate at runtime |

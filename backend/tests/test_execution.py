@@ -263,7 +263,8 @@ def _good_receipt(job_id="job-1", tool_id="hermes", state="succeeded",
         release_path="/opt/ega-update/releases/abc", target=after,
         target_mode="exact", expected_checks=["smoke"],
         installer_exit=0, install_outcome="succeeded",
-        actual_change=True, evidence_durable=True)
+        actual_change=True, evidence_durable=True,
+        cleanup_status="resolved", recovery_disposition="none")
 
 
 def test_receipt_validate_matrix():
@@ -323,18 +324,19 @@ def test_receipt_validate_matrix():
 
 
 def test_receipt_apply_and_idempotency(tmp_path):
+    import support as support_lib
+
     conn = _make_db(str(tmp_path / "state.db"))
     job_id = _reserve(conn)
     assert jobs_lib.claim_with_nonce(conn, job_id, "n-1") is True
-    plan_id = _job_row(conn, job_id)["plan_id"]
-    data = _good_receipt(job_id=job_id, nonce="n-1", plan_id=plan_id)
+    data = support_lib.bound_receipt(conn, job_id, "n-1")
     state = receipts_lib.apply_receipt(conn, data, job_id)
     assert state == "succeeded"
     row = _job_row(conn, job_id)
-    assert row["state"] == "succeeded" and row["after_version"] == "2.0.0"
+    assert row["state"] == "succeeded" and row["after_version"] == "9.9.9"
     checks = conn.execute("SELECT * FROM checks WHERE job_id=?",
                           (job_id,)).fetchall()
-    assert len(checks) == 2
+    assert len(checks) == 1
     events = conn.execute(
         "SELECT * FROM events WHERE job_id=? AND event_type='receipt_applied'",
         (job_id,)).fetchall()
@@ -346,23 +348,22 @@ def test_receipt_apply_and_idempotency(tmp_path):
     events2 = conn.execute(
         "SELECT * FROM events WHERE job_id=? AND event_type='receipt_applied'",
         (job_id,)).fetchall()
-    assert len(checks2) == 2 and len(events2) == 1
+    assert len(checks2) == 1 and len(events2) == 1
     # Invalid receipts raise instead of writing.
     with pytest.raises(ValueError):
         receipts_lib.apply_receipt(conn, {"schema_version": 999})
+    missing = support_lib.bound_receipt(conn, job_id, "n-1")
+    missing["job_id"] = "missing"
     with pytest.raises(ValueError):
-        receipts_lib.apply_receipt(conn, _good_receipt(job_id="missing"))
+        receipts_lib.apply_receipt(conn, missing, "missing")
     # Unbound receipts (wrong nonce / swapped job) never apply (R08).
-    swapped = _good_receipt(job_id=job_id, nonce="WRONG", plan_id=plan_id)
+    swapped = support_lib.bound_receipt(conn, job_id, "WRONG")
     with pytest.raises(ValueError):
         receipts_lib.apply_receipt(conn, swapped, job_id)
-    other_id = _good_receipt(job_id="other", nonce="n-1", plan_id=plan_id)
-    with pytest.raises(ValueError):
-        receipts_lib.apply_receipt(conn, other_id, "other")
     # Contradicting a resolved terminal row is refused (manual review).
-    contra = _good_receipt(job_id=job_id, nonce="n-1", plan_id=plan_id,
-                           state="failed", after="")
-    contra["after_version"] = ""
+    contra = support_lib.bound_receipt(
+        conn, job_id, "n-1", state="failed", after="",
+        install_outcome="install_failed", actual_change=False)
     with pytest.raises(ValueError):
         receipts_lib.apply_receipt(conn, contra, job_id)
     conn.close()
@@ -667,16 +668,22 @@ def _stopped(monkeypatch):
 
 
 def _bound_success_receipt(conn, job_id, nonce="n-r", after="9.9.9"):
+    # Bound to the job's REAL plan row (N03/F04): hash, release, target,
+    # mode, and manifest all come from the immutable plan, never fixtures.
     plan_id = _job_row(conn, job_id)["plan_id"]
+    plan = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                             (plan_id,)).fetchone())
     return receipts_lib.build_receipt(
         job_id, "hermes", "succeeded", "1.0.0", after, 0, "",
         [{"name": "smoke", "result": "pass", "mandatory": True,
           "summary": "ok"}], "2026-09-08T00:00:00+00:00",
-        plan_id=plan_id, plan_hash="ph-1", attempt_nonce=nonce,
-        release_path="/opt/ega-update/releases/abc", target=after,
-        target_mode="exact", expected_checks=["smoke"],
+        plan_id=plan_id, plan_hash=plan["plan_hash"],
+        attempt_nonce=nonce, release_path=plan["release_path"],
+        target=after, target_mode=plan["target_mode"],
+        expected_checks=["smoke"],
         installer_exit=0, install_outcome="succeeded",
-        actual_change=True, evidence_durable=True)
+        actual_change=True, evidence_durable=True,
+        cleanup_status="resolved", recovery_disposition="none")
 
 
 def test_reconcile_dead_plus_valid_receipt_applies(tmp_path, monkeypatch):

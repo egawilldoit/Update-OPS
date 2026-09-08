@@ -215,7 +215,8 @@ def test_n02_success_receipt_zero_exit_validates(tmp_path):
         release_path=row["release_path"], target="9.9.9",
         target_mode="exact", expected_checks=["smoke"], installer_exit=0,
         install_outcome="succeeded", actual_change=True,
-        evidence_durable=True)
+        evidence_durable=True, cleanup_status="resolved",
+        recovery_disposition="none")
     ok, reason = receipts_lib.validate_receipt(data)
     assert ok, reason
     conn.close()
@@ -237,7 +238,8 @@ def _bound_receipt(conn, jid, nonce, **over):
              "summary": "ok"}], "2026-09-08T00:00:00+00:00",
         plan_id=row["plan_id"], attempt_nonce=nonce,
         installer_exit=0, install_outcome="succeeded", actual_change=True,
-        evidence_durable=True, expected_checks=["smoke"], **base)
+        evidence_durable=True, expected_checks=["smoke"],
+        cleanup_status="resolved", recovery_disposition="none", **base)
 
 
 def test_n03_binding_matrix(tmp_path):

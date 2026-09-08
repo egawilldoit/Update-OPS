@@ -46,7 +46,11 @@ def v2_plan_row(conn, plan_id, tool_id="hermes", subject="owner@example.invalid"
                 fingerprint="fp-test-1", target="9.9.9", target_mode="exact",
                 activity_state="idle", expires_future=True):
     # type: (...) -> dict
-    """Build + INSERT a v2 immutable plan with live identities. Returns row."""
+    """Build + INSERT a v2 immutable plan with live identities. Returns row.
+
+    Keyword arguments at the build call (F-audit fix): positional drift
+    here once swapped steps/space and crashed required_space_bytes.
+    """
     from backend.app import plans as plans_lib
 
     now = datetime.now(timezone.utc)
@@ -54,13 +58,21 @@ def v2_plan_row(conn, plan_id, tool_id="hermes", subject="owner@example.invalid"
         now - timedelta(seconds=600)
     cfg, rel, envfp = live_identities()
     row = plans_lib.build_plan_row(
-        tool_id, subject, "display-identity-%s" % tool_id, fingerprint,
-        target, target_mode, "test-channel", [], {}, [], {}, [],
-        ["smoke"], {}, {}, ["preflight", "backup", "updating", "verifying"],
-        {"preflight": 120, "backup": 600, "updating": 1800,
-         "verifying": 300}, "none", "", activity_state,
-        now.isoformat(), "evidence-%s" % activity_state, 1024, cfg, rel,
-        now.isoformat(), exp.isoformat(), {}, envfp)
+        tool_id=tool_id, subject=subject,
+        install_identity="display-identity-%s" % tool_id,
+        fingerprint=fingerprint, target=target, target_mode=target_mode,
+        channel="test-channel", services=[], launch={}, state_homes=[],
+        backup_scope={}, backup_policy={}, required_probes=[],
+        required_checks=["smoke"], budgets={}, space_fs={},
+        steps=["preflight", "backup", "updating", "verifying"],
+        deadlines={"preflight": 120, "backup": 600, "updating": 1800,
+                   "verifying": 300},
+        restart_impact="none", restart_detail="", activity_state=activity_state,
+        activity_ts=now.isoformat(),
+        activity_evidence="evidence-%s" % activity_state,
+        required_space_bytes=1024, config_hash=cfg, release_path=rel,
+        created_at=now.isoformat(), expires_at=exp.isoformat(), artifact={},
+        env_fingerprint=envfp)
     row["id"] = plan_id
     # F01: no manual plan_hash repair. build_plan_row() is the single
     # authority for the hash ("id" is not a hashed field); recomputing
@@ -94,3 +106,50 @@ def admit_new(conn, subject="owner@example.invalid", plan_id=None,
                                  fingerprint, True, False)
     assert err == "" and created and job_id, err
     return job_id
+
+
+def bound_receipt(conn, job_id, nonce, after=None, state="succeeded",
+                  **overrides):
+    # type: (...) -> dict
+    """Build a receipt fully bound to the job's real plan row (job, tool,
+    plan, nonce, hash, release, target, mode, manifest). Callers override
+    individual fields to construct contradiction cases."""
+    from backend.app import receipts as receipts_lib
+
+    job = dict(conn.execute("SELECT * FROM jobs WHERE id=?",
+                            (job_id,)).fetchone())
+    plan = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                             (job.get("plan_id", ""),)).fetchone())
+    import json as _json
+    try:
+        manifest = list(_json.loads(
+            plan.get("required_checks_json", "[]") or "[]"))
+    except Exception:
+        manifest = ["smoke"]
+    target = str(plan.get("target", "") or "")
+    if after is None:
+        after = target
+    params = {
+        "plan_id": job.get("plan_id", ""),
+        "plan_hash": plan.get("plan_hash", ""),
+        "attempt_nonce": nonce,
+        "release_path": plan.get("release_path", ""),
+        "target": target,
+        "target_mode": plan.get("target_mode", "exact") or "exact",
+        "expected_checks": list(manifest),
+        "installer_exit": 0,
+        "install_outcome": "succeeded",
+        "actual_change": True,
+        "evidence_durable": True,
+        "cleanup_status": "resolved",
+        "recovery_disposition": "none",
+    }
+    params.update(overrides)
+    checks = overrides.get("checks", [
+        {"name": name, "result": "pass", "mandatory": True,
+         "summary": "ok"} for name in manifest] or [
+        {"name": "smoke", "result": "pass", "mandatory": True,
+         "summary": "ok"}])
+    return receipts_lib.build_receipt(
+        job_id, job.get("tool_id", ""), state, "1.0.0", after, 0, "",
+        checks, "2026-09-08T00:00:00+00:00", **params)
