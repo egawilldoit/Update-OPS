@@ -37,10 +37,19 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Trusted operator-checkout root (F06): bootstrap operations (config
+# parse, quiescence, archive validation) run from here — never from the
+# candidate release before it is validated, and never from an old
+# installed release for new-protocol gates.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Release checkout validator (N17): the tarball is NEVER trusted for its
 # own validation code. Archive inspection runs from the operator's
 # checkout copy before any root extraction.
 VALIDATE_ARCHIVE="$SCRIPT_DIR/../etc/validate-archive.py"
+# Version-independent quiescence controller (F07): proves quiescence
+# from stable DB/systemd contracts without requiring any installed
+# release to implement the newest protocol.
+QUIESCE_CHECK="$SCRIPT_DIR/../etc/quiescence-check.py"
 
 COMMIT=""
 TARBALL=""
@@ -92,21 +101,22 @@ PREV_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || echo '')"
 DRAIN_CREATED_BY_US=0
 WAS_API=0
 WAS_WORKER=0
+# F08: existing-deployment detection happens AFTER trusted config parse
+# (see below where EFFECTIVE_DB resolves); never from a hardcoded path
+# before configuration is known.
 EXISTING_DEPLOY=0
-if [ -f "$STATE/state.db" ]; then
-  EXISTING_DEPLOY=1
-fi
 
-# Config value helper (N16/R32): exactly one parser —
-# `python -m backend.app.config_cli` from the staged release
-# (PYTHONPATH; stdlib-only so it runs before the venv exists).
+# Config value helper (N16/F06): exactly one parser —
+# `python -m backend.app.config_cli` from the TRUSTED CHECKOUT
+# (PYTHONPATH=$REPO_ROOT; stdlib-only so it runs before any venv or
+# release exists). Never the candidate release, never an old install.
 # Fresh installs (no config file yet) fall back to documented defaults;
 # an EXISTING but unparsable config is a hard failure, never silent.
 cfg_value() {
   local key="$1"
   local fallback="$2"
   local out=""
-  if out="$(PYTHONPATH="$RELEASE_DIR" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli get --require "$key" 2>/dev/null)"; then
+  if out="$(PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli get --require "$key" 2>/dev/null)"; then
     printf '%s' "$out"
   elif [ -f "$ETC/config.json" ]; then
     echo "[install] REFUSING: config parse failed for required key $key" >&2
@@ -123,7 +133,7 @@ fail_keep_drain() {
   exit 1
 }
 
-echo "[install] pinned release: $COMMIT (existing_deploy=$EXISTING_DEPLOY)"
+echo "[install] pinned release: $COMMIT (existing deploy resolved after config parse below)"
 
 # 1. Dedicated non-root API account (no login shell, no tool ownership).
 if id "$API_USER" >/dev/null 2>&1; then
@@ -142,16 +152,38 @@ if [ -e "$RELEASE_DIR" ]; then
   exit 1
 fi
 mkdir -p "$RELEASE_DIR"
+# F15: immutable staging — the operator-supplied tarball path may live in
+# a writable location, so copy it into a root-controlled staging dir,
+# digest it, validate the STAGED copy, re-verify the digest, then extract
+# exactly that staged file. Validation and extraction never independently
+# reopen a mutable path (no TOCTOU window).
+STAGE_DIR="$(mktemp -d /var/tmp/ega-stage-XXXXXXXX)" || { echo "[install] cannot create staging dir" >&2; exit 1; }
+chmod 0700 "$STAGE_DIR"
+STAGED_ARCHIVE="$STAGE_DIR/release.tar.gz"
+cleanup_stage() { rm -rf "$STAGE_DIR"; }
+cp -p "$TARBALL" "$STAGED_ARCHIVE" || { echo "[install] cannot stage tarball" >&2; cleanup_stage; exit 1; }
+CANDIDATE_SHA256="$(sha256sum "$STAGED_ARCHIVE" | awk '{print $1}')"
+if [ -z "$CANDIDATE_SHA256" ]; then echo "[install] cannot digest staged archive" >&2; cleanup_stage; exit 1; fi
+echo "[install] candidate archive sha256: $CANDIDATE_SHA256"
 # N17: validate EVERY archive member (traversal/links/devices/modes +
 # expected top-levels) BEFORE any root extraction, using the checkout's
 # validator — never code from the unvalidated tarball.
-if python3 "$VALIDATE_ARCHIVE" --archive "$TARBALL" --dest "$RELEASE_DIR"; then
+if python3 "$VALIDATE_ARCHIVE" --archive "$STAGED_ARCHIVE" --dest "$RELEASE_DIR"; then
   echo "[install] archive validation ok"
 else
   echo "[install] REFUSING: archive validation blocked" >&2
+  cleanup_stage
   exit 1
 fi
-tar -xzf "$TARBALL" -C "$RELEASE_DIR"
+if [ "$(sha256sum "$STAGED_ARCHIVE" | awk '{print $1}')" != "$CANDIDATE_SHA256" ]; then
+  echo "[install] REFUSING: staged archive changed after validation" >&2
+  cleanup_stage
+  exit 1
+fi
+tar -xzf "$STAGED_ARCHIVE" -C "$RELEASE_DIR"
+printf '%s  %s\n' "$CANDIDATE_SHA256" "$COMMIT" > "$RELEASE_DIR/CANDIDATE_SHA256"
+chmod 0644 "$RELEASE_DIR/CANDIDATE_SHA256"
+cleanup_stage
 chown -R root:root "$RELEASE_DIR"
 chmod -R a-w "$RELEASE_DIR" || true
 
@@ -229,6 +261,13 @@ EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
 EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
 DRAIN="$EFFECTIVE_STATE/drain"
 echo "[install] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB backups=$EFFECTIVE_BACKUPS"
+# F08: existing deployment = the CONFIGURED DB path exists (determined
+# only now, after trusted config parse — never a hardcoded path before
+# configuration is known).
+if [ -f "$EFFECTIVE_DB" ]; then
+  EXISTING_DEPLOY=1
+fi
+echo "[install] existing_deploy=$EXISTING_DEPLOY (from configured db path)"
 
 # Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
 # while present). No drain by default on fresh installs; existing deploys
@@ -260,9 +299,11 @@ else
   echo "[install] enabled linger for $TOOL_OWNER (user manager at boot for --user job units)"
 fi
 
-# Existing-deploy maintenance gate (R33 steps 1-3): drain FIRST, prove
-# quiescence via cli status (bounded 120s, fail closed), then stop services
-# and PROVE stopped. Fresh installs skip to venv/stage.
+# Existing-deploy maintenance gate (R33 steps 1-3, F07/F09): drain FIRST,
+# prove quiescence via the version-independent deploy controller (bounded
+# 120s, fail closed — never requires any installed release to implement
+# new protocol, never stops services on unproven state), then stop
+# services and PROVE stopped. Fresh installs skip to venv/stage.
 if [ "$EXISTING_DEPLOY" = "1" ]; then
   echo "[install] existing deploy detected — entering maintenance protocol"
   mkdir -p "$EFFECTIVE_STATE"
@@ -273,25 +314,20 @@ if [ "$EXISTING_DEPLOY" = "1" ]; then
     DRAIN_CREATED_BY_US=1
     echo "[install] drain created at $DRAIN (new plans/jobs refused)"
   fi
-  if [ -L "$CURRENT_LINK" ] && [ -x "$CURRENT_LINK/venv/bin/python" ]; then
-    echo "[install] waiting for quiescence via cli status (bounded 120s)..."
-    QUIESCED=0
-    for _i in $(seq 1 24); do
-      cd "$RELEASE_DIR"
-      if EGA_CONFIG_FILE="$ETC/config.json" "$CURRENT_LINK/venv/bin/python" -m backend.app.cli status --require-quiescent >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
-        QUIESCED=1
-        break
-      fi
-      echo "[install] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-install-status.json detail.reasons..."
-      sleep 5
-    done
-    if [ "$QUIESCED" = "1" ]; then
-      echo "[install] quiesced: no active job, no unresolved runners"
-    else
-      fail_keep_drain "quiescence timeout after 120s (fail closed, drain kept)"
+  echo "[install] waiting for quiescence via deploy controller (bounded 120s)..."
+  QUIESCED=0
+  for _i in $(seq 1 24); do
+    if python3 "$QUIESCE_CHECK" --config "$ETC/config.json" >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
+      QUIESCED=1
+      break
     fi
+    echo "[install] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-install-status.json reasons..."
+    sleep 5
+  done
+  if [ "$QUIESCED" = "1" ]; then
+    echo "[install] quiesced: deploy controller proves no active/unresolved work, no live units, drain present"
   else
-    echo "[install] no runnable current release for status gate — stopping services directly"
+    fail_keep_drain "quiescence timeout after 120s (fail closed, drain kept)"
   fi
   if systemctl is-active --quiet ega-update-api 2>/dev/null; then WAS_API=1; fi
   if systemctl is-active --quiet ega-update-worker 2>/dev/null; then WAS_WORKER=1; fi

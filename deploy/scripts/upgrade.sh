@@ -31,10 +31,19 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Trusted operator-checkout root (F06): bootstrap operations (config
+# parse, quiescence, archive validation) run from here — never from the
+# candidate release before it is validated, and never rely on an old
+# installed release for new-protocol gates.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Release checkout validator (N17): the tarball is NEVER trusted for its
 # own validation code. Archive inspection runs from the operator's
 # checkout copy before any root extraction.
 VALIDATE_ARCHIVE="$SCRIPT_DIR/../etc/validate-archive.py"
+# Version-independent quiescence controller (F07): proves quiescence
+# from stable DB/systemd contracts without requiring any installed
+# release to implement the newest protocol.
+QUIESCE_CHECK="$SCRIPT_DIR/../etc/quiescence-check.py"
 
 COMMIT=""
 TARBALL=""
@@ -94,16 +103,12 @@ fi
 # quiescence/status/validator/migrate/readiness.
 export EGA_CONFIG_FILE="$ETC/config.json"
 
-# Config values come ONLY from config_cli (N16): the release venv
-# interpreter once staged, else system python3 over the staged tree
-# (PYTHONPATH; config parser is stdlib-only). Existing config must parse;
-# there are no silent fallbacks for an existing-but-broken config.
+# Config values come ONLY from the trusted checkout parser (F06/N16):
+# PYTHONPATH=$REPO_ROOT (operator checkout), never the candidate
+# release, never an old install. Existing config must parse; there are
+# no silent fallbacks for an existing-but-broken config.
 cfg_cli() {
-  if [ -x "$RELEASE_DIR/venv/bin/python" ]; then
-    EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.config_cli "$@"
-  else
-    PYTHONPATH="$RELEASE_DIR" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli "$@"
-  fi
+  PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli "$@"
 }
 
 cfg_value() {
@@ -175,32 +180,19 @@ else
   echo "[upgrade] drain created at $DRAIN (new plans/jobs refused)"
 fi
 
-# (2) Quiescence via canonical cli status (N01/R33): `status
-# --require-quiescent` exits 0 ONLY when proven quiescent (worker alive,
+# (2) Quiescence via the version-independent deploy controller (F07):
+# `quiescence-check.py` exits 0 ONLY when proven quiescent (worker alive,
 # no active/unresolved/recovery work, no live/unknown runner units, no
-# active delegated operations, drain present). Deployment relies on the
-# process exit — shell JSON parsing of quiescence is forbidden. Bounded
-# 120s, fail closed. CWD is the current release; EGA_CONFIG_FILE exported.
-echo "[upgrade] waiting for quiescence via cli status (bounded 120s)..."
-STATUS_PY="$CURRENT_LINK/venv/bin/python"
-STATUS_CWD="$PREV_RELEASE"
-if [ -n "$PREV_RELEASE" ] && [ -x "$STATUS_PY" ]; then
-  :
-else
-  # No runnable current release: quiescence cannot be proven from its
-  # CLI, and an ambient interpreter must never stand in (R32). Refuse
-  # closed with drain kept instead of waiting out a doomed loop.
-  echo "[upgrade] REFUSING: no runnable current release for the quiescence gate (drain kept)" >&2
-  exit 1
-fi
+# active delegated operations, drain present). No installed release —
+# old or candidate — participates. Bounded 120s, fail closed.
+echo "[upgrade] waiting for quiescence via deploy controller (bounded 120s)..."
 QUIESCED=0
 for _i in $(seq 1 24); do
-  cd "$STATUS_CWD" 2>/dev/null || cd /tmp
-  if EGA_CONFIG_FILE="$ETC/config.json" "$STATUS_PY" -m backend.app.cli status --require-quiescent >/tmp/ega-upgrade-status.json 2>/tmp/ega-upgrade-status.err; then
+  if python3 "$QUIESCE_CHECK" --config "$ETC/config.json" >/tmp/ega-upgrade-status.json 2>/tmp/ega-upgrade-status.err; then
     QUIESCED=1
     break
   fi
-  echo "[upgrade] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-upgrade-status.json detail.reasons..."
+  echo "[upgrade] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-upgrade-status.json reasons..."
   sleep 5
 done
 if [ "$QUIESCED" = "1" ]; then
@@ -237,14 +229,32 @@ echo "[upgrade] backup: $EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"
 # sha256sum, install venv with --require-hashes (NO fallback), then validate.
 if [ -e "$RELEASE_DIR" ]; then fail "release dir exists: $RELEASE_DIR"; fi
 mkdir -p "$RELEASE_DIR" || fail "cannot create $RELEASE_DIR"
+# F15: immutable staging — copy the operator tarball into a
+# root-controlled staging dir, digest it, validate the STAGED copy,
+# re-verify the digest, then extract exactly that file (no TOCTOU).
+STAGE_DIR="$(mktemp -d /var/tmp/ega-stage-XXXXXXXX)" || fail "cannot create staging dir"
+chmod 0700 "$STAGE_DIR"
+STAGED_ARCHIVE="$STAGE_DIR/release.tar.gz"
+cp -p "$TARBALL" "$STAGED_ARCHIVE" || fail "cannot stage tarball"
+CANDIDATE_SHA256="$(sha256sum "$STAGED_ARCHIVE" | awk '{print $1}')"
+[ -n "$CANDIDATE_SHA256" ] || fail "cannot digest staged archive"
+echo "[upgrade] candidate archive sha256: $CANDIDATE_SHA256"
 # N17: validate EVERY archive member BEFORE any root extraction, using
 # the checkout's validator — never code from the unvalidated tarball.
-if python3 "$VALIDATE_ARCHIVE" --archive "$TARBALL" --dest "$RELEASE_DIR"; then
+if python3 "$VALIDATE_ARCHIVE" --archive "$STAGED_ARCHIVE" --dest "$RELEASE_DIR"; then
   echo "[upgrade] archive validation ok"
 else
+  rm -rf "$STAGE_DIR"
   fail "archive validation blocked"
 fi
-tar -xzf "$TARBALL" -C "$RELEASE_DIR" || fail "tarball extraction failed"
+if [ "$(sha256sum "$STAGED_ARCHIVE" | awk '{print $1}')" != "$CANDIDATE_SHA256" ]; then
+  rm -rf "$STAGE_DIR"
+  fail "staged archive changed after validation"
+fi
+tar -xzf "$STAGED_ARCHIVE" -C "$RELEASE_DIR" || { rm -rf "$STAGE_DIR"; fail "tarball extraction failed"; }
+printf '%s  %s\n' "$CANDIDATE_SHA256" "$COMMIT" > "$RELEASE_DIR/CANDIDATE_SHA256"
+chmod 0644 "$RELEASE_DIR/CANDIDATE_SHA256"
+rm -rf "$STAGE_DIR"
 chown -R root:root "$RELEASE_DIR"
 # Build output mapping: frontend/vite.config.ts outDir is
 # ../backend/app/static and backend/app/main.py serves backend/app/static,
