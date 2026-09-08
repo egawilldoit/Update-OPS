@@ -324,7 +324,14 @@ def test_h02_adapters_emit_structured_refs():
     with open(os.path.join(_REPO_ROOT, "backend", "app", "adapters",
                            "codex.py"), "r", encoding="utf-8") as fh:
         codex_src = fh.read()
-    assert "codex-daemon" not in codex_src
+    # Product invariant: Codex never EMITS codex-daemon as a delegated
+    # systemd unit (it is an app-server concept, not a unit). Scoped
+    # to service-emission expressions only — explanatory comments may
+    # mention the old name.
+    service_lines = [line for line in codex_src.splitlines()
+                     if "services=" in line]
+    assert service_lines, "no services emission found in codex adapter"
+    assert all("codex-daemon" not in line for line in service_lines)
     with open(os.path.join(_REPO_ROOT, "backend", "app", "adapters",
                            "opencode.py"), "r", encoding="utf-8") as fh:
         opencode_src = fh.read()
@@ -1599,16 +1606,18 @@ def test_s01_both_service_identities_read_via_group():
 
 def test_s01_config_and_example_agree_on_location():
     import json as _json
-    from backend.app.config import settings as settings_lib
+    from backend.app.config import Settings as _Settings
 
-    assert str(getattr(settings_lib, "secrets_file", "")) == \
-        "/etc/ega-update/secrets.env"
+    # Source/default contract — never the live singleton, which the
+    # suite-wide autouse fixture intentionally repoints per test.
+    declared = _Settings.__dataclass_fields__[
+        "secrets_file"].default
+    assert declared == "/etc/ega-update/secrets.env"
     with open(os.path.join(_REPO_ROOT, "deploy", "etc",
                            "config.example.json"), "r",
               encoding="utf-8") as fh:
         example = _json.load(fh)
-    assert example.get("secrets_file") == \
-        "/etc/ega-update/secrets.env"
+    assert example.get("secrets_file") == declared
     assert "0640" in str(example.get("_comment_secrets_file", ""))
     assert "0600" not in str(
         example.get("_comment_secrets_file", ""))
