@@ -374,6 +374,25 @@ def main(argv=None):
                   "admission stays blocked): %s" % exc)
             return 1
 
+    # P2: the final verdict derives from PERSISTED post-reconciliation
+    # truth, never the pre-reconciliation snapshot above. A proven
+    # success may have atomically persisted succeeded/0/0 while the
+    # stale local `recovery` is still True — printing UNRESOLVED from
+    # the stale copy would be a false verdict. Re-read the row; any
+    # read failure stays fail-closed (unresolved hold).
+    try:
+        _fresh = conn.execute(
+            "SELECT state, unresolved, recovery_required FROM jobs"
+            " WHERE id=?", (args.job_id,)).fetchone()
+        if _fresh is not None:
+            state = str(_fresh["state"] or state)
+            recovery = bool(int(_fresh["recovery_required"] or 0))
+            _fresh_unresolved = bool(int(_fresh["unresolved"] or 0))
+        else:
+            _fresh_unresolved = True
+    except Exception:
+        _fresh_unresolved = True
+
     if args.clear_recovery:
         if not recovery:
             print("VERDICT: no updater remains; recovery_required already "
@@ -400,8 +419,9 @@ def main(argv=None):
               "remains. Terminal history preserved; run Check again.")
         return 0
 
-    if recovery or state in ("accepted", "preflight", "backup", "updating",
-                             "verifying", "interrupted"):
+    if recovery or _fresh_unresolved or state in (
+            "accepted", "preflight", "backup", "updating", "verifying",
+            "interrupted"):
         print("VERDICT: UNRESOLVED — no updater remains, but recovery/state "
               "needs an explicit `--clear-recovery` decision after "
               "inspecting the installation.")

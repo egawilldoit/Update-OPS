@@ -303,19 +303,27 @@ def load_secret_values(s):
     """Return known secret values for redaction (never logs values).
 
     Strict (G05): values parsed with the single shared parser
-    (sanitize.parse_secrets_content). An empty/unset ``secrets_file``
-    means no secrets by design and yields ``()``. A CONFIGURED but
-    missing/unreadable file raises SecretSourceError — callers on
-    durable evidence paths must fail closed instead of persisting
-    with zero secrets. Callers pass the values to redaction only,
-    never to logs or error details.
+    (sanitize.parse_secrets_content). NO source configured to THIS
+    helper (attribute missing, None, or "") means no secrets by
+    design and yields ``()``. A CONFIGURED path that is missing,
+    unreadable, non-string, or unparsable raises SecretSourceError —
+    callers on durable evidence paths must fail closed instead of
+    persisting with zero secrets. The V1 deployment default
+    (``/etc/ega-update/secrets.env``) lives in Settings/config
+    loading, not here: normal Settings always carry a configured
+    path, so deployed worker/API paths stay fail-closed. Callers
+    pass the values to redaction only, never to logs or error
+    details.
     """
     try:
-        path = getattr(s, "secrets_file", "") or "/etc/ega-update/secrets.env"
+        path = getattr(s, "secrets_file", "")
     except Exception as exc:
         raise SecretSourceError("settings unreadable: %s" % exc)
-    if not isinstance(path, str) or not path:
+    if path is None or path == "":
         return ()
+    if not isinstance(path, str):
+        raise SecretSourceError(
+            "secret source is not a path: %r" % (type(path).__name__,))
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             content = fh.read()

@@ -167,8 +167,10 @@ def test_h01_rollback_leaves_neither_job_nor_lease(tmp_path):
     real_execute = conn.execute
 
     def _failing_execute(sql, params=()):
-        if isinstance(sql, str) and sql.strip().upper().startswith(
-                "INSERT INTO jobs"):
+        # T01: normalize BOTH sides — upper() the haystack means the
+        # needle must be uppercase too, or injection never fires.
+        normalized = sql.strip().upper() if isinstance(sql, str) else ""
+        if normalized.startswith("INSERT INTO JOBS"):
             raise sqlite3.OperationalError("injected job failure")
         return real_execute(sql, params)
 
@@ -727,23 +729,27 @@ def test_h04_privilege_fields_participate_in_fingerprint():
         assert contract_fingerprint(altered) not in ("", baseline), key
 
 
-def test_h04_probe_privilege_change_invalidates_plan(tmp_path):
-    """A plan bound under a different probe privilege profile is
-    refused at admission (preview/apply parity is fingerprinted)."""
-    from backend.app.admission import admit
-    from backend.app.owner_env import (build_owner_contract,
-                                       contract_fingerprint)
+def test_h04_probe_privilege_change_invalidates_plan(tmp_path,
+                                                      monkeypatch):
+    """A plan bound under a probe privilege profile is refused once
+    the CURRENT owner contract drifts to another profile (T02).
+    The stored plan is never edited: plan hash stays valid, the live
+    environment differs     → config_changed (TRACE 7, not tampering)."""
+    from backend.app import owner_env as owner_env_lib
 
     support_lib.test_release_root()
     conn = _fresh_db(tmp_path)
     row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
-    altered = dict(build_owner_contract(None))
-    altered["probe_no_new_privileges"] = "true"
-    stale_fp = contract_fingerprint(altered)
-    assert stale_fp
-    conn.execute("UPDATE plans SET env_fingerprint=? WHERE id=?",
-                 (stale_fp, row["id"]))
-    conn.commit()
+    real_build = owner_env_lib.build_owner_contract
+
+    def _drifted_profile(*args, **kwargs):
+        contract = real_build(*args, **kwargs)
+        drifted = dict(contract)
+        drifted["probe_no_new_privileges"] = "true"
+        return drifted
+
+    monkeypatch.setattr(owner_env_lib, "build_owner_contract",
+                        _drifted_profile)
     support_lib.test_release_root()
     _jid, created, err = _admit(conn, row["id"], "k-h04-fp")
     assert err == "config_changed" and not created, err
@@ -1321,6 +1327,136 @@ def test_h05f_crash_after_success_then_second_job(tmp_path,
     assert jid2 != jid1
     assert _lease_held(conn, jid2)
     conn.close()
+
+
+# -- SSH P2: verdict derives from persisted truth ------------------------------
+
+def _ssh_setup(tmp_path, monkeypatch, state="verifying", nonce="n-sshp2"):
+    """Admitted + claimed crash row. Returns
+    (db_path, log_dir, jid, plan_id, nonce)."""
+    from backend.app import jobs as jobs_lib
+    from backend.app.config import settings as settings_lib
+
+    support_lib.use_test_secrets(monkeypatch, tmp_path)
+    log_dir = str(tmp_path / "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    monkeypatch.setattr(settings_lib, "log_dir", log_dir)
+    db_path = str(tmp_path / "ssh.db")
+    conn = _fresh_db(tmp_path, "ssh.db")
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = _admit(conn, row["id"], "k-sshp2-%s" % nonce)
+    assert err == "" and created, err
+    assert jobs_lib.claim_with_nonce(conn, jid, nonce) is True
+    _crash_row(conn, jid, state)
+    conn.commit()
+    conn.close()
+    return db_path, log_dir, jid, row["id"], nonce
+
+
+def _ssh_quiescent(monkeypatch):
+    from backend.app import units as units_lib
+    import backend.app.worker.reconcile as reconcile_mod
+
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=10: {"state": "confirmed_stopped",
+                                    "unit": unit, "detail": ""})
+    monkeypatch.setattr(
+        units_lib, "query_unit_system",
+        lambda unit, timeout_s=10: {"state": "confirmed_stopped",
+                                    "unit": unit, "detail": ""})
+    # Human-readable inspection only; never part of transitions.
+    monkeypatch.setattr(reconcile_mod, "_genuine_inspection",
+                        lambda _tool_id: "test inspection")
+
+
+def test_sshp2_crash_success_resolves_exit_zero(tmp_path, monkeypatch,
+                                                capsys):
+    """Proven crash-success via SSH: DB succeeded/0/0, lease released,
+    exit 0, resolved verdict (not the stale pre-read)."""
+    import sqlite3 as _sqlite
+    import backend.app.db as db_lib
+    import backend.app.worker.reconcile as reconcile_mod
+
+    db_path, log_dir, jid, plan_id, nonce = _ssh_setup(
+        tmp_path, monkeypatch)
+    conn = db_lib.connect(db_path)
+    try:
+        data = _success_receipt_data(conn, jid, plan_id, nonce)
+    finally:
+        conn.close()
+    _write_receipt(log_dir, jid, data)
+    _ssh_quiescent(monkeypatch)
+    assert reconcile_mod.main(
+        ["--job-id", jid, "--db-path", db_path]) == 0
+    out = capsys.readouterr().out
+    assert "VERDICT: resolved" in out
+    check = _sqlite.connect(db_path)
+    check.row_factory = _sqlite.Row
+    try:
+        row = dict(check.execute("SELECT state, unresolved,"
+                                 " recovery_required FROM jobs WHERE id=?",
+                                 (jid,)).fetchone())
+        assert (row["state"], int(row["unresolved"] or 0),
+                int(row["recovery_required"] or 0)) == (
+                    "succeeded", 0, 0)
+    finally:
+        check.close()
+    check = db_lib.connect(db_path)
+    try:
+        assert not _lease_held(check, jid)
+    finally:
+        check.close()
+
+
+def test_sshp2_ambiguous_failure_stays_unresolved(tmp_path, monkeypatch,
+                                                  capsys):
+    """No resolving receipt: recovery stays, exit nonzero, even with
+    quiescence proven."""
+    import sqlite3 as _sqlite
+    import backend.app.worker.reconcile as reconcile_mod
+
+    db_path, _log_dir, jid, _pid, _nonce = _ssh_setup(
+        tmp_path, monkeypatch, state="updating", nonce="n-sshp2b")
+    _ssh_quiescent(monkeypatch)
+    assert reconcile_mod.main(
+        ["--job-id", jid, "--db-path", db_path]) == 1
+    out = capsys.readouterr().out
+    assert "VERDICT: UNRESOLVED" in out
+    check = _sqlite.connect(db_path)
+    check.row_factory = _sqlite.Row
+    try:
+        row = dict(check.execute("SELECT state, unresolved,"
+                                 " recovery_required FROM jobs WHERE id=?",
+                                 (jid,)).fetchone())
+        assert row["state"] == "interrupted"
+        assert int(row["recovery_required"] or 0) == 1
+    finally:
+        check.close()
+
+
+def test_sshp2_manual_clear_still_works(tmp_path, monkeypatch, capsys):
+    """--clear-recovery remains the manual path for genuinely
+    ambiguous outcomes."""
+    import sqlite3 as _sqlite
+    import backend.app.worker.reconcile as reconcile_mod
+
+    db_path, _log_dir, jid, _pid, _nonce = _ssh_setup(
+        tmp_path, monkeypatch, state="interrupted", nonce="n-sshp2c")
+    _ssh_quiescent(monkeypatch)
+    assert reconcile_mod.main(
+        ["--job-id", jid, "--db-path", db_path,
+         "--clear-recovery"]) == 0
+    out = capsys.readouterr().out
+    assert "CLEARED" in out
+    check = _sqlite.connect(db_path)
+    check.row_factory = _sqlite.Row
+    try:
+        row = dict(check.execute("SELECT recovery_required FROM jobs"
+                                 " WHERE id=?", (jid,)).fetchone())
+        assert int(row["recovery_required"] or 0) == 0
+    finally:
+        check.close()
 
 
 # -- H06 evidence-init blocks mutation -----------------------------------------

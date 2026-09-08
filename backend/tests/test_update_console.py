@@ -73,13 +73,21 @@ def _insert_plan(conn, plan_id, tool_id="hermes", fingerprint="fp-test-1",
                             expires_future=expires_future)
 
 
-def _reserve_in_tx(db_path, tool_id, plan_id, subject, idem_key, ack, out, idx):
+def _reserve_in_tx(db_path, tool_id, plan_id, subject, idem_key, ack, out, idx,
+                   barrier=None):
     # type: (...) -> None
     """One admission attempt in its own connection (no tx held by caller;
-    admission owns its transaction)."""
+    admission owns its transaction). An optional barrier releases all
+    contenders simultaneously for deterministic contention."""
     support_lib.test_release_root()
     conn = db_lib.connect(db_path)
     try:
+        if barrier is not None:
+            try:
+                barrier.wait(timeout=30)
+            except Exception as exc:
+                out[idx] = ("error", "", False, "barrier:%s" % exc)
+                return
         try:
             plan = conn.execute("SELECT fingerprint FROM plans WHERE id=?",
                                 (plan_id,)).fetchone()
@@ -118,12 +126,16 @@ def test_concurrent_reservation_single_slot(tmp_path):
 
     n = len(plan_ids)
     out = [None] * n  # type: ignore
+    # Deterministic contention: every contender starts the admission
+    # attempt at the same instant (a sequential start would serialize
+    # the race away and hide lost-update defects).
+    barrier = threading.Barrier(n)
     threads = []
     for i, pid in enumerate(plan_ids):
         t = threading.Thread(
             target=_reserve_in_tx,
             args=(db_path, "hermes", pid, "owner@example.invalid",
-                  "key-%d" % i, False, out, i))
+                  "key-%d" % i, False, out, i, barrier))
         threads.append(t)
     for t in threads:
         t.start()
@@ -151,14 +163,15 @@ def test_concurrent_same_idempotency_key_single_winner(tmp_path):
     _insert_plan(setup, pid)
     setup.close()
     out = [None, None]  # type: ignore
+    pair_barrier = threading.Barrier(2)
     t1 = threading.Thread(
         target=_reserve_in_tx,
         args=(db_path, "hermes", pid, "owner@example.invalid",
-              "shared-key", False, out, 0))
+              "shared-key", False, out, 0, pair_barrier))
     t2 = threading.Thread(
         target=_reserve_in_tx,
         args=(db_path, "hermes", pid, "owner@example.invalid",
-              "shared-key", False, out, 1))
+              "shared-key", False, out, 1, pair_barrier))
     t1.start()
     t2.start()
     t1.join(timeout=30)

@@ -997,6 +997,46 @@ def test_g05_absent_by_design_yields_empty_set():
 
     assert load_secret_values(_Settings()) == ()
 
+    class _BareSettings(object):
+        pass
+
+    assert load_secret_values(_BareSettings()) == ()
+
+    class _NoneSettings(object):
+        secrets_file = None
+
+    assert load_secret_values(_NoneSettings()) == ()
+
+
+def test_g05_non_string_source_raises():
+    """A configured non-string source is a broken source, never
+    silently empty secrets (G05)."""
+    from backend.app.config import SecretSourceError, load_secret_values
+
+    class _Settings(object):
+        secrets_file = 12345
+
+    with pytest.raises(SecretSourceError):
+        load_secret_values(_Settings())
+
+
+def test_g05_valid_file_parses_values(tmp_path):
+    """A configured valid file yields exactly its parsed values."""
+    from backend.app.config import load_secret_values
+
+    path = tmp_path / "some.env"
+    path.write_text("ALPHA=first-secret-value\n"
+                    "export BETA='second-secret-value'\n",
+                    encoding="utf-8")
+
+    class _Settings(object):
+        secrets_file = str(path)
+
+    values = load_secret_values(_Settings())
+    assert "first-secret-value" in values
+    assert "second-secret-value" in values
+    assert "ALPHA" not in values
+
 
 def test_g05_configured_missing_unreadable_raise(tmp_path):
     from backend.app.config import SecretSourceError, load_secret_values
