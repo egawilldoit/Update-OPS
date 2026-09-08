@@ -438,3 +438,83 @@ def test_f04_strict_exit_parsing():
         "2026-09-08T00:00:00+00:00", installer_exit="0")
     assert receipt["exit_code"] == 0
     assert receipt["installer_exit"] == 0
+
+
+# -- F05 migration inference safety --------------------------------------------
+
+def _apply_files(conn, *filenames):
+    for filename in filenames:
+        with open(os.path.join(_REPO_ROOT, "backend", "migrations",
+                               filename), "r", encoding="utf-8") as fh:
+            conn.executescript(fh.read())
+    conn.commit()
+
+
+def test_f05_full_v1_infers_1_and_migrates(tmp_path):
+    conn = db_lib.connect(str(tmp_path / "v1.db"))
+    _apply_files(conn, "001_init.sql")
+    assert db_lib.is_schema_version_fully_present(conn, 1) is True
+    assert db_lib.is_schema_version_fully_present(conn, 2) is False
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    assert db_lib.validate_schema(conn) == db_lib.CODE_VERSION
+    conn.close()
+
+
+def test_f05_full_v2_infers_1_and_2(tmp_path):
+    conn = db_lib.connect(str(tmp_path / "v2.db"))
+    _apply_files(conn, "001_init.sql", "002_execution_hardening.sql")
+    assert db_lib.is_schema_version_fully_present(conn, 2) is True
+    assert db_lib.is_schema_version_fully_present(conn, 3) is False
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    conn.close()
+
+
+def test_f05_partial_003_marker_subset_not_inferred(tmp_path):
+    """The old marker subset (two columns of ~thirty changes) must NOT
+    count as migration 003: the engine finishes the work instead."""
+    conn = db_lib.connect(str(tmp_path / "p3.db"))
+    _apply_files(conn, "001_init.sql", "002_execution_hardening.sql")
+    conn.execute("ALTER TABLE jobs ADD COLUMN attempt_claimed INTEGER"
+                 " NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE plans ADD COLUMN plan_hash TEXT NOT NULL"
+                 " DEFAULT ''")
+    conn.commit()
+    assert db_lib.is_schema_version_fully_present(conn, 2) is True
+    assert db_lib.is_schema_version_fully_present(conn, 3) is False
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    assert db_lib.is_schema_version_fully_present(
+        conn, db_lib.CODE_VERSION) is True
+    # Rerun remains idempotent.
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    conn.close()
+
+
+def test_f05_complete_003_infers_3(tmp_path):
+    conn = db_lib.connect(str(tmp_path / "c3.db"))
+    _apply_files(conn, "001_init.sql", "002_execution_hardening.sql",
+                 "003_corrective.sql")
+    assert db_lib.is_schema_version_fully_present(conn, 3) is True
+    assert db_lib.is_schema_version_fully_present(conn, 4) is False
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    conn.close()
+
+
+def test_f05_partial_004_not_inferred_then_completed(tmp_path):
+    conn = db_lib.connect(str(tmp_path / "p4.db"))
+    _apply_files(conn, "001_init.sql", "002_execution_hardening.sql",
+                 "003_corrective.sql")
+    conn.execute(
+        "CREATE TABLE execution_leases (id TEXT PRIMARY KEY,"
+        " kind TEXT NOT NULL DEFAULT '')")
+    conn.commit()
+    assert db_lib.is_schema_version_fully_present(conn, 3) is True
+    assert db_lib.is_schema_version_fully_present(conn, 4) is False
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    cols = {r["name"] for r in
+            conn.execute("PRAGMA table_info(execution_leases)").fetchall()}
+    assert "released_at" in cols
+    assert "env_fingerprint" in {
+        r["name"] for r in
+        conn.execute("PRAGMA table_info(plans)").fetchall()}
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    conn.close()

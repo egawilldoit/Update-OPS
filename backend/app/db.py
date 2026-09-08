@@ -37,13 +37,34 @@ MIGRATIONS = (
 # restore is safe without a DB backup restore.
 ROLLBACK_OK = frozenset([(4, 3), (4, 2), (4, 1), (3, 2), (3, 1), (2, 1)])
 
-BASE_TABLES = ("schema_meta", "tools", "plans", "jobs", "checks",
-               "backups", "events")
-V3_TABLES = BASE_TABLES + ("schema_migrations", "probe_requests",
-                           "probe_results", "tombstones")
-V4_TABLES = V3_TABLES + ("execution_leases",)
+# F05: complete per-version structural contracts. Every table lists ALL
+# required columns (not just added ones); every version lists its index
+# requirements. Inference and verification both consume these maps, so a
+# partial signature (e.g. two marker columns of twenty changes) can
+# never be mistaken for a complete migration.
+BASE_COLUMNS = {
+    "schema_meta": ("key", "value"),
+    "tools": ("id", "install_identity", "observed_version",
+              "available_target", "channel", "observation_time",
+              "discovery_error", "health", "health_detail", "updated_at"),
+    "plans": ("id", "tool_id", "subject", "created_at", "expires_at",
+              "fingerprint", "target", "target_mode", "channel",
+              "services", "backup_scope", "activity_state",
+              "activity_evidence", "used_at"),
+    "jobs": ("id", "tool_id", "plan_id", "subject", "idempotency_key",
+             "request_hash", "state", "step", "before_version",
+             "after_version", "created_at", "started_at", "finished_at",
+             "exit_code", "error_code", "error_detail", "ack",
+             "runner_unit", "heartbeat", "recovery_required"),
+    "checks": ("id", "tool_id", "job_id", "name", "result", "mandatory",
+               "summary", "created_at"),
+    "backups": ("id", "job_id", "path", "scope", "consistency",
+                "size_bytes", "completed_at"),
+    "events": ("seq", "job_id", "created_at", "event_type", "detail"),
+}
 
-# version -> required jobs/plans/tools columns beyond the base set.
+# version -> extra (table, column) pairs beyond the base set (complete:
+# every ALTER in the corresponding migration file is represented).
 REQUIRED_COLUMNS = {
     2: [("tools", "fingerprint"), ("jobs", "dispatch_nonce")],
     3: [("jobs", "attempt_claimed"), ("jobs", "claim_deadline"),
@@ -51,13 +72,104 @@ REQUIRED_COLUMNS = {
         ("jobs", "install_outcome"), ("jobs", "actual_change"),
         ("jobs", "final_log_seq"), ("jobs", "release_path"),
         ("jobs", "canonical_unit"),
-        ("plans", "plan_version"), ("plans", "plan_hash"),
-        ("plans", "config_hash"), ("plans", "release_path"),
-        ("plans", "required_checks_json"), ("plans", "steps_json"),
-        ("plans", "deadlines_json"),
-        ("tools", "last_success_at"), ("tools", "last_attempt_at")],
+        ("plans", "plan_version"), ("plans", "install_identity"),
+        ("plans", "artifact_json"), ("plans", "config_hash"),
+        ("plans", "plan_hash"), ("plans", "launch_json"),
+        ("plans", "state_homes_json"), ("plans", "backup_policy_json"),
+        ("plans", "required_probes_json"), ("plans", "budgets_json"),
+        ("plans", "space_json"), ("plans", "deadlines_json"),
+        ("plans", "restart_detail"), ("plans", "activity_ts"),
+        ("plans", "release_path"), ("plans", "required_space_bytes"),
+        ("plans", "required_checks_json"), ("plans", "restart_impact"),
+        ("plans", "steps_json"),
+        ("tools", "last_success_at"), ("tools", "last_attempt_at"),
+        ("tools", "last_attempt_error")],
     4: [("plans", "env_fingerprint")],
 }
+
+# version -> extra tables with their full required columns.
+EXTRA_TABLES = {
+    3: {
+        "schema_migrations": ("version", "applied_at", "note"),
+        "probe_requests": ("id", "subject", "tool_id", "op", "arg_json",
+                           "created_at", "claim_deadline", "state",
+                           "owner", "result_id"),
+        "probe_results": ("request_id", "status", "result_json",
+                          "finished_at"),
+        "tombstones": ("id", "kind", "ref", "reason", "created_at"),
+    },
+    4: {
+        "execution_leases": ("id", "kind", "subject", "tool_id", "job_id",
+                             "request_id", "holder", "acquired_at",
+                             "expires_at", "released_at"),
+    },
+}
+
+# version -> required index names (ux_jobs_single_active additionally
+# requires the constant-expression form; see _index_ok).
+REQUIRED_INDEXES = {
+    1: ("ux_jobs_single_active", "ix_jobs_tool_created",
+        "ix_events_job_seq", "ix_checks_job"),
+    3: ("ix_probe_queue", "ix_tombstones_ref"),
+    4: ("ix_leases_kind_released",),
+}
+
+
+def _index_ok(conn, name):
+    # type: (sqlite3.Connection, str) -> bool
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND"
+            " name=?", (name,)).fetchone()
+    except Exception:
+        return False
+    if row is None:
+        return False
+    if name == "ux_jobs_single_active":
+        return "(1)" in str(row["sql"] or "")
+    return True
+
+
+def is_schema_version_fully_present(conn, version):
+    # type: (sqlite3.Connection, int) -> bool
+    """F05: prove the ENTIRE structural contract for a version.
+
+    Cumulative: version N requires every table/column/index of versions
+    1..N. A partial signature (e.g. two marker columns of twenty
+    changes) returns False and the migration engine finishes the work
+    instead of recording a false applied entry. Never writes.
+    """
+    try:
+        current = int(version)
+    except (TypeError, ValueError):
+        return False
+    if current < 1 or current > CODE_VERSION:
+        return False
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        tables = {str(r["name"]) for r in rows}
+    except Exception:
+        return False
+    for table, columns in BASE_COLUMNS.items():
+        if table not in tables:
+            return False
+        if not set(columns) <= _table_columns(conn, table):
+            return False
+    for version_step in range(2, current + 1):
+        for table, column in REQUIRED_COLUMNS.get(version_step, []):
+            if column not in _table_columns(conn, table):
+                return False
+        for table, columns in EXTRA_TABLES.get(version_step, {}).items():
+            if table not in tables:
+                return False
+            if not set(columns) <= _table_columns(conn, table):
+                return False
+    for version_step in range(1, current + 1):
+        for index in REQUIRED_INDEXES.get(version_step, ()):
+            if not _index_ok(conn, index):
+                return False
+    return True
 
 
 class SchemaError(Exception):
@@ -151,35 +263,22 @@ def _table_columns(conn, table):
 
 def _infer_applied(conn):
     # type: (sqlite3.Connection) -> set
-    """Pre-ledger databases: infer from objects present (recorded as
-    inferred so reruns stay idempotent)."""
-    inferred = set()  # type: set
-    tables = set()
-    try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        tables = {str(r["name"]) for r in rows}
-    except Exception:
-        return inferred
-    if not {"tools", "plans", "jobs"} <= tables:
-        return inferred
-    inferred.add(1)
-    cols_tools = _table_columns(conn, "tools")
-    cols_jobs = _table_columns(conn, "jobs")
-    if "fingerprint" in cols_tools and "dispatch_nonce" in cols_jobs:
-        inferred.add(2)
-    if "attempt_claimed" in cols_jobs and \
-            "plan_hash" in _table_columns(conn, "plans"):
-        inferred.add(3)
-    try:
-        tables_now = {str(r["name"]) for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    except Exception:
-        tables_now = set()
-    if "execution_leases" in tables_now and \
-            "env_fingerprint" in _table_columns(conn, "plans"):
-        inferred.add(4)
-    return inferred
+    """Pre-ledger databases: infer ONLY fully proven versions (F05).
+
+    Highest fully-present version wins (contracts are cumulative, so
+    proving N proves 1..N). A partial signature records nothing — the
+    migration engine then completes the work instead of the ledger
+    permanently blocking repair. Read-only.
+    """
+    for version in (CODE_VERSION, 3, 2, 1):
+        if version < 1:
+            continue
+        try:
+            if is_schema_version_fully_present(conn, version):
+                return set(range(1, version + 1))
+        except Exception:
+            continue
+    return set()
 
 
 def _read_version(conn):
@@ -196,35 +295,43 @@ def _read_version(conn):
 
 def _verify_objects(conn, upto):
     # type: (sqlite3.Connection, int) -> None
+    """Verify the complete structural contract through `upto` (F05).
+
+    Same maps as inference: base columns, every ALTER column, extra
+    tables with full columns, and every required index (including the
+    constant-expression form of the single-slot index).
+    """
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        tables = {str(r["name"]) for r in rows}
-    except Exception as exc:
-        raise SchemaError("cannot inspect schema: %s" % exc)
-    missing = [t for t in
-               (V4_TABLES if upto >= 4
-                else V3_TABLES if upto >= 3 else BASE_TABLES)
-               if t not in tables]
-    if missing:
-        raise SchemaError("missing tables: %s" % ",".join(missing))
+        upto_i = int(upto)
+    except (TypeError, ValueError):
+        raise SchemaError("bad verify target: %r" % (upto,))
+    for table, columns in BASE_COLUMNS.items():
+        if not set(columns) <= _table_columns(conn, table):
+            raise SchemaError("base table %s incomplete" % table)
     for version in sorted(REQUIRED_COLUMNS):
-        if version > upto:
+        if version > upto_i:
             continue
         for table, column in REQUIRED_COLUMNS[version]:
             if column not in _table_columns(conn, table):
                 raise SchemaError(
                     "migration %d incomplete: %s.%s missing"
                     % (version, table, column))
-    try:
-        idx = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND"
-            " name='ux_jobs_single_active'").fetchone()
-    except Exception as exc:
-        raise SchemaError("cannot inspect index: %s" % exc)
-    if idx is None or "(1)" not in str(idx["sql"] or ""):
-        raise SchemaError("ux_jobs_single_active is not the "
-                          "constant-expression form")
+    for version in sorted(EXTRA_TABLES):
+        if version > upto_i:
+            continue
+        for table, columns in EXTRA_TABLES[version].items():
+            if not set(columns) <= _table_columns(conn, table):
+                raise SchemaError(
+                    "migration %d incomplete: %s incomplete"
+                    % (version, table))
+    for version in sorted(REQUIRED_INDEXES):
+        if version > upto_i:
+            continue
+        for index in REQUIRED_INDEXES[version]:
+            if not _index_ok(conn, index):
+                raise SchemaError(
+                    "migration %d incomplete: index %s missing/invalid"
+                    % (version, index))
 
 
 def _split_statements(sql):
