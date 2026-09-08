@@ -940,13 +940,15 @@ class Runner(object):
 
     def _run_phase(self, phase, payload_extra, timeout_s, op=""):
         # type: (str, Dict[str, Any], float, str) -> Tuple[bool, Dict[str, Any], str, bool]
-        """One supervised phase (N10): worker process in an owned scope.
+        """One supervised phase (N10, F03): worker process in an owned
+        scope launched with the canonical contract env.
 
         Returns (ok, data, error, timed_out). Live stream lines flow to
         the log while the worker runs. No worker Python survives a
         declared timeout: it is an OS process in the killed cgroup.
         """
         from .phase_run import run_supervised_phase
+        from ..owner_env import build_owner_contract, contract_env
 
         settings = self._settings()
         try:
@@ -955,11 +957,16 @@ class Runner(object):
         except Exception:
             log_dir = "/var/lib/ega-update/logs"
         try:
+            env = contract_env(build_owner_contract(settings))
+        except Exception as exc:
+            return False, {}, "owner contract unbuildable: %s" % exc, \
+                False
+        try:
             out = run_supervised_phase(
                 self.tool_id, self.job_id, phase,
                 dict(payload_extra or {}), timeout_s, settings,
                 log_dir, self._live_on_line, op=op,
-                cancel_event=self._stop)
+                cancel_event=self._stop, env=env)
         except Exception as exc:
             return False, {}, "supervision failed: %s" % exc, False
         try:

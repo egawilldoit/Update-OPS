@@ -13,6 +13,9 @@
 #     --working-directory=<resolved-release> \
 #     --setenv=EGA_CONFIG_FILE=... \
 #     --setenv=EGA_ATTEMPT_NONCE=... --setenv=<allow-listed owner env> \
+#     (--setenv covers the canonical OwnerExecutionContract: PATH, HOME,
+#     USER, LOGNAME, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, LANG,
+#     LC_ALL, LC_CTYPE, TZ — identical keys for probes and phases) \
 #     --property=KillMode=control-group \
 #     --property=Restart=no \
 #     <release-venv-python> -m backend.app.worker.runner <job-id> <nonce>

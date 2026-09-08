@@ -119,6 +119,127 @@ def test_f01_env_release_config_target_mutations_break_hash(tmp_path):
     conn.close()
 
 
+# -- F03 unified owner execution contract --------------------------------------
+
+def _contract(**over):
+    from backend.app.owner_env import build_owner_contract
+
+    support_lib.test_release_root()
+    base = {"LANG": "C.UTF-8", "TZ": "UTC"}
+    base.update(over)
+    return build_owner_contract(None, None, "", base)
+
+
+def test_f03_probe_env_equals_apply_env():
+    """Runner launch env and probe launch env derive from ONE contract:
+    identical except the attempt nonce (probes never consume attempts)."""
+    from backend.app.owner_env import contract_env, contract_fingerprint
+
+    contract = _contract()
+    probe_env = contract_env(contract)
+    apply_env = contract_env(contract, nonce="n-1")
+    for key, value in probe_env.items():
+        assert apply_env.get(key) == value, key
+    assert apply_env["EGA_ATTEMPT_NONCE"] == "n-1"
+    assert "EGA_ATTEMPT_NONCE" not in probe_env
+    assert contract_fingerprint(contract)
+    # Same inputs rebuild the identical contract (deterministic).
+    again = _contract()
+    assert again == contract
+
+
+def test_f03_every_contract_field_moves_fingerprint(monkeypatch):
+    """Bus/locale/release/owner-identity/privilege changes each move the
+    fingerprint (F03: no conceptual approximation).
+
+    Note: raw environ HOME/USER/PATH are deliberately NOT contract
+    inputs — the contract takes uid/gid/user/home from passwd and PATH
+    from the configured node bin, so a stray login-shell override can
+    neither sneak in nor invalidate. Owner identity itself (tool_owner)
+    does move the fingerprint.
+    """
+    from backend.app.config import settings as settings_lib
+    from backend.app.owner_env import contract_fingerprint
+
+    baseline = contract_fingerprint(_contract())
+    assert baseline
+    for variant in (
+            _contract(XDG_RUNTIME_DIR="/run/user/9999"),
+            _contract(DBUS_SESSION_BUS_ADDRESS="unix:path=/other/bus"),
+            _contract(LANG="fr_FR.UTF-8"),
+            _contract(TZ="America/New_York")):
+        assert contract_fingerprint(variant) not in ("", baseline)
+    monkeypatch.setattr(settings_lib, "tool_owner", "other-owner")
+    assert contract_fingerprint(_contract()) != baseline
+
+
+def test_f03_release_node_privilege_move_fingerprint(monkeypatch):
+    from backend.app import inventory as inventory_lib
+    from backend.app import owner_env as owner_env_lib
+    from backend.app.config import settings as settings_lib
+
+    support_lib.test_release_root()
+    baseline = owner_env_lib.contract_fingerprint(
+        owner_env_lib.build_owner_contract())
+    assert baseline
+    assert owner_env_lib.contract_fingerprint(
+        owner_env_lib.build_owner_contract(
+            None, None, "/other-release")) != baseline
+    monkeypatch.setattr(settings_lib, "node_path",
+                        "/other/node/bin/node")
+    assert owner_env_lib.contract_fingerprint(
+        owner_env_lib.build_owner_contract()) != baseline
+
+
+def test_f03_sudo_profile_change_moves_fingerprint(monkeypatch):
+    from backend.app import inventory as inventory_lib
+    from backend.app import owner_env as owner_env_lib
+
+    support_lib.test_release_root()
+    baseline = owner_env_lib.contract_fingerprint(
+        owner_env_lib.build_owner_contract())
+    monkeypatch.setattr(
+        inventory_lib, "get_tool_inventory",
+        lambda tool_id: {"service_units": [
+            {"unit": "hermes-gateway@x.service",
+             "restart_authority": "owner-sudo"}],
+            "launch_method": "systemd --user"} if tool_id == "hermes"
+        else {})
+    changed = owner_env_lib.contract_fingerprint(
+        owner_env_lib.build_owner_contract())
+    assert changed and changed != baseline
+
+
+def test_f03_stale_env_fingerprint_blocks_admission(tmp_path):
+    """A plan bound to an older environment is invalidated at admission
+    (config_changed), never silently applied under a new contract.
+
+    The stored plan keeps a CONSISTENT hash for the stale environment
+    (recomputed like production does), so the test exercises exactly
+    the env gate rather than the tamper gate.
+    """
+    from backend.app import plans as plans_lib
+    from backend.app.admission import admit
+
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    stored = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                              (row["id"],)).fetchone())
+    stored["env_fingerprint"] = "stale-environment-fingerprint"
+    fresh_hash = plans_lib.canonical_plan_hash(
+        plans_lib._hash_view(stored))
+    conn.execute("UPDATE plans SET env_fingerprint=?, plan_hash=?"
+                 " WHERE id=?",
+                 ("stale-environment-fingerprint", fresh_hash,
+                  row["id"]))
+    conn.commit()
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-f03", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "config_changed" and not created
+    conn.close()
+
+
 # -- F02 mutation ownership lifetime -------------------------------------------
 
 def test_f02_terminal_live_unit_keeps_lease(tmp_path, monkeypatch):

@@ -127,41 +127,255 @@ def validate_executables(paths):
 
 def build_job_env(nonce, paths=None, extra_bus=None):
     # type: (str, object, object) -> Dict[str, str]
-    """Allow-listed environment for the runner unit (R02).
+    """Allow-listed environment for the runner unit (R02, F03).
 
-    Only ALLOW_ENV_KEYS-derived values plus EGA_CONFIG_FILE/EGA_ATTEMPT_NONCE
-    and owner Node paths. Never copies os.environ wholesale.
+    Derived from the single canonical contract (build_owner_contract),
+    never reconstructed here: preview and apply share it exactly.
+    extra_bus merges existence-resolved bus values (dispatcher side).
     """
-    paths = dict(paths or {})
-    node_bin = os.path.dirname(paths.get("node_path", "") or "")
+    try:
+        merged_source = dict(_environ_mapping(None))
+    except Exception:
+        merged_source = {}
+    if isinstance(extra_bus, dict):
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            try:
+                if extra_bus.get(key):
+                    merged_source[key] = str(extra_bus[key])
+            except Exception:
+                continue
+    try:
+        from .config import settings as _defaults
+    except Exception:
+        _defaults = None
+    _release = ""
+    try:
+        _release = str((paths or {}).get("release_root", "") or "")
+    except Exception:
+        _release = ""
+    try:
+        contract = build_owner_contract(
+            _defaults, None, _release, merged_source)
+    except Exception:
+        contract = {}
+    if paths:
+        # Honor explicitly supplied resolved paths (tests, tooling).
+        try:
+            for key, ckey in (("node_path", "node"),
+                              ("npm_path", "npm"),
+                              ("npx_path", "npx"),
+                              ("home", "home"), ("user", "user"),
+                              ("config_path", "config")):
+                val = (paths or {}).get(key, "")
+                if val:
+                    contract[ckey] = str(val)
+            node_bin = os.path.dirname(
+                str((paths or {}).get("node_path", "") or ""))
+            if node_bin:
+                parts = [node_bin] + [
+                    p for p in ["/usr/local/bin", "/usr/bin", "/bin"]
+                    if p != node_bin]
+                contract["path"] = ":".join(parts)
+        except Exception:
+            pass
+    return contract_env(contract, nonce)
+
+
+LOCALE_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TZ")
+
+BUS_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _environ_mapping(source=None):
+    # type: (object) -> Dict[str, str]
+    """Read-only snapshot of the relevant process environment."""
+    if isinstance(source, dict):
+        return {str(k): str(v) for k, v in source.items()}
+    try:
+        import os as _os
+        return dict(_os.environ)
+    except Exception:
+        return {}
+
+
+def build_owner_contract(settings=None, inventory=None, release_path="",
+                         env_source=None):
+    # type: (object, object, str, object) -> Dict[str, str]
+    """One canonical owner execution contract (F03).
+
+    Every execution-relevant property in ONE typed structure, derived
+    once from canonical sources — never reconstructed per module:
+    uid/gid/user/home (passwd), PATH (node bin + fixed fallbacks),
+    config file, release root, venv/node/npm/npx paths, XDG runtime +
+    DBus address, locale/TZ, NoNewPrivileges policy, systemd manager
+    scope, and the approved sudo/service-authority profile identifier.
+
+    env_source supplies bus/locale values (default: this process's
+    environ). The dispatcher passes its environ (+ existence-resolved
+    bus); scoped workers inherit the contract through --setenv and
+    therefore resolve the identical contract from their own environ.
+    All values are strings; missing values are "" (explicit, comparable).
+    """
+    try:
+        from .config import settings as _defaults
+    except Exception:
+        _defaults = None
+    s = settings if settings is not None else _defaults
+    environ = _environ_mapping(env_source)
+    try:
+        paths = resolved_paths(s, inventory)
+    except Exception:
+        paths = {}
+    if release_path:
+        release = str(release_path)
+    else:
+        try:
+            release = resolve_release()
+        except Exception:
+            release = ""
+    user = str(paths.get("user", "") or "ubuntu")
+    uid = str(paths.get("uid", "") or "")
+    gid = str(paths.get("gid", "") or "")
+    home = str(paths.get("home", "") or "")
+    node_bin = ""
+    try:
+        import os as _os
+        node_bin = _os.path.dirname(paths.get("node_path", "") or "")
+    except Exception:
+        node_bin = ""
     path_parts = []
     if node_bin:
         path_parts.append(node_bin)
     for fallback in ("/usr/local/bin", "/usr/bin", "/bin"):
         if fallback not in path_parts:
             path_parts.append(fallback)
-    env = {
-        "PATH": ":".join(path_parts),
-        "HOME": paths.get("home", "") or "/home/ubuntu",
-        "USER": paths.get("user", "") or "ubuntu",
-        "LOGNAME": paths.get("user", "") or "ubuntu",
-        "EGA_ATTEMPT_NONCE": nonce or "",
-        "EGA_CONFIG_FILE": paths.get("config_path", "") or
-                           "/etc/ega-update/config.json",
-        "EGA_RELEASE_ROOT": paths.get("release_root", "") or "",
+    try:
+        bus = systemd_user_bus(user)
+    except Exception:
+        bus = {}
+    # Existence-resolved bus wins when present (dispatcher side); the
+    # scoped worker side inherits the same values through --setenv and
+    # therefore computes the identical contract from its environ.
+    xdg = str(bus.get("XDG_RUNTIME_DIR", "") or environ.get(
+        "XDG_RUNTIME_DIR", "") or "")
+    dbus = str(bus.get("DBUS_SESSION_BUS_ADDRESS", "") or environ.get(
+        "DBUS_SESSION_BUS_ADDRESS", "") or "")
+    try:
+        from .inventory import config_identity
+        config_id = config_identity(s, inventory)
+    except Exception:
+        config_id = ""
+    contract = {
+        "uid": uid,
+        "gid": gid,
+        "user": user,
+        "home": home,
+        "path": ":".join(path_parts),
+        "config": str(paths.get("config_path", "") or environ.get(
+            "EGA_CONFIG_FILE", "") or "/etc/ega-update/config.json"),
+        "release": release,
+        "venv_python": str(paths.get("venv_python", "") or ""),
+        "node": str(paths.get("node_path", "") or ""),
+        "npm": str(paths.get("npm_path", "") or ""),
+        "npx": str(paths.get("npx_path", "") or ""),
+        "xdg_runtime_dir": xdg,
+        "dbus_address": dbus,
+        "lang": str(environ.get("LANG", "") or ""),
+        "lc_all": str(environ.get("LC_ALL", "") or ""),
+        "lc_ctype": str(environ.get("LC_CTYPE", "") or ""),
+        "tz": str(environ.get("TZ", "") or ""),
+        "no_new_privileges": "true",
+        "manager_scope": "user",
+        "config_identity": str(config_id or ""),
+        "sudo_profile": _sudo_profile_id(inventory),
     }
-    for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG",
-                "LC_ALL", "LC_CTYPE", "TZ"):
-        try:
-            val = os.environ.get(key, "")
-        except Exception:
-            val = ""
-        if val:
-            env[key] = val
-    if isinstance(extra_bus, dict):
-        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
-            if extra_bus.get(key):
-                env[key] = str(extra_bus[key])
+    return contract
+
+
+def _sudo_profile_id(inventory=None):
+    # type: (object) -> str
+    """Approved sudo/service-authority profile identifier (F03).
+
+    Canonical hash of the inventoried per-tool service units
+    (supervisor scope + restart authority) and launch methods — the
+    exact privilege surface preview and apply must share. Empty
+    inventory yields a deterministic hash of empties (downstream gates
+    fail closed on uninventoried tools regardless).
+    """
+    import hashlib
+    import json
+
+    try:
+        from .inventory import get_tool_inventory
+        subset = {}
+        for tool_id in ("hermes", "opencode", "codex", "t3"):
+            try:
+                entry = get_tool_inventory(tool_id)
+            except Exception:
+                entry = {}
+            if not isinstance(entry, dict):
+                entry = {}
+            subset[tool_id] = {
+                "service_units": entry.get("service_units", []),
+                "launch_method": entry.get("launch_method", ""),
+            }
+        raw = json.dumps(subset, sort_keys=True, default=str).encode(
+            "utf-8")
+        return "sha256:%s" % hashlib.sha256(raw).hexdigest()
+    except Exception:
+        return "unavailable"
+
+
+def contract_fingerprint(contract):
+    # type: (Dict[str, str]) -> str
+    """Hash the actual canonical execution contract (F03).
+
+    Fingerprints the real contract dict — not a conceptual subset — so
+    any execution-relevant difference (HOME, PATH, bus, locale,
+    executables, privilege profile, release) invalidates the plan.
+    """
+    import hashlib
+    import json
+
+    try:
+        narrowed = {str(k): str(v or "") for k, v in
+                    (contract or {}).items()}
+        raw = json.dumps(narrowed, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+    except Exception:
+        return ""
+
+
+def contract_env(contract, nonce=""):
+    # type: (Dict[str, str], str) -> Dict[str, str]
+    """Environment dictionary derived from ONE contract (F03).
+
+    Used for runner launch arguments AND probe launch arguments alike.
+    Only contract keys travel (plus the attempt nonce); never the
+    ambient process environment wholesale.
+    """
+    contract = dict(contract or {})
+    env = {
+        "PATH": contract.get("path", "") or "/usr/local/bin:/usr/bin:/bin",
+        "HOME": contract.get("home", "") or "/home/ubuntu",
+        "USER": contract.get("user", "") or "ubuntu",
+        "LOGNAME": contract.get("user", "") or "ubuntu",
+        "EGA_CONFIG_FILE": contract.get("config", "") or
+                           "/etc/ega-update/config.json",
+        "EGA_RELEASE_ROOT": contract.get("release", "") or "",
+        "XDG_RUNTIME_DIR": contract.get("xdg_runtime_dir", "") or "",
+        "DBUS_SESSION_BUS_ADDRESS": contract.get("dbus_address", "") or "",
+        "LANG": contract.get("lang", "") or "",
+        "LC_ALL": contract.get("lc_all", "") or "",
+        "LC_CTYPE": contract.get("lc_ctype", "") or "",
+        "TZ": contract.get("tz", "") or "",
+    }
+    # Drop empties except PATH/HOME/USER/LOGNAME (always materialized
+    # above); systemd --setenv skips them identically on both paths.
+    env = {k: v for k, v in env.items()
+           if v or k in ("PATH", "HOME", "USER", "LOGNAME")}
+    if nonce:
+        env["EGA_ATTEMPT_NONCE"] = str(nonce)
     return env
 
 
@@ -226,6 +440,10 @@ TRANSIENT_SETENV_KEYS = (
     "LOGNAME",
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
 )
 
 RUNNER_MODULE_ARGV = ["-m", "backend.app.worker.runner"]
@@ -265,31 +483,17 @@ def transient_scope_name(job_hex, phase):
 
 def canonical_fingerprint(settings=None, inventory=None, release_path=""):
     # type: (object, object, str) -> str
-    """Environment fingerprint comparable across processes (N09).
+    """Environment fingerprint comparable across processes (F03).
 
-    Computed from CANONICAL values (resolved release, configured
-    Node paths, config identity) — never raw environ — so the
-    dispatcher, phase worker, and runner all agree. Bound into plans;
-    execution rechecks it before mutation.
+    Thin compatibility wrapper: builds the single canonical owner
+    execution contract and hashes it. All callers (plan creation,
+    admission, runner mutation boundary) therefore bind the FULL
+    contract — HOME, PATH, bus, locale, executables, privilege
+    profile — not a conceptual subset.
     """
-    import hashlib
-    import json
-
     try:
-        from .inventory import config_identity
-        config_hash = config_identity(settings, inventory)
-    except Exception:
-        config_hash = ""
-    try:
-        paths = resolved_paths(settings, inventory)
-        node = {k: paths.get(k, "") for k in
-                ("node_path", "npm_path", "npx_path")}
-    except Exception:
-        node = {}
-    try:
-        narrowed = {"release": release_path or "", "node": node,
-                    "config_hash": config_hash}
-        raw = json.dumps(narrowed, sort_keys=True).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
+        return contract_fingerprint(
+            build_owner_contract(settings, inventory,
+                                 release_path or ""))
     except Exception:
         return ""

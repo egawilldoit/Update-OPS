@@ -344,6 +344,29 @@ def main(argv=None):
         settings = _load_settings()
     except Exception:
         return EXIT_INVALID
+    # F03 parity proof: recompute the canonical contract from THIS
+    # process's context (scope env inherited from the coordinator) and
+    # refuse when it differs from the coordinator's expectation. Preview
+    # and apply provably share one environment instead of assuming it.
+    try:
+        from ..owner_env import (build_owner_contract,
+                                 contract_fingerprint)
+        own_fp = contract_fingerprint(build_owner_contract(settings))
+    except Exception:
+        own_fp = ""
+    expected_fp = ""
+    try:
+        expected_fp = str(payload.get("env_fingerprint", "") or "")
+    except Exception:
+        expected_fp = ""
+    if not own_fp or not expected_fp or own_fp != expected_fp:
+        _write_result(args.result, False, args.phase,
+                      {"error_code": "invalid_request",
+                       "error_detail": "owner environment mismatch: "
+                                       "phase worker contract differs from "
+                                       "coordinator expectation"})
+        writer.flush_final()
+        return EXIT_OK
     try:
         from ..config import load_secret_values
         secrets = load_secret_values(settings)
@@ -422,9 +445,15 @@ if __name__ == "__main__":
 # -- coordinator ------------------------------------------------------------
 
 def _scope_argv(scope, release, config_path, venv_python, job_id, phase,
-                payload_path, result_path, stream_path, op, deadline_s):
+                payload_path, result_path, stream_path, op, deadline_s,
+                env=None):
     # type: (...) -> List[str]
-    """Exact scope-launch argv (fixed values only, never user input)."""
+    """Exact scope-launch argv (fixed values only, never user input).
+
+    The scope environment is the canonical owner contract (F03): the
+    same allow-listed keys the runner launch carries (minus the attempt
+    nonce — workers never consume attempts). Probes and phases share it.
+    """
     for token in (scope, release, config_path, venv_python, job_id,
                   phase, payload_path, result_path, stream_path):
         if not token or not isinstance(token, str):
@@ -433,16 +462,38 @@ def _scope_argv(scope, release, config_path, venv_python, job_id, phase,
             raise ValueError("scope launch token invalid")
     if "/" in scope or " " in scope:
         raise ValueError("scope unit name invalid")
+    try:
+        from ..owner_env import TRANSIENT_SETENV_KEYS
+        allow = tuple(TRANSIENT_SETENV_KEYS)
+    except Exception:
+        allow = ("EGA_CONFIG_FILE", "EGA_RELEASE_ROOT", "PATH", "HOME",
+                 "USER", "LOGNAME", "XDG_RUNTIME_DIR",
+                 "DBUS_SESSION_BUS_ADDRESS", "LANG", "LC_ALL", "LC_CTYPE",
+                 "TZ")
     argv = ["systemd-run", "--user", "--scope", "--quiet",
             "--unit=%s" % scope,
             "--working-directory=%s" % release,
             "--setenv=EGA_CONFIG_FILE=%s" % config_path,
-            "--setenv=EGA_RELEASE_ROOT=%s" % release,
-            venv_python, "-m", "backend.app.worker.phase_run",
-            job_id, phase,
-            "--payload", payload_path, "--result", result_path,
-            "--stream", stream_path,
-            "--deadline-s", "%.1f" % max(1.0, float(deadline_s or 60.0))]
+            "--setenv=EGA_RELEASE_ROOT=%s" % release]
+    try:
+        env_map = dict(env or {})
+    except Exception:
+        env_map = {}
+    for key in allow:
+        if key in ("EGA_CONFIG_FILE", "EGA_RELEASE_ROOT",
+                   "EGA_ATTEMPT_NONCE"):
+            continue
+        try:
+            value = env_map.get(key, "")
+        except Exception:
+            value = ""
+        if value:
+            argv.append("--setenv=%s=%s" % (key, value))
+    argv += [venv_python, "-m", "backend.app.worker.phase_run",
+             job_id, phase,
+             "--payload", payload_path, "--result", result_path,
+             "--stream", stream_path,
+             "--deadline-s", "%.1f" % max(1.0, float(deadline_s or 60.0))]
     if op:
         argv += ["--op", str(op)]
     return argv
@@ -482,9 +533,15 @@ def _kill_scope_wait_empty(scope, grace_s=10.0):
 
 def run_supervised_phase(tool_id, job_id, phase, payload_extra,
                          timeout_s, settings, log_dir, emit,
-                         op="", cancel_event=None):
+                         op="", cancel_event=None, env=None):
     # type: (...) -> tuple
-    """Run one phase in a coordinator-owned scope (N10).
+    """Run one phase in a coordinator-owned scope (N10, F03).
+
+    env is the canonical owner contract environment (owner_env.contract_env
+    of build_owner_contract): probes and phases launch with it identically.
+    The expected environment fingerprint travels in the payload; the
+    worker recomputes it from its own context and refuses on mismatch,
+    proving preview/apply parity instead of assuming it.
 
     Returns (ok, data, error, timed_out):
     - ok True + data: worker completed; data is the sanitized result dict.
@@ -529,8 +586,19 @@ def run_supervised_phase(tool_id, job_id, phase, payload_extra,
     payload_path = os.path.join(log_dir, "%s.%s.payload.json" % (uid, phase))
     result_path = os.path.join(log_dir, "%s.%s.result.json" % (uid, phase))
     stream_path = os.path.join(log_dir, "%s.%s.stream" % (uid, phase))
+    try:
+        from ..owner_env import (build_owner_contract, contract_env,
+                                 contract_fingerprint)
+        if not isinstance(env, dict) or not env:
+            env = contract_env(build_owner_contract(settings))
+        expected_fp = contract_fingerprint(
+            build_owner_contract(settings))
+    except Exception as exc:
+        return False, {}, "owner contract unbuildable: %s" % exc, False
+    if not expected_fp:
+        return False, {}, "owner contract fingerprint empty", False
     payload = {"tool_id": tool_id, "job_id": job_id, "phase": phase,
-               "op": op or ""}
+               "op": op or "", "env_fingerprint": expected_fp}
     try:
         if isinstance(payload_extra, dict):
             for key, value in payload_extra.items():
@@ -557,7 +625,7 @@ def run_supervised_phase(tool_id, job_id, phase, payload_extra,
     try:
         argv = _scope_argv(scope, release, config_path, venv_python,
                            job_id, phase, payload_path, result_path,
-                           stream_path, op, deadline)
+                           stream_path, op, deadline, env)
     except ValueError as exc:
         return False, {}, "scope launch refused: %s" % exc, False
     if not (os.path.isfile("/usr/bin/systemd-run")
