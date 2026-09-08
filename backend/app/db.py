@@ -178,8 +178,12 @@ class SchemaError(Exception):
 
 def _migrations_dir():
     # type: () -> str
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "..", "..", "migrations")
+    # D2: exactly one parent level — backend/migrations alongside the
+    # backend/app package (two levels resolved to a nonexistent
+    # <repo>/migrations and broke every fresh migration).
+    return os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "migrations"))
 
 
 def _migration_path(filename):

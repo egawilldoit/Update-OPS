@@ -389,6 +389,19 @@ def test_config_identity_stable_and_sensitive(tmp_path):
 
 # -- migrations --------------------------------------------------------------
 
+def test_migrations_dir_resolves_to_backend_migrations():
+    """D2: every migration file in MIGRATIONS must exist on disk at the
+    resolved path (derived from db.py location, independent of CWD).
+    A wrong parent level broke all fresh migrations silently."""
+    path = db_lib._migration_path("001_init.sql")
+    assert path.endswith(
+        os.path.join("backend", "migrations", "001_init.sql"))
+    assert os.path.isfile(path)
+    for _version, filename in db_lib.MIGRATIONS:
+        resolved = db_lib._migration_path(filename)
+        assert os.path.isfile(resolved), filename
+
+
 def test_migrate_fresh_rerun_and_newer_rejected(tmp_path):
     path = str(tmp_path / "m.db")
     conn = db_lib.connect(path)
