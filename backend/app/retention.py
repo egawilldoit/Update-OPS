@@ -194,7 +194,11 @@ def run_retention(conn, settings):
         except Exception as exc:
             _err("tombstone %s %s: %s" % (kind, ref, exc))
 
-    # Protected jobs: nonterminal OR recovery_required OR unresolved=1.
+    # Protected jobs: nonterminal OR recovery_required OR unresolved=1
+    # OR holding an unreleased mutation lease (F02: a terminal-but-owned
+    # job must keep its row AND its plan until reconciliation disposes
+    # the lease; deleting either would orphan the lease and wedge
+    # admission, or make delegated proof unprovable).
     job_cols = _table_columns(conn, "jobs")
     has_unresolved = "unresolved" in job_cols
     has_recovery = "recovery_required" in job_cols
@@ -221,6 +225,19 @@ def run_retention(conn, settings):
                 continue
     except Exception as exc:
         _err("protected scan: %s" % exc)
+    try:
+        lease_rows = conn.execute(
+            "SELECT job_id FROM execution_leases WHERE kind='mutation'"
+            " AND released_at=''").fetchall()
+        for r in lease_rows:
+            try:
+                jid = str(dict(r).get("job_id", "") or "")
+                if jid:
+                    protected.add(jid)
+            except Exception:
+                continue
+    except Exception as exc:
+        _err("protected lease scan: %s" % exc)
     protected.discard("")
 
     def _is_protected(job_id):

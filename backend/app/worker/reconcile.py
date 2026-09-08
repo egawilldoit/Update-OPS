@@ -75,6 +75,36 @@ def _genuine_inspection(tool_id):
         return "inspect unparseable"
 
 
+def _delegated_proof(conn, job):
+    # type: (object, dict) -> dict
+    """Shared delegated-operation proof for SSH reconcile (G03).
+
+    Same reconcile_core.delegated_quiescence() the dispatcher uses —
+    one algorithm, not two. Prints per-service evidence for the
+    operator and returns the {quiescent, evidence, reason} mapping
+    decide() requires.
+    """
+    try:
+        from backend.app import reconcile_core as _rc
+        quiescent, evidence, reason = _rc.delegated_quiescence(conn, job)
+    except Exception as exc:
+        return {"quiescent": False, "evidence": [],
+                "reason": "delegated proof crashed: %s" % exc}
+    try:
+        if evidence:
+            print("delegated operations:")
+            for item in evidence[:20]:
+                print("  service=%s bus=%s state=%s %s" % (
+                    item.get("service", "?"), item.get("bus", "?"),
+                    item.get("state", "?"), item.get("detail", "")[:120]))
+        else:
+            print("delegated operations: %s" % (reason or "none bound"))
+    except Exception:
+        pass
+    return {"quiescent": bool(quiescent), "evidence": evidence,
+            "reason": reason}
+
+
 def main(argv=None):
     # type: (list) -> int
     from backend.app import reconcile_core as _rc
@@ -137,12 +167,14 @@ def main(argv=None):
     try:
         procs = _rc.job_processes(_rc.unit_hex(args.job_id), args.job_id)
     except Exception:
-        procs = []
+        procs = None
     if procs:
         print("live execution-marked processes: %d (self excluded)"
               % len(procs))
         for item in procs[:20]:
             print("  pid=%s cmd=%s" % (item["pid"], item["cmdline"]))
+    elif procs is None:
+        print("live execution-marked processes: UNPROVABLE (scan failed)")
     else:
         print("live execution-marked processes: 0")
 
@@ -177,7 +209,8 @@ def main(argv=None):
     else:
         print("receipt: %s" % (reason or "absent"))
 
-    action, detail = _rc.decide(job_d, info, receipt_view, procs)
+    action, detail = _rc.decide(job_d, info, receipt_view, procs,
+                                _delegated_proof(conn, job_d))
     print("decision: %s — %s" % (action, detail))
     try:
         from backend.app.events import record_event

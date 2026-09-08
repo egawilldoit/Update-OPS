@@ -406,7 +406,21 @@ def _reconcile_row(conn, row):
     try:
         procs = _rc.job_processes(_rc.unit_hex(job_id), job_id)
     except Exception:
-        procs = []
+        procs = None
+    # G02/G03: delegated proof is computed only once the unit itself is
+    # confirmed stopped (otherwise decide() holds on the unit alone and
+    # no service queries are spent). It is REQUIRED before any receipt
+    # application or ownership release.
+    delegated = None
+    if str(info.get("state", "")) == "confirmed_stopped":
+        try:
+            quiescent, evidence, reason = _rc.delegated_quiescence(
+                conn, job)
+            delegated = {"quiescent": bool(quiescent),
+                         "evidence": evidence, "reason": reason}
+        except Exception as exc:
+            delegated = {"quiescent": False, "evidence": [],
+                         "reason": "delegated proof crashed: %s" % exc}
     receipt_valid = False
     receipt_data = {}  # type: Dict[str, Any]
     ok, data, _reason = _load_receipt_bound(job_id)
@@ -424,7 +438,8 @@ def _reconcile_row(conn, row):
     receipt_view = dict(receipt_data) if receipt_valid else None
     if receipt_view is not None:
         receipt_view["_valid"] = True
-    action, detail = _rc.decide(job, info, receipt_view, procs)
+    action, detail = _rc.decide(job, info, receipt_view, procs,
+                                delegated)
     if action in ("live", "starting", "stopping"):
         try:
             conn.execute("UPDATE jobs SET heartbeat=? WHERE id=?",

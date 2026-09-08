@@ -440,11 +440,22 @@ def test_decide_matrix():
     assert rc_lib.decide(
         {}, {"state": "unknown"}, None, [])[0] == "keep-unknown"
     stopped = {"state": "confirmed_stopped"}
-    assert rc_lib.decide({}, stopped, None, [])[0] == "mark-interrupted"
-    assert rc_lib.decide({}, stopped, {"_valid": True}, [])[0] == \
-        "apply-receipt"
+    quiet = {"quiescent": True, "evidence": [], "reason": ""}
+    # G02: stopped unit alone never suffices — delegated proof missing
+    # holds even with a perfect receipt.
+    assert rc_lib.decide({}, stopped, None, [])[0] == "keep-unknown"
+    assert rc_lib.decide(
+        {}, stopped, {"_valid": True}, [])[0] == "keep-unknown"
+    assert rc_lib.decide({}, stopped, None, [], quiet)[0] == \
+        "mark-interrupted"
+    assert rc_lib.decide(
+        {}, stopped, {"_valid": True}, [], quiet)[0] == "apply-receipt"
     assert rc_lib.decide(
         {}, stopped, None, [{"pid": 1}])[0] == "keep-unknown"
+    # Surviving processes override even receipt + delegated proof.
+    assert rc_lib.decide(
+        {}, stopped, {"_valid": True}, [{"pid": 1}], quiet)[0] == \
+        "keep-unknown"
     assert rc_lib.canonical_unit("ab-cd").endswith(
         "ega-update-job-abcd.service")
     assert rc_lib.job_processes("zz-no-such-token-zz", "") == []

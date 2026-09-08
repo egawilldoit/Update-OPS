@@ -958,3 +958,233 @@ def test_g01_no_duplicated_adapter_gate_comment():
     hits = [i for i, line in enumerate(lines)
             if "Disabled adapters never mutate" in line]
     assert len(hits) <= 1, hits
+
+
+# -- G02/G03 quiescence-ordered reconciliation -----------------------------------
+
+def _stopped_units(monkeypatch, live=(), unknown=(), stopped_extra=()):
+    from backend.app import units as units_lib
+
+    def _fake(unit, timeout_s=10):
+        if unit in live:
+            return {"state": "live", "unit": unit, "active_state": "active",
+                    "sub_state": "running", "main_pid": 1, "cgroup": "",
+                    "identity_ok": True, "detail": ""}
+        if unit in unknown:
+            return {"state": "unknown", "unit": unit, "active_state": "",
+                    "sub_state": "", "main_pid": 0, "cgroup": "",
+                    "identity_ok": False, "detail": "bus down"}
+        return {"state": "confirmed_stopped", "unit": unit,
+                "active_state": "inactive", "sub_state": "dead",
+                "main_pid": 0, "cgroup": "", "identity_ok": True,
+                "detail": "manager=inactive load=not-found"}
+
+    monkeypatch.setattr(units_lib, "query_unit", _fake)
+    monkeypatch.setattr(units_lib, "query_unit_system", _fake)
+
+
+def _plan_with_services(conn, plan_id, services):
+    import json as _json
+    from backend.app import plans as plans_lib
+
+    support_lib.test_release_root()
+    row = support_lib.v2_plan_row(conn, plan_id)
+    conn.execute("UPDATE plans SET services=? WHERE id=?",
+                 (_json.dumps(list(services)), plan_id))
+    conn.commit()
+    # Recompute the hash over the edited row (production path builds
+    # services before hashing; the test edits afterwards, so rebind).
+    stored = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                               (plan_id,)).fetchone())
+    conn.execute("UPDATE plans SET plan_hash=? WHERE id=?",
+                 (plans_lib.canonical_plan_hash(
+                     plans_lib._hash_view(stored)), plan_id))
+    conn.commit()
+    return row
+
+
+def test_g02_receipt_never_overrides_live_process(tmp_path, monkeypatch):
+    """Stopped unit + valid receipt + live execution-marked process
+    holds (no apply, no release, no admission)."""
+    from backend.app import reconcile_core as rc_lib
+    from backend.app.admission import admit
+    from backend.app.worker import dispatch as dispatch_lib
+
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g02p", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    assert rc_lib.decide(
+        {}, {"state": "confirmed_stopped"},
+        {"_valid": True}, [{"pid": 4242, "cmdline": "x"}],
+        {"quiescent": True, "evidence": [], "reason": ""})[0] == \
+        "keep-unknown"
+    conn.close()
+
+
+def test_g02_dispatcher_holds_with_procs_despite_receipt(
+        tmp_path, monkeypatch):
+    """End to end through _reconcile_row: stopped unit + bound valid
+    receipt + surviving process -> unknown-held, lease stays, admission
+    stays blocked."""
+    from backend.app import reconcile_core as rc_lib
+    from backend.app.admission import admit
+    from backend.app.worker import dispatch as dispatch_lib
+
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g02e", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    assert jobs_lib_claim(conn, jid, "n-g02e") is True
+    unit = rc_lib.canonical_unit(jid)
+    # Unit itself stopped: only the surviving process may hold the row.
+    _stopped_units(monkeypatch)
+    monkeypatch.setattr(
+        rc_lib, "job_processes",
+        lambda hex_token, full_id="", exclude_pids=(): [
+            {"pid": 4242, "cmdline": "ega-update-job-abc runner"}])
+    db_row = conn.execute("SELECT * FROM jobs WHERE id=?",
+                          (jid,)).fetchone()
+    assert dispatch_lib._reconcile_row(conn, db_row) == "unknown-held"
+    assert _lease_held(conn, jid)
+    row2 = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    _jid2, created2, err2 = admit(
+        conn, "owner@example.invalid", "k-g02e-new", row2["id"], False,
+        "fp-test-1", True, False)
+    assert err2 == "busy" and not created2
+    conn.close()
+
+
+def jobs_lib_claim(conn, job_id, nonce):
+    from backend.app import jobs as jobs_lib
+
+    return jobs_lib.claim_with_nonce(conn, job_id, nonce)
+
+
+def test_g03_delegated_live_blocks_release(tmp_path, monkeypatch):
+    """Stopped runner + valid receipt + live delegated service holds
+    ownership (no apply, no release)."""
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    _plan_with_services(conn, uuid.uuid4().hex, ["svc-live.service"])
+    _stopped_units(monkeypatch, live=["svc-live.service"])
+    job = {"id": "job-g03a", "plan_id": None}
+    # Fetch the real plan id back for the helper.
+    prow = conn.execute(
+        "SELECT id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+    job["plan_id"] = str(dict(prow)["id"])
+    quiescent, evidence, reason = rc_lib.delegated_quiescence(conn, job)
+    assert quiescent is False
+    assert any(e["service"] == "svc-live.service" for e in evidence)
+    assert rc_lib.decide(
+        job, {"state": "confirmed_stopped"}, {"_valid": True}, [],
+        {"quiescent": quiescent, "evidence": evidence,
+         "reason": reason})[0] == "keep-unknown"
+    conn.close()
+
+
+def test_g03_delegated_unknown_blocks_release(tmp_path, monkeypatch):
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    _plan_with_services(conn, uuid.uuid4().hex, ["svc-mystery.service"])
+    _stopped_units(monkeypatch, unknown=["svc-mystery.service"])
+    prow = conn.execute(
+        "SELECT id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+    job = {"id": "job-g03b", "plan_id": str(dict(prow)["id"])}
+    quiescent, _evidence, _reason = rc_lib.delegated_quiescence(conn, job)
+    assert quiescent is False
+    conn.close()
+
+
+def test_g03_full_quiescence_applies(tmp_path, monkeypatch):
+    """Stopped unit + no processes + delegated stopped + valid receipt
+    is the ONLY combination that applies."""
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    _plan_with_services(conn, uuid.uuid4().hex, ["svc-done.service"])
+    _stopped_units(monkeypatch)
+    prow = conn.execute(
+        "SELECT id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+    job = {"id": "job-g03c", "plan_id": str(dict(prow)["id"])}
+    quiescent, evidence, reason = rc_lib.delegated_quiescence(conn, job)
+    assert quiescent is True, reason
+    assert evidence and evidence[0]["state"] == "confirmed_stopped"
+    assert rc_lib.decide(
+        job, {"state": "confirmed_stopped"}, {"_valid": True}, [],
+        {"quiescent": quiescent, "evidence": evidence,
+         "reason": reason})[0] == "apply-receipt"
+    conn.close()
+
+
+def test_g03_no_receipt_quiescent_interrupts(tmp_path, monkeypatch):
+    from backend.app import reconcile_core as rc_lib
+
+    conn = _fresh_db(tmp_path)
+    support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    _stopped_units(monkeypatch)
+    prow = conn.execute(
+        "SELECT id FROM plans ORDER BY created_at DESC LIMIT 1").fetchone()
+    job = {"id": "job-g03d", "plan_id": str(dict(prow)["id"])}
+    quiescent, _evidence, _reason = rc_lib.delegated_quiescence(conn, job)
+    assert quiescent is True
+    assert rc_lib.decide(
+        job, {"state": "confirmed_stopped"}, None, [],
+        {"quiescent": quiescent, "evidence": [], "reason": ""})[0] == \
+        "mark-interrupted"
+    conn.close()
+
+
+def test_g03_terminal_held_lease_live_delegated_stays(tmp_path, monkeypatch):
+    """Terminal DB row + held lease + live delegated operation: the
+    lease stays and admission stays blocked."""
+    from backend.app import reconcile_core as rc_lib
+    from backend.app.admission import admit
+    from backend.app.worker import dispatch as dispatch_lib
+
+    conn = _fresh_db(tmp_path)
+    plan_id = uuid.uuid4().hex
+    _plan_with_services(conn, plan_id, ["svc-stuck.service"])
+    row = dict(conn.execute("SELECT * FROM plans WHERE id=?",
+                            (plan_id,)).fetchone())
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g03e", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    assert jobs_lib_claim(conn, jid, "n-g03e") is True
+    from backend.app import tx as tx_lib
+    tx_lib.transition_tx(conn, jid, "failed", step="updating",
+                         expect_states=["preflight"],
+                         update={"error_code": "install_failed"},
+                         event="failed", event_detail="")
+    _stopped_units(monkeypatch, live=["svc-stuck.service"])
+    # Unit itself stopped, but delegated service live: hold everything.
+    db_row = conn.execute("SELECT * FROM jobs WHERE id=?",
+                          (jid,)).fetchone()
+    outcome = dispatch_lib._reconcile_row(conn, db_row)
+    assert outcome == "unknown-held", outcome
+    assert _lease_held(conn, jid)
+    conn.close()
+
+
+def test_g03_shared_rule_across_reconcilers():
+    """Dispatcher and SSH reconcile decide through the same
+    reconcile_core.decide + delegated_quiescence entry points (one
+    algorithm, not two)."""
+    import inspect
+    from backend.app.worker import dispatch as dispatch_lib
+    import backend.app.worker.reconcile as reconcile_mod
+
+    dispatch_src = inspect.getsource(dispatch_lib._reconcile_row)
+    assert "delegated_quiescence" in dispatch_src
+    assert ".decide(" in dispatch_src
+    reconcile_src = inspect.getsource(reconcile_mod.main)
+    assert "delegated_quiescence" in reconcile_src or \
+        "_delegated_proof" in reconcile_src
+    assert ".decide(" in reconcile_src
