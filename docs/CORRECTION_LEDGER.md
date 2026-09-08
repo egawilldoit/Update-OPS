@@ -1,4 +1,4 @@
-# Update-OPS V1 — Senior-Review Correction Ledger (R01–R36, N01–N18, F01–F16, G01–G08)
+# Update-OPS V1 — Senior-Review Correction Ledger (R01–R36, N01–N18, F01–F16, G01–G08, H01–H03)
 
 Branch: `feat/v1-implementation`. Baseline: `2e0f898`.
 Statuses: `open` → `implementing` → `implemented-static` → `runtime-pending`.
@@ -120,3 +120,15 @@ Statuses: implemented-static only. No verified/accepted/passed.
 | G06 | `RECOVERY_RESOLVED_VALUES=("none",)`: success requires exactly `none` in validate + binding | `receipts.py` | G06 allowlist test |
 | G07 | Deploy quiescence is proof-structured: unreadable jobs/leases/plans block; pre-lease schemas explicit; missing tables block | `quiescence-check.py` | G07 block (2) |
 | G08 | Held leases independently fatal; terminal-owned jobs in delegated/unit/process proof | `quiescence-check.py` | G08 block (6) |
+
+# Pre-runtime surgical corrections, wave H (H01–H03 implemented-static; H04–H06/S01 pending finding definitions)
+
+Statuses: implemented-static only. No verified/accepted/passed.
+All runtime results: `NOT EXECUTED — IMPLEMENTATION PHASE`.
+Commits (branch `feat/v1-implementation`): H01 `66b2fb1`, H02 `a9bab77`, H03 `60f1c4b`.
+
+| ID | Root-cause fix | Files | Regression tests |
+| --- | --- | --- | --- |
+| H01 | Mutation lease bound to the REAL job UUID before acquisition (`mutation-<job-uuid>`, `job_id` set in the same reservation transaction); no `mutation-__pending__` placeholder insert/update/repair; held older leases still block; rollback leaves neither job nor lease | `admission.py` | `test_final_pre_runtime_static.py` H01 block (5) |
+| H02 | Scope-directed delegated quiescence: `parse_service_ref()` (`scope:unit`, bare unit = user scope, malformed = UNKNOWN and blocks); `delegated_quiescence()` queries ONLY the declared manager (user-then-system fallback removed); deploy `quiescence-check.py` mirrors the parser scope-directly; codex drops non-unit `codex-daemon`, opencode emits `user:<unit>`, hermes/t3 already `scope:unit` | `reconcile_core.py`, `dispatch.py` (unchanged call sites), `adapters/codex.py`, `adapters/opencode.py`, `deploy/etc/quiescence-check.py` | H02 block (6) |
+| H03 | Structured process proof `prove_processes()` (`ok`/`processes`/`reason`; enumeration failure, PermissionError/other non-exit read failures, undecodable cmdlines are UNPROVABLE and hold; exited PIDs skip); all reconcile paths + `_prove_launch` + runner sentinel (`pid -1`) fail closed; `expected_phase_scopes()` + `phase_scopes_quiescence()` (all four job scopes confirmed stopped, pinned to `phase_run.PHASES` minus probe) gate both reconcilers before receipt/ownership; `run_supervised_phase()` proves scope exit on normal completion (reap-then-deliver; unreapable = timeout, keep recovery) | `reconcile_core.py`, `dispatch.py`, `reconcile.py`, `runner.py`, `phase_run.py` | H03 block (15) + G02 hook update in `test_final_integration.py` |
