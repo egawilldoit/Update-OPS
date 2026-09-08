@@ -43,6 +43,65 @@ DISK_RESERVE_BYTES = 1 * 1024 * 1024 * 1024
 # Bound per-stream capture for probes so a chatty helper cannot OOM the worker.
 CAPTURE_LIMIT_BYTES = 256 * 1024
 
+# Shared contract: adapter mutation subprocess timeout = step_timeout +
+# MUTATION_TIMEOUT_MARGIN_S (120s). Applies to mutation calls ONLY (the
+# single mutating subprocess per adapter execute()); read-only probes keep
+# their fixed bounded timeouts and never add this margin. The runner still
+# enforces its own hard per-step ceiling centrally; adapters enforce their
+# own margin locally.
+MUTATION_TIMEOUT_MARGIN_S = 120
+
+
+def mutation_timeout(step_timeout, default=1800):
+    # type: (object, int) -> int
+    """Mutation timeout for adapter execute(): step_timeout + margin.
+
+    Fail-closed to default + margin when the step value is missing or
+    non-numeric. Callers pass plan.timeouts.get(step, default).
+    Python 3.10 compatible.
+    """
+    try:
+        base = int(step_timeout)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        try:
+            base = int(default)
+        except (TypeError, ValueError):
+            base = 1800
+    return base + MUTATION_TIMEOUT_MARGIN_S
+
+
+def mutation_timeout_for(plan, step="updating", default=1800):
+    # type: (object, str, int) -> int
+    """Extract step timeout from a PlanResult (or mapping) + margin."""
+    try:
+        timeouts = getattr(plan, "timeouts", None)
+        if isinstance(timeouts, dict) and step in timeouts:
+            return mutation_timeout(timeouts.get(step), default=default)
+        if isinstance(plan, dict):
+            nested = plan.get("timeouts", {})
+            if isinstance(nested, dict) and step in nested:
+                return mutation_timeout(nested.get(step), default=default)
+    except Exception:
+        pass
+    return mutation_timeout(default, default=default)
+
+
+def attach_timed_out(result, timed_out):
+    # type: (object, bool) -> object
+    """Attach timed_out flag to an ExecuteResult (registry-owned result path).
+
+    base.ExecuteResult carries a real timed_out field; this helper assigns it
+    (with a dynamic fallback) so adapter code has one call site for both.
+    """
+    try:
+        object.__setattr__(result, "timed_out", bool(timed_out))
+    except Exception:
+        try:
+            result.__dict__["timed_out"] = bool(timed_out)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return result
+
 EXPECTED_EXECUTABLES = {
     "hermes": "/home/ubuntu/.local/bin/hermes",
     "opencode": "/home/ubuntu/.opencode/bin/opencode",

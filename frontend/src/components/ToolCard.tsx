@@ -17,6 +17,7 @@ export function ToolCard({
   onPlan,
   checking,
   planning,
+  disconnected,
 }: {
   card: Card;
   updateDisabled: boolean;
@@ -25,12 +26,19 @@ export function ToolCard({
   onPlan: () => void;
   checking: boolean;
   planning: boolean;
+  disconnected?: boolean;
 }): React.ReactElement {
   const stale = isStale(card.checked_at);
-  const healthLabel = stale && card.health !== "stale" ? "stale" : card.health;
+  // Disconnected forces stale presentation regardless of cached values:
+  // never render cached green as current while the API is unreachable.
+  const forcedStale = disconnected === true;
+  const healthLabel = forcedStale ? "stale" : stale && card.health !== "stale" ? "stale" : card.health;
   const name = DISPLAY[card.id] ?? card.id;
   return (
-    <article className="tool-card" aria-label={`${name} status card`}>
+    <article
+      className={forcedStale ? "tool-card tool-card-stale" : "tool-card"}
+      aria-label={`${name} status card${forcedStale ? " (stale — disconnected)" : ""}`}
+    >
       <header className="tool-card-head">
         <h2>{name}</h2>
         <StatusBadge status={healthLabel} />
@@ -60,9 +68,15 @@ export function ToolCard({
           <dt>Last checked</dt>
           <dd>
             {card.checked_at || "never"}
-            {stale ? " (stale)" : ""}
+            {forcedStale ? " (stale — disconnected)" : stale ? " (stale)" : ""}
           </dd>
         </div>
+        {forcedStale ? (
+          <div>
+            <dt>Status</dt>
+            <dd>stale — disconnected</dd>
+          </div>
+        ) : null}
         {card.health_detail ? (
           <div>
             <dt>Health detail</dt>

@@ -110,7 +110,44 @@ class LogRecord(BaseModel):
 class LogPage(BaseModel):
     records: List[LogRecord] = Field(default_factory=list)
     next_after: int = 0
+    # truncated is strictly storage-cap loss (per-job cap marker or file at
+    # cap); has_more is page continuation (more records beyond limit).
     truncated: bool = False
+    has_more: bool = False
+
+
+class ReceiptCheck(BaseModel):
+    name: str = ""
+    result: CheckResult = "unknown"
+    mandatory: bool = True
+    summary: str = ""
+
+
+class ReceiptModel(BaseModel):
+    """Durable completion receipt (mirrors backend/app/receipts.py).
+
+    schema_version must equal receipts.RECEIPT_SCHEMA_VERSION. `tool` is a
+    read-compat alias of `tool_id`; `finished_at` is a read-compat alias of
+    `ts`. Writers populate both pairs identically.
+    """
+
+    schema_version: int = 1
+    job_id: str = ""
+    tool_id: str = ""
+    tool: str = ""
+    state: Literal[
+        "succeeded", "blocked", "failed", "health_failed", "interrupted",
+    ] = "interrupted"
+    before_version: str = ""
+    after_version: str = ""
+    exit_code: int = 0
+    error_code: str = ""
+    error_detail: str = ""
+    checks: List[ReceiptCheck] = Field(default_factory=list)
+    ts: str = ""
+    finished_at: str = ""
+    backup_summary: str = ""
+    log_truncated: bool = False
 
 
 class HistoryPage(BaseModel):

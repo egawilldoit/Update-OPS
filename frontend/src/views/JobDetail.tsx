@@ -7,10 +7,12 @@ export function JobDetail({
   job,
   logs,
   truncated,
+  hasMore,
 }: {
   job: Detail | null;
   logs: LogRecord[];
   truncated: boolean;
+  hasMore?: boolean;
 }): React.ReactElement {
   const [nowMs, setNowMs] = React.useState(Date.now());
   React.useEffect(() => {
@@ -86,7 +88,7 @@ export function JobDetail({
           </ul>
         </section>
       ) : null}
-      <LogViewer records={logs} truncated={truncated} />
+      <LogViewer records={logs} truncated={truncated} hasMore={hasMore === true} />
     </section>
   );
 }

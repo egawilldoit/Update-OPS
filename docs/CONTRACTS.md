@@ -28,8 +28,12 @@ Canonical display order: Hermes, OpenCode, Codex, T3.
 States (SPEC §8): `accepted → preflight → backup → updating → verifying → succeeded`.
 Terminal alternatives: `blocked`, `failed`, `health_failed`, `interrupted`.
 `NONTERMINAL = {accepted, preflight, backup, updating, verifying}`.
-Single active slot enforced by partial unique index on jobs where state in NONTERMINAL.
+Single active slot enforced by constant-expression partial unique index
+(`ON jobs((1)) WHERE state IN NONTERMINAL`).
 `recovery_required` flag blocks new jobs independently of terminal state.
+One-shot execution: `jobs.dispatch_nonce` claimed atomically via
+`jobs.claim_with_nonce`; runner argv is `runner <job-id> <nonce>` and refuses
+mismatches with exit 6 before any mutation.
 
 Steps mirror states plus `not_applicable` only when the adapter declares it in `plan()`
 before execution. Step timeouts come from adapter `plan().timeouts`.
@@ -52,12 +56,12 @@ failure, `6` interrupted/recovery required.
 | `GET /session` | owner identity + CSRF token |
 | `GET /tools` | four cards, independent observations + freshness |
 | `POST /tools/{id}/check` | bounded read-only refresh; cached `stale`/`updating` during mutation |
-| `POST /tools/{id}/plans` | 5-minute server-owned preview; no installation |
-| `POST /jobs` | `plan_id` + activity ack; `Idempotency-Key` header required; `202` new job, `200` idempotent replay with `replayed:true` |
+| `POST /tools/{id}/plans` | 5-minute server-owned preview; no installation; `unknown` activity allowed without ack (ack enforced at job creation); 15-min discovery coalesce (`?force=1` bypass); 409 without probing when a job is active or recovery is required; 503 when drained |
+| `POST /jobs` | `plan_id` + activity ack; `Idempotency-Key` header required; `202` new job, `200` idempotent replay with `replayed:true`; fingerprint compared against `tools.fingerprint` (adapter value — `install_identity` is display-only); unknown activity without ack → 409 |
 | `GET /jobs?cursor=&limit=` | paginated history, default 25, max 100 |
 | `GET /jobs/{id}` | state, step, timings, checks, backup summary, errors |
-| `GET /jobs/{id}/logs?after=&limit=` | ordered redacted records, next cursor, truncation flag |
-| `GET /health` | authenticated API/DB/worker readiness |
+| `GET /jobs/{id}/logs?after=&limit=` | ordered redacted records, next cursor; `has_more` = page continuation, `truncated` strictly = storage-cap loss; log seq starts at 1 |
+| `GET /health` | authenticated API/DB/worker readiness; worker liveness from `<state_dir>/dispatcher.heartbeat` file (fresh ≤20s), never inferred from job absence |
 
 Errors: `{code, message, details, request_id}`. `401` auth, `403` identity/CSRF,
 `409` busy/stale/conflict, `422` invalid input, `503` worker/storage,
@@ -76,6 +80,12 @@ arrays with `shell=False`. Pydantic models for every result are defined in
 Target semantics: exact-version adapters install the planned target;
 `native_latest` adapters (Codex) record observed candidate + actual result and
 the UI discloses main/latest-tracking behavior.
+Central runner rule: for `target_mode=exact`, `after_version != plan.target`
+is mandatory verification failure (`health_failed/exact_target_mismatch`).
+Adapter mutation subprocess timeout = step timeout +
+`registry.MUTATION_TIMEOUT_MARGIN_S` (120s); any adapter timeout funnels into
+the runner hard-timeout path (systemd unit termination, survivor verify,
+`recovery_required` when unproved). `ExecuteResult.timed_out` marks it.
 
 ## 6. Disk / backup floors
 
@@ -87,11 +97,28 @@ example). Unknown estimates block. No wholesale archiving of the observed
 ## 7. Paths (deferred to deploy config; defaults)
 
 - Release: `/opt/ega-update/releases/<commit>/`, pointer `/opt/ega-update/current`
-- Config: `/etc/ega-update/` (secrets outside shared storage)
+- Config: `/etc/ega-update/` (secrets outside shared storage; `config.json`
+  owner-managed, `api.env`/`worker.env` per-service overrides, `csrf.secret`
+  consumed when `csrf_secret` unset, `secrets.env` for known-secret values)
 - State: `/var/lib/ega-update/state.db` (SQLite WAL, outside releases)
 - Logs: `/var/lib/ega-update/logs/<job-id>.jsonl`
 - Backups: `/var/lib/ega-update/backups/`
+- Dispatcher heartbeat: `/var/lib/ega-update/dispatcher.heartbeat` (`{ts, pid}`)
+- Drain flag: `/var/lib/ega-update/drain` (presence refuses new plans/jobs: 503)
 - Log caps: 20 MiB/job, 500 MiB total, 30 days completed logs, 90 days metadata.
+
+## 8. Canonical job launch (exactly one mechanism)
+
+Dispatcher (system service, `User=ubuntu`, lingering enabled) launches each job
+via ubuntu's user manager only:
+`systemd-run --user --collect --unit=ega-update-job-<shortid>.service
+--working-directory=/opt/ega-update/current --setenv=EGA_CONFIG_FILE=...
+--setenv=EGA_ATTEMPT_NONCE=... --property=KillMode=control-group
+--property=Restart=no <venv-python> -m backend.app.worker.runner <job-id> <nonce>`.
+Launch is proved (exit status + `systemctl --user is-active`); otherwise the
+job is `blocked/worker_unavailable`. No system-manager fallback, no sudo.
+Continuous per-loop reconcile applies validated completion receipts
+(`backend/app/receipts.py`, schema v1) or marks `interrupted`; never reruns.
 
 ## 8. Dependency pins (verified 2026-09-08, see `docs/DEPENDENCIES.md`)
 

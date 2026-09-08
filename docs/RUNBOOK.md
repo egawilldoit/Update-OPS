@@ -14,8 +14,10 @@ tool's own CLI wrappers.
 | --- | --- |
 | API unit | `ega-update-api.service` (user `ega-update`, loopback `127.0.0.1:8771`) |
 | Dispatcher worker unit | `ega-update-worker.service` (user `ubuntu`, singleton via `worker.lock`) |
-| Per-job runner | transient `ega-update-job-<shortid>.service` via `systemd-run --collect` (template: `ega-update-runner@.service`) |
-| Tunnel unit | `cloudflared-ega-update.service` (dedicated hostname → `127.0.0.1:8771`) |
+| Per-job runner | transient `ega-update-job-<shortid>.service` via `systemd-run --user --collect` as `ubuntu` (user manager; template: `systemd/user/ega-update-runner@.service`) — inspect with `systemctl --user` as `ubuntu` |
+| User-manager linger | `loginctl enable-linger ubuntu` REQUIRED (idempotent; see install.sh §4b) or `--user` job units + T3 user services die with the last SSH session |
+| Drain file | `<state_dir>/drain` (`/var/lib/ega-update/drain`): API refuses new plans/jobs while present; absent by default |
+| Tunnel unit | `cloudflared-ega-update.service` (dedicated hostname → `127.0.0.1:8771`; placeholder config fail-closed, see §1) |
 | Release / pointer | `/opt/ega-update/releases/<commit>/` · `/opt/ega-update/current` |
 | Config / secrets | `/etc/ega-update/` (`config.json` 0640; `*.secret`/`tunnel.env` 0600) |
 | Env files | `/etc/ega-update/api.env` · `/etc/ega-update/worker.env` |
@@ -38,6 +40,11 @@ Global rules (SPEC §8–§9):
 ## 0. Triage order
 
 1. Can you SSH in? If not, use the provider console (all steps below work there).
+2. Drain present? `ls -l /var/lib/ega-update/drain` — when present the API
+   refuses new plans/jobs (admission stopped for upgrade/maintenance, see
+   §10). Do NOT remove it until quiescence + healthy start are proven.
+3. `loginctl show-user ubuntu -p Linger` must be `yes`; if not, `--user` job
+   units cannot survive logout — re-run `sudo loginctl enable-linger ubuntu`.
 2. `systemctl is-active ega-update-api ega-update-worker cloudflared-ega-update`
 3. `journalctl -u ega-update-api -n 50 --no-pager`; same for `-worker`, `cloudflared-ega-update`.
 4. Any nonterminal job? Check SQLite (read-only):
@@ -51,6 +58,13 @@ Symptoms: browser shows Access error / tunnel error / timeout; SSH fine.
 1. Tunnel unit: `systemctl status cloudflared-ega-update --no-pager`; `journalctl -u cloudflared-ega-update -n 100 --no-pager`.
 2. Config: `/etc/ega-update/cloudflared/config.yml` must route **only** the
    dedicated hostname to `http://127.0.0.1:8771`. No other ingress.
+   Install.sh generates this file with an explicit placeholder hostname
+   (`CHANGEME-*`, fail-closed): the service refuses to route while any
+   placeholder remains — replace hostname + tunnel ID + credentials file
+   before enabling. Credentials live in
+   `/etc/ega-update/cloudflared/credentials.json` (0600) with optional token
+   overrides in `/etc/ega-update/tunnel.env` (0600, via `EnvironmentFile`
+   in the unit; never logged).
 3. API loopback: `ss -ltnp | grep 127.0.0.1:8771` (or configured
    `EGA_LISTEN_PORT`). If the API listens on anything else, stop it and fix
    `listen_host` to `127.0.0.1` — never publish the API directly.
@@ -199,21 +213,65 @@ health checks listed on the tool card.
 
 ```bash
 systemctl is-active ega-update-api ega-update-worker cloudflared-ega-update
+sudo -u ubuntu systemctl --user is-active ega-update-job-<shortid>
+loginctl show-user ubuntu -p Linger
 journalctl -u ega-update-api -u ega-update-worker -u cloudflared-ega-update -n 100 --no-pager
 ss -ltnp | grep 127.0.0.1:8771
 sqlite3 /var/lib/ega-update/state.db "SELECT id,tool_id,state,recovery_required,runner_unit FROM jobs ORDER BY created_at DESC LIMIT 10;"
+ls -l /var/lib/ega-update/drain
 cd /opt/ega-update/current && venv/bin/python -m backend.app.worker.reconcile --job-id <uuid>
 ```
 
+## 10. Admission drain, Hermes sudoers, lockfiles (release gates)
+
+- **--user launch model + linger.** Job runners launch via
+  `systemd-run --user` as `ubuntu` into the ubuntu user manager; inspect
+  them with `systemctl --user` as `ubuntu` (reconcile.py does this).
+  `loginctl enable-linger ubuntu` is required (idempotent check in
+  install.sh §4b) so the manager exists at boot for `--user` job units +
+  T3 user services. Without linger the manager dies with the last SSH
+  session.
+- **Drain procedure.** `<state_dir>/drain` (`/var/lib/ega-update/drain`)
+  blocks new plans/jobs (API refuses while present). Absent by default.
+  Admission stop: `sudo touch /var/lib/ega-update/drain`. Re-admit ONLY
+  after quiescence (no nonterminal jobs) + healthy start:
+  `sudo rm -f /var/lib/ega-update/drain`. upgrade.sh creates the drain
+  FIRST, waits bounded for quiescence (fail closed), then stops services,
+  and removes the drain only on its success path (failures keep the drain
+  and restart previously-running services).
+- **Hermes sudoers snippet.** The Hermes adapter never uses a generic
+  `sudo -n true` proof. Install the narrowly-scoped allow-list:
+  `sudo cp deploy/etc/sudoers.d/ega-update-hermes.example
+  /etc/sudoers.d/ega-update-hermes` (replace every `CHANGEME-*` unit with
+  the inventoried Hermes units from `settings.service_units` /
+  inventory.json), then `sudo chown root:root` + `chmod 0440` +
+  `sudo visudo -c`. The adapter probes ONLY
+  `sudo -n systemctl --no-pager show <unit>` in that exact shape, else
+  `BLOCKED_RESTART_AUTHORITY` before mutation.
+- **Cloudflared placeholder config.** `install.sh` writes
+  `/etc/ega-update/cloudflared/config.yml` with an explicit placeholder
+  hostname only; routing stays disabled until the owner replaces
+  hostname/tunnel/credentials (service validates non-placeholder before
+  routing). Token overrides live in `/etc/ega-update/tunnel.env` via
+  `EnvironmentFile` (never logged).
+- **Lockfiles remain a release gate (not fabricated).** The singleton
+  `worker.lock` and per-job `execution.lock` + cgroup containment are
+  release gates: a second dispatcher/runner exits instead of duplicating
+  work. Never delete a lock to "fix" a stuck job — reconcile the recorded
+  `--user` unit + receipt first (§5–§6).
+
 ## Notes (clarifications only — procedures above are unchanged)
 
-- Runner unit naming: the dispatcher records a transient
-  `ega-update-job-<shortid>` unit name in `jobs.runner_unit`
-  (first 8 chars of the job UUID, spawned via `systemd-run --collect`).
-  Sites that prefer template instances may use
-  `ega-update-runner@<jobid>.service` instead (see
-  `systemd/ega-update-runner@.service`). Reconcile handles both naming
-  schemes when resolving the recorded `runner_unit`.
+- Runner unit naming: the dispatcher (as `ubuntu`) records a transient
+  `ega-update-job-<shortid>` user unit name in `jobs.runner_unit`
+  (first 8 chars of the job UUID, spawned via `systemd-run --user
+  --collect`). Sites that prefer template instances may use the user-unit
+  template `systemd/user/ega-update-runner@.service` (installed to
+  `ubuntu`'s `~/.config/systemd/user`) as
+  `ega-update-runner@<jobid>.service` instead (system template
+  `systemd/ega-update-runner@.service` retained for reference). Reconcile
+  handles both naming schemes when resolving the recorded `runner_unit`
+  (always via `systemctl --user` as `ubuntu`).
 - Frontend build output: the release gate checks
   `backend/app/static/index.html` — `frontend/vite.config.ts` sets
   `outDir` to `../backend/app/static` and `backend/app/main.py` serves

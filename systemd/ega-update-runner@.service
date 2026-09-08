@@ -1,16 +1,23 @@
 # EGA Update Console — per-job runner template (SPEC §8).
 #
-# NOT enabled directly. The dispatcher spawns one transient instance per job:
+# NOT enabled directly. The dispatcher (running as ubuntu) spawns one
+# transient instance per job via the ubuntu USER manager:
 #
-#   systemd-run --collect \
+#   systemd-run --user --collect \
 #     --unit=ega-update-job-<shortid> \
 #     --working-directory=/opt/ega-update/current \
 #     ega-update-runner <job-id>
 #
 # where <shortid> is the first 8 chars of the job UUID and the unit name is
 # persisted to jobs.runner_unit BEFORE dispatch (dispatch.py claim_or_block).
-# A dispatch retry inspects that recorded unit (systemctl is-active/show)
-# instead of spawning a duplicate.
+# A dispatch retry inspects that recorded unit (`systemctl --user is-active/
+# show` as ubuntu) instead of spawning a duplicate.
+# User-manager requirement: `loginctl enable-linger ubuntu` must be active
+# (see deploy/scripts/install.sh §4b) or the user manager — and all --user
+# job units — dies with the last SSH session.
+# Preferred user-unit template: systemd/user/ega-update-runner@.service
+# (installed to ubuntu's ~/.config/systemd/user); this system template is
+# retained for sites that run the runner as a system unit instead.
 #
 # Cgroup containment: updater descendants remain in the job's cgroup.
 # - Runner crash: systemd terminates remaining cgroup processes; the

@@ -1,0 +1,45 @@
+# EGA Update Console — per-job runner USER-unit template (SPEC §8).
+#
+# Preferred template for --user job units. Installed by
+# deploy/scripts/install.sh to ubuntu's ~/.config/systemd/user as
+# ega-update-runner@.service and reloaded via `systemctl --user
+# daemon-reload` (as ubuntu). Requires `loginctl enable-linger ubuntu`
+# so the user manager exists at boot.
+#
+# The dispatcher (running as ubuntu) prefers transient units:
+#
+#   systemd-run --user --collect \
+#     --unit=ega-update-job-<shortid> \
+#     --working-directory=/opt/ega-update/current \
+#     /opt/ega-update/current/venv/bin/python -m backend.app.worker.runner <job-id>
+#
+# Sites that prefer template instances over bare systemd-run properties may
+# instead start:
+#
+#   systemctl --user start ega-update-runner@<jobid>.service
+#
+# In both cases the recorded jobs.runner_unit is inspected with
+# `systemctl --user is-active/show` (as ubuntu); never the system manager.
+# Cgroup containment, timeouts, and no-restart semantics mirror the system
+# template (systemd/ega-update-runner@.service).
+
+[Unit]
+Description=EGA Update Console job runner %i (user unit)
+Documentation=file:/opt/ega-update/current/docs/RUNBOOK.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ega-update/current
+EnvironmentFile=/etc/ega-update/worker.env
+ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.runner %i
+KillMode=control-group
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+TimeoutStopSec=60
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

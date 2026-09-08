@@ -10,6 +10,7 @@ export function Overview({
   disableReason,
   checkingId,
   planningId,
+  disconnected,
   onCheck,
   onPlan,
 }: {
@@ -18,6 +19,7 @@ export function Overview({
   disableReason: string;
   checkingId: string;
   planningId: string;
+  disconnected: boolean;
   onCheck: (toolId: string) => void;
   onPlan: (toolId: string) => void;
 }): React.ReactElement {
@@ -35,6 +37,7 @@ export function Overview({
             onPlan={() => onPlan(c.id)}
             checking={checkingId === c.id}
             planning={planningId === c.id}
+            disconnected={disconnected}
           />
         ))}
       </div>

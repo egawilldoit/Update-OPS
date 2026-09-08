@@ -77,9 +77,19 @@ if [ ! -f "$RELEASE_DIR/backend/app/static/index.html" ]; then
 fi
 
 # 3. Config + secrets dirs. Secrets 0600, shared config 0640.
+# Traversal: /etc/ega-update is root:ega-update 0750 so both service accounts
+# traverse via group; files stay group-readable (0640) and secrets 0600.
+# The cloudflared subdir is root:ega-update 0750 (traversable by the
+# ega-update user via group); never 0700 root-only when the tunnel runs as
+# ega-update.
+getent group ega-update >/dev/null 2>&1 || groupadd -r ega-update
+usermod -aG ega-update "$API_USER" || true
+usermod -aG ega-update "$TOOL_OWNER" || true
 mkdir -p "$ETC" "$ETC/cloudflared"
+chown root:ega-update "$ETC"
 chmod 0750 "$ETC"
-chmod 0700 "$ETC/cloudflared"
+chown root:ega-update "$ETC/cloudflared"
+chmod 0750 "$ETC/cloudflared"
 if [ ! -f "$ETC/config.json" ]; then
   cp "$CONFIG_SRC" "$ETC/config.json"
   chmod 0640 "$ETC/config.json"
@@ -88,16 +98,41 @@ if [ ! -f "$ETC/config.json" ]; then
 fi
 touch "$ETC/api.env" "$ETC/worker.env"
 chmod 0640 "$ETC/api.env" "$ETC/worker.env"
-chown root:"$API_USER" "$ETC/api.env" "$ETC/worker.env"
+chown root:ega-update "$ETC/api.env" "$ETC/worker.env"
 # Secret files (created by owner, never by installer with real values):
 for f in "$ETC/csrf.secret" "$ETC/tunnel.env"; do
   [ -e "$f" ] || { touch "$f"; chmod 0600 "$f"; chown root:"$API_USER" "$f"; }
 done
+# Cloudflared tunnel config: generate ONLY with an explicit placeholder
+# hostname (fail-closed). The tunnel service validates non-placeholder
+# before routing; see docs/RUNBOOK.md. Never invent a real hostname here.
+if [ ! -f "$ETC/cloudflared/config.yml" ]; then
+  cat > "$ETC/cloudflared/config.yml" <<'YML'
+# EGA Update Console — tunnel ingress (placeholder only; owner MUST replace).
+# Fail-closed: cloudflared-ega-update.service refuses to route while the
+# hostname below is still a placeholder (see RUNBOOK §1).
+tunnel: CHANGEME-tunnel-id
+credentials-file: /etc/ega-update/cloudflared/credentials.json
+ingress:
+  - hostname: CHANGEME-update-console.example.invalid
+    service: http://127.0.0.1:8771
+    originRequest:
+      noTLSVerify: false
+  - service: http_status:404
+YML
+  chmod 0640 "$ETC/cloudflared/config.yml"
+  chown root:ega-update "$ETC/cloudflared/config.yml"
+  echo "[install] wrote placeholder $ETC/cloudflared/config.yml — REPLACE hostname/tunnel before enabling routing"
+fi
+# Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
+# while present). No drain by default; hooks below document the procedure.
+#   sudo touch /var/lib/ega-update/drain   # admission stop (upgrade/maintenance)
+#   sudo rm -f /var/lib/ega-update/drain    # re-admit only after quiescence + healthy start
+echo "[install] drain hooks: no drain by default ($STATE/drain absent = admitting)"
 
 # 4. Persistent state dirs OUTSIDE releases, shared by the two service
-#    accounts only. Mode 0750 denied group write so ubuntu could not write
-#    state.db/WAL, worker.lock, or logs: both accounts now share a joint
-#    group (ega-update) with group read/write. Never widen beyond the two
+#    accounts only. Both accounts share joint group ega-update with group
+#    read/write (0770 dirs, 0660 DB files). Never widen beyond the two
 #    accounts (no o+rw, no 0777).
 getent group ega-update >/dev/null 2>&1 || groupadd -r ega-update
 usermod -aG ega-update "$API_USER" || true
@@ -107,6 +142,18 @@ chown "$API_USER:ega-update" "$STATE"
 chown "$API_USER:ega-update" "$STATE/logs"
 chown "$TOOL_OWNER:ega-update" "$STATE/backups"
 chmod 0770 "$STATE" "$STATE/logs" "$STATE/backups"
+# Drain file: absent by default (admitting). Never create here.
+# Admission stop: sudo touch "$STATE/drain"; re-admit: sudo rm -f "$STATE/drain".
+
+# 4b. User-manager linger: job runners launch via `systemd-run --user` as
+#     ubuntu and T3 user services run under the ubuntu user manager, so the
+#     manager must exist at boot even with no login session.
+if [ "$(loginctl show-user "$TOOL_OWNER" -p Linger --value 2>/dev/null || echo no)" != "yes" ]; then
+  loginctl enable-linger "$TOOL_OWNER"
+  echo "[install] enabled linger for $TOOL_OWNER (user manager at boot for --user job units)"
+else
+  echo "[install] linger already enabled for $TOOL_OWNER"
+fi
 
 # 5. Dedicated app venv + pinned requirements install (baseline Python
 #    >=3.10,<3.14; shared runtimes are untouched — this only creates the
@@ -161,10 +208,21 @@ for dbf in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"; do
 done
 
 # 8. Systemd units: daemon-reload + enable + start order (api, worker, cloudflared).
+# Job units launch via `systemd-run --user` as ubuntu (see RUNBOOK --user
+# launch model); inspect them with `systemctl --user` as ubuntu, never the
+# system manager. The optional user-unit template lives at
+# systemd/user/ega-update-runner@.service for sites that prefer template
+# instances over bare systemd-run properties.
 cp "$CURRENT_LINK/systemd/ega-update-api.service" /etc/systemd/system/
 cp "$CURRENT_LINK/systemd/ega-update-worker.service" /etc/systemd/system/
 cp "$CURRENT_LINK/systemd/ega-update-runner@.service" /etc/systemd/system/
 cp "$CURRENT_LINK/systemd/cloudflared-ega-update.service" /etc/systemd/system/
+if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
+  mkdir -p "/home/$TOOL_OWNER/.config/systemd/user"
+  cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" "/home/$TOOL_OWNER/.config/systemd/user/"
+  chown -R "$TOOL_OWNER:$TOOL_OWNER" "/home/$TOOL_OWNER/.config/systemd/user"
+  su -s /bin/bash "$TOOL_OWNER" -c 'systemctl --user daemon-reload' || true
+fi
 systemctl daemon-reload
 systemctl enable ega-update-api ega-update-worker cloudflared-ega-update
 systemctl start ega-update-api
@@ -207,10 +265,11 @@ echo "    systemctl cat <timer> > $CONFLICT_DIR/<timer>.unit.bak"
 echo "    sudo systemctl disable --now <timer>"
 echo "  and record the restoration command in $CONFLICT_DIR/README."
 
-# Lingering / user-services note: the worker runs as a SYSTEM unit under the
-# tool-owner account (User=ubuntu), so no loginctl lingering or user-manager
-# units are required. If a site variant ever moves the worker to a --user
-# unit, that variant MUST run `loginctl enable-linger ubuntu` first or the
-# dispatcher will die when the last SSH session closes.
+# Lingering / user-services: job runners launch via `systemd-run --user` as
+# ubuntu and T3 user services run under the ubuntu user manager, so
+# `loginctl enable-linger ubuntu` is REQUIRED (see §4b with idempotent
+# check). Without linger the user manager (and all --user job units) dies
+# when the last SSH session closes. The worker itself remains a system unit
+# under User=ubuntu; only job execution uses the user manager.
 
 echo "[install] done: $COMMIT (tool state untouched)"

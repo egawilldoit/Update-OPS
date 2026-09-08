@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 def _env(name, default=""):
@@ -62,6 +62,7 @@ class Settings:
     listen_host: str = "127.0.0.1"
     listen_port: int = 8771
     csrf_secret: str = ""
+    csrf_secret_file: str = "/etc/ega-update/csrf.secret"
     # State
     state_dir: str = "/var/lib/ega-update"
     db_path: str = "/var/lib/ega-update/state.db"
@@ -86,6 +87,11 @@ class Settings:
     npx_path: str = "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npx"
     # Secrets file (one secret per line; never logged)
     secrets_file: str = "/etc/ega-update/secrets.env"
+    # Deploy-owned passthroughs (mirror deploy/etc/config.example.json).
+    # service_units: console + inventoried units (deploy-managed).
+    # adapter_timeouts_s: per-step ceilings overlaying ADAPTER_TIMEOUT_DEFAULTS.
+    service_units: Dict[str, Any] = field(default_factory=dict)
+    adapter_timeouts_s: Dict[str, Any] = field(default_factory=dict)
 
 
 def load_settings():
@@ -137,6 +143,28 @@ def load_settings():
     s.listen_host = pick("EGA_LISTEN_HOST", "listen_host") or s.listen_host
     s.listen_port = pick_int("EGA_LISTEN_PORT", "listen_port", s.listen_port)
     s.csrf_secret = pick("EGA_CSRF_SECRET", "csrf_secret")
+    s.csrf_secret_file = pick(
+        "EGA_CSRF_SECRET_FILE", "csrf_secret_file",
+        s.csrf_secret_file) or s.csrf_secret_file
+    # csrf.secret file fallback: when csrf_secret is empty, read the first
+    # non-empty line of csrf_secret_file (default
+    # /etc/ega-update/csrf.secret). Never logs values; missing/unreadable
+    # file leaves the secret empty (fail-closed downstream).
+    if not s.csrf_secret:
+        _csrf_path = s.csrf_secret_file or "/etc/ega-update/csrf.secret"
+        try:
+            if isinstance(_csrf_path, str) and _csrf_path:
+                with open(_csrf_path, "r", encoding="utf-8",
+                          errors="replace") as _fh:
+                    for _line in _fh.read().splitlines():
+                        _stripped = _line.strip()
+                        if _stripped:
+                            s.csrf_secret = _stripped
+                            break
+        except OSError:
+            pass
+        except Exception:
+            pass
     s.state_dir = pick("EGA_STATE_DIR", "state_dir") or s.state_dir
     s.db_path = pick("EGA_DB_PATH", "db_path") or s.db_path
     s.log_dir = pick("EGA_LOG_DIR", "log_dir") or s.log_dir
@@ -172,7 +200,88 @@ def load_settings():
     s.npx_path = pick("EGA_NPX_PATH", "npx_path") or s.npx_path
     s.secrets_file = pick(
         "EGA_SECRETS_FILE", "secrets_file", s.secrets_file) or s.secrets_file
+    # service_units dict passthrough (file key service_units; optional JSON
+    # object in EGA_SERVICE_UNITS wins). Unparsable shapes yield {}.
+    _units = {}  # type: Dict[str, Any]
+    try:
+        if "EGA_SERVICE_UNITS" in os.environ:
+            _parsed_units = json.loads(
+                str(os.environ["EGA_SERVICE_UNITS"] or "{}"))
+            if isinstance(_parsed_units, dict):
+                _units = dict(_parsed_units)
+        elif isinstance(data.get("service_units"), dict):
+            _units = dict(data["service_units"])
+    except Exception:
+        _units = {}
+    s.service_units = _units
+    # adapter_timeouts_s dict passthrough (file key adapter_timeouts_s;
+    # optional JSON object in EGA_ADAPTER_TIMEOUTS_S wins). Values stay raw
+    # here; get_adapter_timeouts() coerces ints over defaults.
+    _timeouts = {}  # type: Dict[str, Any]
+    try:
+        if "EGA_ADAPTER_TIMEOUTS_S" in os.environ:
+            _parsed_to = json.loads(
+                str(os.environ["EGA_ADAPTER_TIMEOUTS_S"] or "{}"))
+            if isinstance(_parsed_to, dict):
+                _timeouts = dict(_parsed_to)
+        elif isinstance(data.get("adapter_timeouts_s"), dict):
+            _timeouts = dict(data["adapter_timeouts_s"])
+    except Exception:
+        _timeouts = {}
+    s.adapter_timeouts_s = _timeouts
     return s
+
+
+def get_adapter_timeouts(s=None):
+    # type: (object) -> Dict[str, int]
+    """Merge file adapter_timeouts_s over ADAPTER_TIMEOUT_DEFAULTS.
+
+    Returns ints for preflight/backup/updating/verifying plus any extra
+    file keys (e.g. stop_grace_s). Malformed values fall back to the
+    default per key; missing overlay yields defaults. Never raises.
+    Python 3.10 compatible.
+    """
+    try:
+        from .adapters.base import ADAPTER_TIMEOUT_DEFAULTS as _defaults
+        _base = dict(_defaults)
+    except Exception:
+        _base = {"preflight": 120, "backup": 600, "updating": 1800,
+                 "verifying": 300}
+    try:
+        _obj = s if s is not None else settings
+        _overlay = getattr(_obj, "adapter_timeouts_s", {}) or {}
+    except Exception:
+        _overlay = {}
+    out = {}  # type: Dict[str, int]
+    try:
+        for _k, _v in _base.items():
+            try:
+                _def = int(_v)
+            except Exception:
+                continue
+            if isinstance(_overlay, dict) and _k in _overlay:
+                out[_k] = _coerce_int(_overlay.get(_k), _def)
+            else:
+                out[_k] = _def
+        if isinstance(_overlay, dict):
+            for _k, _v in _overlay.items():
+                if _k in out:
+                    continue
+                try:
+                    _coerced = _coerce_int(_v, -1)
+                except Exception:
+                    continue
+                if isinstance(_coerced, int) and _coerced >= 0:
+                    out[str(_k)] = _coerced
+    except Exception:
+        pass
+    if not out:
+        try:
+            out = {str(_k): int(_v) for _k, _v in _base.items()}
+        except Exception:
+            out = {"preflight": 120, "backup": 600, "updating": 1800,
+                   "verifying": 300}
+    return out
 
 
 def load_secret_values(s):

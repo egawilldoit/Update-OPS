@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS tools (
   discovery_error TEXT NOT NULL DEFAULT '',
   health TEXT NOT NULL DEFAULT 'unknown',
   health_detail TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL DEFAULT ''
+  updated_at TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS plans (
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   runner_unit TEXT NOT NULL DEFAULT '',
   heartbeat TEXT NOT NULL DEFAULT '',
   recovery_required INTEGER NOT NULL DEFAULT 0,
+  dispatch_nonce TEXT NOT NULL DEFAULT '',
   UNIQUE (subject, idempotency_key)
 );
 

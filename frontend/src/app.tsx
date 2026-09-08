@@ -46,6 +46,7 @@ export function App(): React.ReactElement {
   const [logs, setLogs] = React.useState<LogRecord[]>([]);
   const [logsAfter, setLogsAfter] = React.useState(0);
   const [truncated, setTruncated] = React.useState(false);
+  const [hasMore, setHasMore] = React.useState(false);
   const [history, setHistory] = React.useState<JobView[]>([]);
   const [nextCursor, setNextCursor] = React.useState("");
   const [historyLoading, setHistoryLoading] = React.useState(false);
@@ -193,18 +194,30 @@ export function App(): React.ReactElement {
   }
 
   // Job detail + log polling: logs every 2s while nonterminal (SPEC section 9).
+  // Polled jobs merge into the history list so update-disabled gating
+  // recomputes live; terminal states refetch history.
   const jobId = view.kind === "job" ? view.jobId : "";
   React.useEffect(() => {
     if (!jobId) return;
     let cancelled = false;
     let logAfter = 0;
     let timer = 0;
+    function mergePolledJob(j: JobDetailT): void {
+      const { checks: _omit, ...lite } = j as JobDetailT & { checks?: unknown };
+      const entry = lite as JobView;
+      setHistory((prev) => {
+        const idx = prev.findIndex((h) => h.id === entry.id);
+        if (idx === -1) return [entry, ...prev];
+        return prev.map((h) => (h.id === entry.id ? { ...h, ...entry } : h));
+      });
+    }
     async function fetchOnce(): Promise<boolean> {
       try {
         const [j, page] = await Promise.all([api.getJob(jobId), api.getLogs(jobId, logAfter, 200)]);
         if (cancelled) return true;
         markConnected();
         setJob(j);
+        mergePolledJob(j);
         if (page.records.length > 0) {
           logAfter = page.next_after;
           setLogsAfter(page.next_after);
@@ -214,7 +227,10 @@ export function App(): React.ReactElement {
           });
         }
         setTruncated(page.truncated);
-        return !NONTERMINAL.includes(j.state);
+        setHasMore(page.has_more === true);
+        const done = !NONTERMINAL.includes(j.state);
+        if (done) void loadHistory();
+        return done;
       } catch (e) {
         if (!cancelled) markMaybeDisconnected(e);
         return false;
@@ -223,6 +239,7 @@ export function App(): React.ReactElement {
     setJob(null);
     setLogs([]);
     setTruncated(false);
+    setHasMore(false);
     void fetchOnce().then((done) => {
       if (cancelled || done) return;
       timer = window.setInterval(() => {
@@ -235,7 +252,7 @@ export function App(): React.ReactElement {
       cancelled = true;
       if (timer) window.clearInterval(timer);
     };
-  }, [jobId]);
+  }, [jobId, loadHistory]);
 
   function openJob(jobIdToOpen: string): void {
     setView({ kind: "job", jobId: jobIdToOpen });
@@ -289,7 +306,7 @@ export function App(): React.ReactElement {
       ) : null}
 
       <main id="main">
-        <HealthPanel health={health} />
+        <HealthPanel health={health} disconnected={disconnected} />
         {view.kind === "overview" ? (
           <Overview
             cards={cards}
@@ -297,6 +314,7 @@ export function App(): React.ReactElement {
             disableReason={disableReason}
             checkingId={checkingId}
             planningId={planningId}
+            disconnected={disconnected}
             onCheck={(t) => void handleCheck(t)}
             onPlan={(t) => void handlePlan(t)}
           />
@@ -314,7 +332,7 @@ export function App(): React.ReactElement {
             blockedReason={disableReason}
           />
         ) : null}
-        {view.kind === "job" ? <JobDetail job={job} logs={logs} truncated={truncated} /> : null}
+        {view.kind === "job" ? <JobDetail job={job} logs={logs} truncated={truncated} hasMore={hasMore} /> : null}
         {view.kind === "history" ? (
           <History
             jobs={history}

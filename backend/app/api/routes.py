@@ -23,9 +23,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -45,6 +47,115 @@ PLAN_STEPS_DEFAULT = ["preflight", "backup", "updating", "verifying"]
 DISCOVERY_CACHE_S = 15 * 60
 LOG_DEFAULT_LIMIT = 200
 LOG_MAX_LIMIT = 1000
+# 15-minute discovery coalesce: {tool_id: (snapshot_card, monotonic_ts)}.
+# Snapshot is the last successfully persisted tool card; monotonic_ts comes
+# from time.monotonic() so wall-clock jumps never extend the window.
+_DISCOVERY_CACHE = {}  # type: Dict[str, Tuple[Dict[str, Any], float]]
+# Per-tool locks coalesce concurrent duplicate checks with a short critical
+# section (guard only cache/inflight bookkeeping, never adapter probes).
+_DISCOVERY_LOCKS = {}  # type: Dict[str, threading.Lock]
+_DISCOVERY_LOCKS_GUARD = threading.Lock()
+_DISCOVERY_INFLIGHT = set()  # type: set
+
+
+def _per_tool_lock(tool_id):
+    # type: (str) -> threading.Lock
+    with _DISCOVERY_LOCKS_GUARD:
+        lock = _DISCOVERY_LOCKS.get(tool_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DISCOVERY_LOCKS[tool_id] = lock
+        return lock
+
+
+def _drained():
+    # type: () -> bool
+    """True when <state_dir>/drain exists (maintenance refuses new work).
+
+    Reads only; never raises. Callers gate POST plans + POST jobs with
+    503 {code: maintenance}; reads are unaffected.
+    """
+    try:
+        base = settings.state_dir or "/var/lib/ega-update"
+    except Exception:
+        return False
+    try:
+        return os.path.exists(os.path.join(str(base), "drain"))
+    except Exception:
+        return False
+
+
+def _health_from_verify(verify_result):
+    # type: (Any) -> Tuple[str, str]
+    """Map adapter verify() to (health, health_detail).
+
+    pass -> healthy with detail; fail -> unhealthy (mandatory fail) or
+    degraded (optional-only fail); unknown/no-evidence -> unknown.
+    Never raises; detail is truncated safe text.
+    """
+    try:
+        passed = bool(getattr(verify_result, "passed", False))
+    except Exception:
+        passed = False
+    try:
+        version = str(getattr(verify_result, "version", "") or "")[:200]
+    except Exception:
+        version = ""
+    try:
+        raw_checks = list(getattr(verify_result, "checks", []) or [])
+    except Exception:
+        raw_checks = []
+    parts = []
+    man_fail = False
+    opt_fail = False
+    man_unknown = False
+    total_man = 0
+    pass_man = 0
+    for item in raw_checks:
+        try:
+            if isinstance(item, dict):
+                name = str(item.get("name", "") or "")[:100]
+                result = str(item.get("result", "unknown") or "unknown")
+                mandatory = bool(item.get("mandatory", True))
+            else:
+                name = str(getattr(item, "name", "") or "")[:100]
+                result = str(getattr(item, "result", "unknown")
+                             or "unknown")
+                mandatory = bool(getattr(item, "mandatory", True))
+        except Exception:
+            continue
+        if result not in ("pass", "fail", "unknown", "not_applicable"):
+            result = "unknown"
+        parts.append("%s=%s" % (name or "check", result))
+        if mandatory and result != "not_applicable":
+            total_man += 1
+            if result == "pass":
+                pass_man += 1
+        if result == "fail" and mandatory:
+            man_fail = True
+        elif result == "fail":
+            opt_fail = True
+        elif result == "unknown" and mandatory:
+            man_unknown = True
+    summary = "; ".join(parts)[:800]
+    if version:
+        prefix = "verify %s version=%s" % (
+            "pass" if passed else "fail", version)
+    else:
+        prefix = "verify %s" % ("pass" if passed else "fail")
+    if total_man:
+        prefix = "%s (%d/%d mandatory pass)" % (prefix, pass_man, total_man)
+    detail = ("%s: %s" % (prefix, summary)).strip(": ")[:1000]
+    if passed:
+        return "healthy", detail
+    if man_fail:
+        return "unhealthy", detail
+    if opt_fail:
+        return "degraded", detail
+    if man_unknown:
+        return "unknown", detail
+    # No fail evidence but not passed (e.g. empty checks): unknown.
+    return "unknown", detail
 # Explicit per-job cap marker emitted by worker/runner.py JobLog._write_record.
 # Log readers match only this string (not a generic "truncat" substring) so
 # per-line "…[truncated-line]" suffixes and user output containing "truncate"
@@ -249,6 +360,9 @@ def _log_path(job_id):
 
 def _read_log_page(job_id, after, limit):
     # type: (str, int, int) -> Dict[str, Any]
+    # has_more = page continuation (more records beyond limit);
+    # truncated = strictly storage-cap loss (per-job cap marker or file at
+    # cap). Never conflate the two.
     path = _log_path(job_id)
     records = []  # type: List[Dict[str, Any]]
     truncated_marker = False
@@ -259,11 +373,13 @@ def _read_log_page(job_id, after, limit):
                                20 * 1024 * 1024)):
             truncated_marker = True
     except OSError:
-        return {"records": [], "next_after": after, "truncated": False}
+        return {"records": [], "next_after": after, "truncated": False,
+                "has_more": False}
     try:
         fh = open(path, "r", encoding="utf-8", errors="replace")
     except OSError:
-        return {"records": [], "next_after": after, "truncated": False}
+        return {"records": [], "next_after": after, "truncated": False,
+                "has_more": False}
     with fh:
         wanted_from = after
         collected = []  # type: List[Dict[str, Any]]
@@ -312,7 +428,8 @@ def _read_log_page(job_id, after, limit):
                 has_more = True
         next_after = collected[-1]["seq"] if collected else wanted_from
         return {"records": collected, "next_after": next_after,
-                "truncated": bool(has_more or truncated_marker)}
+                "truncated": bool(truncated_marker),
+                "has_more": bool(has_more)}
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +496,59 @@ def post_tool_check(tool_id: str, request: Request):
             card["health"] = "stale"
         return card
 
+    def _preserve_with_error(tool_id_inner, message):
+        # type: (str, str) -> Dict[str, Any]
+        # On exception preserve the last observation; record only
+        # discovery_error + observation timestamps (never invent health).
+        now_inner = utcnow_iso()
+        conn_inner = _db()
+        try:
+            try:
+                conn_inner.execute("BEGIN IMMEDIATE")
+                conn_inner.execute(
+                    "INSERT OR IGNORE INTO tools(id) VALUES(?)",
+                    (tool_id_inner,))
+                conn_inner.execute(
+                    "UPDATE tools SET discovery_error=?,"
+                    " observation_time=?, updated_at=? WHERE id=?",
+                    (str(message)[:500], now_inner, now_inner,
+                     tool_id_inner))
+                conn_inner.commit()
+            except Exception:
+                try:
+                    conn_inner.rollback()
+                except Exception:
+                    pass
+        finally:
+            try:
+                conn_inner.close()
+            except Exception:
+                pass
+        conn_out = _db()
+        try:
+            return _read_tool_card(conn_out, tool_id_inner)
+        finally:
+            try:
+                conn_out.close()
+            except Exception:
+                pass
+
+    # Validate ?force (cache bypass only; still respects the active-job
+    # gate below). Only absent/"" , "0", "1" are accepted.
+    try:
+        _force_raw = request.query_params.get("force", "")
+    except Exception:
+        _force_raw = ""
+    _force_raw = str(_force_raw or "").strip()
+    if _force_raw in ("", "0"):
+        _force = False
+    elif _force_raw == "1":
+        _force = True
+    else:
+        return deps.error_envelope(
+            422, "invalid_request",
+            "force must be 0 or 1", "")
+
     # Short read only: active-job / recovery gate + cached card. No
     # transaction is held across the adapter probes below.
     conn = _db()
@@ -399,6 +569,7 @@ def post_tool_check(tool_id: str, request: Request):
             pass
     # During any active mutation return the cached observation labeled
     # stale/updating and never launch a contending probe (SPEC section 10).
+    # ?force still respects this gate: no probes while a job is active.
     if active is not None:
         avid = ""
         atool = ""
@@ -418,210 +589,247 @@ def post_tool_check(tool_id: str, request: Request):
         return _ok(_labeled_cached(
             dict(cached), "stale — cached observation; recovery required"))
 
-    # No active job: run the real read-only probes outside any transaction.
-    # Never invent observations: every field comes from the adapter results.
+    # 15-minute discovery coalesce (H-10) with per-tool lock, short
+    # critical section. Cache holds (snapshot_card, monotonic_ts);
+    # fresh (<900s) skips adapter probes unless ?force=1. Concurrent
+    # duplicates coalesce: contenders see the in-flight mark (or fail the
+    # non-blocking lock) and return the cached DB card without probing.
+    # The per-tool lock guards only cache/inflight bookkeeping, never the
+    # adapter probes below.
+    _lock = _per_tool_lock(tool_id)
+    _got_lock = _lock.acquire(blocking=False)
+    if not _got_lock:
+        conn_coal = _db()
+        try:
+            return _ok(_read_tool_card(conn_coal, tool_id))
+        finally:
+            try:
+                conn_coal.close()
+            except Exception:
+                pass
+    _added_inflight = False
     try:
-        adapter = _load_adapter(tool_id)
-    except KeyError:
-        return deps.error_envelope(
-            404, "not_found", "unknown tool", "tool_id=%s" % tool_id[:32])
-    except Exception as exc:
+        # Short critical section: cache freshness + in-flight check.
+        _cache_hit = False
+        _coalesced = False
+        if not _force:
+            try:
+                with _DISCOVERY_LOCKS_GUARD:
+                    _entry = _DISCOVERY_CACHE.get(tool_id)
+                    if _entry is not None:
+                        _snap, _ts = _entry
+                        if (time.monotonic() - float(_ts)) < float(
+                                DISCOVERY_CACHE_S):
+                            _cache_hit = True
+                    if not _cache_hit:
+                        if tool_id in _DISCOVERY_INFLIGHT:
+                            _coalesced = True
+                        else:
+                            _DISCOVERY_INFLIGHT.add(tool_id)
+                            _added_inflight = True
+            except Exception:
+                pass
+            if _cache_hit:
+                try:
+                    _lock.release()
+                except Exception:
+                    pass
+                conn_hit = _db()
+                try:
+                    return _ok(_read_tool_card(conn_hit, tool_id))
+                finally:
+                    try:
+                        conn_hit.close()
+                    except Exception:
+                        pass
+            if _coalesced:
+                try:
+                    _lock.release()
+                except Exception:
+                    pass
+                conn_coal2 = _db()
+                try:
+                    return _ok(_read_tool_card(conn_coal2, tool_id))
+                finally:
+                    try:
+                        conn_coal2.close()
+                    except Exception:
+                        pass
+        else:
+            # ?force=1 bypasses the cache but still registers in-flight so
+            # concurrent forced duplicates coalesce.
+            try:
+                with _DISCOVERY_LOCKS_GUARD:
+                    if tool_id in _DISCOVERY_INFLIGHT:
+                        _coalesced = True
+                    else:
+                        _DISCOVERY_INFLIGHT.add(tool_id)
+                        _added_inflight = True
+            except Exception:
+                pass
+            if _coalesced:
+                try:
+                    _lock.release()
+                except Exception:
+                    pass
+                conn_coal3 = _db()
+                try:
+                    return _ok(_read_tool_card(conn_coal3, tool_id))
+                finally:
+                    try:
+                        conn_coal3.close()
+                    except Exception:
+                        pass
+        # Release before the long adapter probes: short section ends here.
+        try:
+            _lock.release()
+        except Exception:
+            pass
+        # No active job: run the real read-only probes outside any
+        # transaction (inspect/discover/activity + verify). Never invent
+        # observations: every field comes from the adapter results.
+        try:
+            adapter = _load_adapter(tool_id)
+        except KeyError:
+            return deps.error_envelope(
+                404, "not_found", "unknown tool", "tool_id=%s" % tool_id[:32])
+        except Exception as exc:
+            return _ok(_preserve_with_error(tool_id, exc))
         now_iso = utcnow_iso()
+        try:
+            inspection = adapter.inspect()
+            discovery = adapter.discover()
+            activity = adapter.activity()
+            verification = adapter.verify()
+        except Exception as exc:
+            # Any probe failure preserves the last observation and records
+            # discovery_error (fail-closed, no invented data).
+            return _ok(_preserve_with_error(tool_id, exc))
+        try:
+            install_identity = str(
+                getattr(inspection, "install_identity", "") or "")[:500]
+            observed_version = str(
+                getattr(inspection, "version", "") or "")[:200]
+            tool_fingerprint = str(
+                getattr(inspection, "fingerprint", "") or "")[:200]
+            available_target = str(
+                getattr(discovery, "target", "") or "")[:200]
+            channel = str(
+                getattr(inspection, "channel", "") or
+                getattr(discovery, "channel", "") or "")[:200]
+            available = bool(getattr(discovery, "available", False))
+            unknown_reason = str(
+                getattr(discovery, "unknown_reason", "") or "")[:1000]
+            discovery_error = "" if available else unknown_reason
+            health, health_detail = _health_from_verify(verification)
+        except Exception as exc:
+            return _ok(_preserve_with_error(tool_id, exc))
+        # Short write transaction only; the subprocess-backed probes above
+        # are already finished so no transaction was held across them.
+        # Re-check the single-slot gate so a job that started during the
+        # probes wins and our observation does not clobber a mutation.
         conn2 = _db()
         try:
             try:
                 conn2.execute("BEGIN IMMEDIATE")
+                try:
+                    raced = jobs_lib.active_job(conn2)
+                except Exception:
+                    raced = None
+                try:
+                    race_recovering = jobs_lib.recovery_blocked(conn2)
+                except Exception:
+                    race_recovering = False
+                if raced is not None or race_recovering:
+                    try:
+                        conn2.rollback()
+                    except Exception:
+                        pass
+                    conn_cached = _db()
+                    try:
+                        card = _read_tool_card(conn_cached, tool_id)
+                    finally:
+                        try:
+                            conn_cached.close()
+                        except Exception:
+                            pass
+                    if raced is not None:
+                        avid = ""
+                        atool = ""
+                        try:
+                            avid = str(dict(raced).get("id", "") or "")
+                            atool = str(dict(raced).get("tool_id", "") or "")
+                        except Exception:
+                            avid = ""
+                            atool = ""
+                        note = ("updating — cached observation during active job"
+                                if atool == tool_id else
+                                "stale — cached observation while another"
+                                " update is active")
+                        if avid:
+                            note = "%s %s" % (note, avid[:8])
+                        return _ok(_labeled_cached(card, note))
+                    return _ok(_labeled_cached(
+                        card, "stale — cached observation; recovery required"))
                 conn2.execute(
                     "INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
                 conn2.execute(
-                    "UPDATE tools SET discovery_error=?, health=?,"
-                    " observation_time=?, updated_at=? WHERE id=?",
-                    (str(exc)[:500], "unknown", now_iso, now_iso, tool_id))
+                    "UPDATE tools SET install_identity=?, observed_version=?,"
+                    " available_target=?, channel=?, fingerprint=?,"
+                    " observation_time=?, discovery_error=?, health=?,"
+                    " health_detail=?, updated_at=? WHERE id=?",
+                    (install_identity, observed_version, available_target,
+                     channel, tool_fingerprint, now_iso, discovery_error,
+                     health, health_detail, now_iso, tool_id))
                 conn2.commit()
             except Exception:
                 try:
                     conn2.rollback()
                 except Exception:
                     pass
-        finally:
-            try:
-                conn2.close()
-            except Exception:
-                pass
-        conn3 = _db()
-        try:
-            return _ok(_read_tool_card(conn3, tool_id))
-        finally:
-            try:
-                conn3.close()
-            except Exception:
-                pass
-    now_iso = utcnow_iso()
-    try:
-        inspection = adapter.inspect()
-        discovery = adapter.discover()
-        activity = adapter.activity()
-    except Exception as exc:
-        # Any probe failure preserves the last observation and records
-        # discovery_error + unknown health (fail-closed, no invented data).
-        conn2 = _db()
-        try:
-            try:
-                conn2.execute("BEGIN IMMEDIATE")
-                conn2.execute(
-                    "INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
-                conn2.execute(
-                    "UPDATE tools SET discovery_error=?, health=?,"
-                    " observation_time=?, updated_at=? WHERE id=?",
-                    (str(exc)[:500], "unknown", now_iso, now_iso, tool_id))
-                conn2.commit()
-            except Exception:
-                try:
-                    conn2.rollback()
-                except Exception:
-                    pass
-        finally:
-            try:
-                conn2.close()
-            except Exception:
-                pass
-        conn3 = _db()
-        try:
-            return _ok(_read_tool_card(conn3, tool_id))
-        finally:
-            try:
-                conn3.close()
-            except Exception:
-                pass
-    try:
-        install_identity = str(
-            getattr(inspection, "install_identity", "") or "")[:500]
-        observed_version = str(
-            getattr(inspection, "version", "") or "")[:200]
-        available_target = str(
-            getattr(discovery, "target", "") or "")[:200]
-        channel = str(
-            getattr(inspection, "channel", "") or
-            getattr(discovery, "channel", "") or "")[:200]
-        available = bool(getattr(discovery, "available", False))
-        unknown_reason = str(
-            getattr(discovery, "unknown_reason", "") or "")[:1000]
-        discovery_error = "" if available else unknown_reason
-        evidence = str(getattr(activity, "evidence", "") or "")[:1000]
-    except Exception as exc:
-        conn2 = _db()
-        try:
-            try:
-                conn2.execute("BEGIN IMMEDIATE")
-                conn2.execute(
-                    "INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
-                conn2.execute(
-                    "UPDATE tools SET discovery_error=?, health=?,"
-                    " observation_time=?, updated_at=? WHERE id=?",
-                    (str(exc)[:500], "unknown", now_iso, now_iso, tool_id))
-                conn2.commit()
-            except Exception:
-                try:
-                    conn2.rollback()
-                except Exception:
-                    pass
-        finally:
-            try:
-                conn2.close()
-            except Exception:
-                pass
-        conn3 = _db()
-        try:
-            return _ok(_read_tool_card(conn3, tool_id))
-        finally:
-            try:
-                conn3.close()
-            except Exception:
-                pass
-    # Short write transaction only; the subprocess-backed probes above are
-    # already finished so no transaction was held across them. Re-check the
-    # single-slot gate so a job that started during the probes wins and our
-    # observation does not clobber a mutation.
-    conn2 = _db()
-    try:
-        try:
-            conn2.execute("BEGIN IMMEDIATE")
-            try:
-                raced = jobs_lib.active_job(conn2)
-            except Exception:
-                raced = None
-            try:
-                race_recovering = jobs_lib.recovery_blocked(conn2)
-            except Exception:
-                race_recovering = False
-            if raced is not None or race_recovering:
-                try:
-                    conn2.rollback()
-                except Exception:
-                    pass
+                # Persist failure still returns the last cached observation
+                # rather than inventing one.
                 conn_cached = _db()
                 try:
-                    card = _read_tool_card(conn_cached, tool_id)
+                    return _ok(_read_tool_card(conn_cached, tool_id))
                 finally:
                     try:
                         conn_cached.close()
                     except Exception:
                         pass
-                if raced is not None:
-                    avid = ""
-                    atool = ""
-                    try:
-                        avid = str(dict(raced).get("id", "") or "")
-                        atool = str(dict(raced).get("tool_id", "") or "")
-                    except Exception:
-                        avid = ""
-                        atool = ""
-                    note = ("updating — cached observation during active job"
-                            if atool == tool_id else
-                            "stale — cached observation while another"
-                            " update is active")
-                    if avid:
-                        note = "%s %s" % (note, avid[:8])
-                    return _ok(_labeled_cached(card, note))
-                return _ok(_labeled_cached(
-                    card, "stale — cached observation; recovery required"))
-            conn2.execute(
-                "INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
-            conn2.execute(
-                "UPDATE tools SET install_identity=?, observed_version=?,"
-                " available_target=?, channel=?, observation_time=?,"
-                " discovery_error=?, health=?, health_detail=?,"
-                " updated_at=? WHERE id=?",
-                (install_identity, observed_version, available_target,
-                 channel, now_iso, discovery_error, "unknown", evidence,
-                 now_iso, tool_id))
-            conn2.commit()
-        except Exception:
+        finally:
             try:
-                conn2.rollback()
+                conn2.close()
             except Exception:
                 pass
-            # Persist failure still returns the last cached observation
-            # rather than inventing one.
-            conn_cached = _db()
-            try:
-                return _ok(_read_tool_card(conn_cached, tool_id))
-            finally:
-                try:
-                    conn_cached.close()
-                except Exception:
-                    pass
-    finally:
+        conn3 = _db()
         try:
-            conn2.close()
+            fresh_card = _read_tool_card(conn3, tool_id)
+        finally:
+            try:
+                conn3.close()
+            except Exception:
+                pass
+        # Refresh the 15-minute coalesce snapshot on success only; failures
+        # preserve the last observation and stay retryable.
+        try:
+            with _DISCOVERY_LOCKS_GUARD:
+                _DISCOVERY_CACHE[tool_id] = (dict(fresh_card),
+                                             time.monotonic())
         except Exception:
             pass
-    conn3 = _db()
-    try:
-        return _ok(_read_tool_card(conn3, tool_id))
+        return _ok(fresh_card)
     finally:
+        # Only the holder that registered in-flight clears it; coalesced
+        # contenders and cache hits leave the holder's mark intact.
+        if _added_inflight:
+            try:
+                with _DISCOVERY_LOCKS_GUARD:
+                    _DISCOVERY_INFLIGHT.discard(tool_id)
+            except Exception:
+                pass
         try:
-            conn3.close()
+            _lock.release()
         except Exception:
             pass
 
@@ -647,35 +855,45 @@ async def post_tool_plan(tool_id: str, request: Request):
     if kind == "unknown":
         return deps.error_envelope(
             404, "not_found", "unknown tool", "tool_id=%s" % tool_id[:32])
-    # Optional activity ack in the JSON body (default False). The frontend
-    # sends {} today; unknown activity then yields 409 ack_required and the
-    # caller retries with {"activity_ack": true} after explicit owner ack.
-    ack = False
+    # Drain gate: when <state_dir>/drain exists, refuse new plans with
+    # 503 maintenance (reads keep working). Checked before any probes.
+    if _drained():
+        return deps.error_envelope(
+            503, "maintenance",
+            "console is drained for maintenance; new plans are refused",
+            "")
+    # Plan gate (H-11): any nonterminal global job or recovery_required
+    # refuses the plan with 409 WITHOUT invoking adapter probes.
+    _gate_conn = _db()
     try:
-        raw_body = await request.body()
+        try:
+            _gate_active = jobs_lib.active_job(_gate_conn)
+        except Exception:
+            _gate_active = None
+        try:
+            _gate_recovering = jobs_lib.recovery_blocked(_gate_conn)
+        except Exception:
+            _gate_recovering = False
+    finally:
+        try:
+            _gate_conn.close()
+        except Exception:
+            pass
+    if _gate_active is not None:
+        return deps.error_envelope(
+            409, "busy",
+            "another update is already active", "")
+    if _gate_recovering:
+        return deps.error_envelope(
+            409, "recovery_required",
+            "recovery required; SSH reconcile must clear first", "")
+    # Ack is never sent at plan time: unknown activity is recorded on the
+    # plan (201) and enforced at POST /jobs with activity_ack=true. Any
+    # request body is ignored for ack purposes.
+    try:
+        await request.body()
     except Exception:
-        raw_body = b""
-    if raw_body:
-        try:
-            limit = int(getattr(settings, "body_limit_bytes",
-                                256 * 1024) or 256 * 1024)
-        except Exception:
-            limit = 256 * 1024
-        if len(raw_body) > limit:
-            return deps.error_envelope(
-                422, "invalid_request", "request body too large", "")
-        try:
-            parsed = json.loads(raw_body.decode("utf-8") or "{}")
-        except Exception:
-            return deps.error_envelope(
-                422, "invalid_request", "malformed JSON body", "")
-        if isinstance(parsed, dict) and "activity_ack" in parsed:
-            val = parsed.get("activity_ack")
-            if not isinstance(val, bool):
-                return deps.error_envelope(
-                    422, "invalid_request",
-                    "activity_ack must be boolean", "")
-            ack = val
+        pass
     # Read-only adapter probes outside any DB transaction. Never install,
     # download, or restart here; plan() is the read-only preview.
     try:
@@ -689,11 +907,13 @@ async def post_tool_plan(tool_id: str, request: Request):
             "tool_id=%s" % tool_id[:32])
     try:
         activity = adapter.activity()
-    except Exception:
-        return deps.error_envelope(
-            409, "ack_required",
-            "unknown activity requires explicit acknowledgment",
-            ("tool_id=%s" % tool_id[:32])[:300])
+    except Exception as exc:
+        # Unprovable activity degrades to unknown (recorded on the plan,
+        # enforced at job time); planning itself stays 201-capable.
+        class _UnknownActivity(object):
+            state = "unknown"
+            evidence = "activity probe failed: %s" % str(exc)[:500]
+        activity = _UnknownActivity()
     try:
         planned = adapter.plan()
     except Exception as exc:
@@ -742,11 +962,8 @@ async def post_tool_plan(tool_id: str, request: Request):
             409, "activity_blocked",
             "tool reports active work; update blocked",
             activity_evidence[:300])
-    if activity_state == "unknown" and not ack:
-        return deps.error_envelope(
-            409, "ack_required",
-            "unknown activity requires explicit acknowledgment",
-            "tool_id=%s" % tool_id[:32])
+    # Unknown activity is allowed at plan time without ack (recorded on
+    # the plan; ack is enforced at POST /jobs).
     try:
         services = [str(s)[:300] for s in list(services_raw)
                     if str(s).strip()]
@@ -833,6 +1050,12 @@ async def post_job(request: Request):
     guard = deps.require_mutation_guards(request, claims or {})
     if guard is not None:
         return guard
+    # Drain gate: refuse new jobs with 503 maintenance (reads unaffected).
+    if _drained():
+        return deps.error_envelope(
+            503, "maintenance",
+            "console is drained for maintenance; new jobs are refused",
+            "")
     idem_key = (request.headers.get("idempotency-key", "") or "").strip()
     if not idem_key:
         return deps.error_envelope(
@@ -891,11 +1114,14 @@ async def post_job(request: Request):
                 409, "stale_plan", "plan expired; create a fresh plan",
                 "plan_id=%s" % plan_id[:8])
         # Fingerprint recheck before mutation (SPEC section 6).
+        # Compare against tools.fingerprint (adapter fingerprint persisted
+        # at check/plan time); install_identity is a human-readable
+        # display string and is never used for this comparison.
         tool_row = conn.execute("SELECT * FROM tools WHERE id=?",
                                 (tool_id,)).fetchone()
         current_fp = ""
         if tool_row is not None:
-            current_fp = dict(tool_row).get("install_identity", "") or ""
+            current_fp = dict(tool_row).get("fingerprint", "") or ""
         planned_fp = plan_d.get("fingerprint", "") or ""
         if current_fp and planned_fp and current_fp != planned_fp:
             return deps.error_envelope(
@@ -1110,7 +1336,7 @@ def get_health(request: Request):
     now_iso = utcnow_iso()
     database = "ok"
     recovery_required = False
-    worker = "ok"
+    worker = "down"
     api = "ok"
     conn = None
     try:
@@ -1127,39 +1353,16 @@ def get_health(request: Request):
                 recovery_required = jobs_lib.recovery_blocked(conn)
             except Exception:
                 recovery_required = False
+            # Worker readiness comes strictly from the dispatcher
+            # heartbeat file (jobs.read_dispatcher_heartbeat): fresh
+            # (<=20s) -> ok, stale/missing -> down. Never infer ok from
+            # the absence of jobs.
             try:
-                stale_accepted = conn.execute(
-                    "SELECT id, created_at FROM jobs WHERE state='accepted'"
-                    " ORDER BY created_at LIMIT 5").fetchall()
+                hb = jobs_lib.read_dispatcher_heartbeat(
+                    settings.state_dir, max_age_s=20)
             except Exception:
-                stale_accepted = []
-            try:
-                claim_s = int(getattr(settings, "worker_claim_s", 10) or 10)
-            except Exception:
-                claim_s = 10
-            cutoff = (datetime.now(timezone.utc)
-                      - timedelta(seconds=claim_s)).isoformat()
-            unclaimed = [dict(r) for r in (stale_accepted or [])
-                         if (dict(r).get("created_at", "") or "") < cutoff]
-            if unclaimed:
-                # Dispatcher has not claimed within 10s (SPEC section 8).
-                worker = "down"
-            else:
-                try:
-                    active = jobs_lib.active_job(conn)
-                except Exception:
-                    active = None
-                if active is None:
-                    worker = "ok"
-                else:
-                    hb = dict(active).get("heartbeat", "") or ""
-                    hbt = _parse_iso(hb) if hb else None
-                    if hbt is None:
-                        worker = "stale"
-                    else:
-                        age = (datetime.now(timezone.utc) - hbt
-                               ).total_seconds()
-                        worker = "ok" if age <= 60 else "stale"
+                hb = {}
+            worker = "ok" if hb else "down"
     except Exception:
         database = "down"
         api = "degraded"

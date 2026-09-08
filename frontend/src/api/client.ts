@@ -103,6 +103,7 @@ export interface LogPage {
   records: LogRecord[];
   next_after: number;
   truncated: boolean;
+  has_more?: boolean;
 }
 
 export interface HistoryPage {
@@ -193,14 +194,17 @@ export const api = {
   getTools(): Promise<ToolCard[]> {
     return req<ToolCard[]>("/tools");
   },
-  checkTool(toolId: string): Promise<ToolCard> {
-    return req<ToolCard>(`/tools/${encodeURIComponent(toolId)}/check`, {
+  checkTool(toolId: string, force = false): Promise<ToolCard> {
+    const suffix = force ? "?force=1" : "";
+    return req<ToolCard>(`/tools/${encodeURIComponent(toolId)}/check${suffix}`, {
       method: "POST",
       headers: mutationHeaders(),
       body: JSON.stringify({}),
     });
   },
   createPlan(toolId: string): Promise<PlanView> {
+    // Never send ack at plan time: unknown activity is recorded on the
+    // plan (201) and acknowledged at POST /jobs.
     return req<PlanView>(`/tools/${encodeURIComponent(toolId)}/plans`, {
       method: "POST",
       headers: mutationHeaders(),

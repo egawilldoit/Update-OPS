@@ -78,6 +78,7 @@ class ExecuteResult(BaseModel):
     state: str = ""  # succeeded|already_current|install_failed|...
     error_code: str = ""
     error_detail: str = ""
+    timed_out: bool = False
 
 
 class CheckItem(BaseModel):

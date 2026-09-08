@@ -55,9 +55,13 @@ def _db_path(args_db):
 
 def _run_systemctl(args):
     # type: (list) -> str
+    # Job runner units are user-manager units: the dispatcher launches via
+    # `systemd-run --user` as ubuntu, so inspection MUST use
+    # `systemctl --user` run as ubuntu (requires linger, see RUNBOOK).
+    # Fixed argv, shell=False, read-only inspection only.
     try:
         proc = subprocess.run(
-            ["systemctl"] + args,
+            ["systemctl", "--user"] + args,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=15, shell=False)
         return proc.stdout.strip()
@@ -67,7 +71,11 @@ def _run_systemctl(args):
 
 def _unit_state(unit):
     # type: (str) -> dict
-    """Read-only inspection of the recorded runner unit."""
+    """Read-only inspection of the recorded runner unit (user manager).
+
+    Uses `systemctl --user` (run as ubuntu) because job units are transient
+    user units launched via `systemd-run --user`.
+    """
     active = _run_systemctl(["is-active", unit])
     show = _run_systemctl(["show", unit, "-p", "ActiveState,SubState,MainPID,ExecMainStatus,Result"])
     info = {"is_active": active, "show": show, "main_pid": 0}  # type: dict
@@ -207,6 +215,66 @@ def main(argv=None):
         return 1
 
     # No updater remains proven (unit inactive + MainPID dead + no job procs).
+    # Optionally reconstruct DB terminal state from a validated receipt.
+    # Import backend.app.receipts defensively; when unavailable fall back to
+    # an existence-report (never invent terminal state, never clear on
+    # heartbeat age).
+    receipt_state = ""
+    try:
+        try:
+            from backend.app.receipts import validate_receipt as _validate_receipt  # type: ignore
+        except Exception:
+            from backend.app.receipts import load_receipt as _load_receipt_fallback  # type: ignore
+            _validate_receipt = None  # type: ignore
+        if "_validate_receipt" in locals() and _validate_receipt is not None:
+            _validated = _validate_receipt(receipt)
+            if isinstance(_validated, dict) and _validated.get("job_id") == args.job_id:
+                receipt_state = str(_validated.get("state", "") or "")
+                print("validated receipt: state=%s exit=%s (via backend.app.receipts)" % (
+                    receipt_state or "?", _validated.get("exit_code", "?")))
+            else:
+                print("validated receipt: unreadable or job mismatch; existence-report only (present=%s)" % receipt_ok)
+        else:
+            raise ImportError("receipts validator unavailable")
+    except Exception:
+        # Fallback: existence-report only; never reconstruct without validation.
+        if receipt_ok:
+            try:
+                with open(receipt, "r", encoding="utf-8") as _fh:
+                    import json as _json
+
+                    _data = _json.load(_fh)
+                if isinstance(_data, dict) and _data.get("job_id") == args.job_id:
+                    _cand = str(_data.get("state", "") or "")
+                    if _cand in ("succeeded", "blocked", "failed", "health_failed", "interrupted"):
+                        receipt_state = _cand
+                        print("receipt existence-report: state=%s (unvalidated fallback; receipts module unavailable)" % receipt_state)
+                    else:
+                        print("receipt existence-report: present but terminal state unproven (present=%s)" % receipt_ok)
+                else:
+                    print("receipt existence-report: present but job mismatch/unreadable (present=%s)" % receipt_ok)
+            except Exception as _exc:
+                print("receipt existence-report: present=%s unreadable (%s)" % (receipt_ok, str(_exc)[:200]))
+        else:
+            print("receipt existence-report: absent; outcome unproven")
+    # When a validated receipt proves a terminal outcome but the DB still
+    # shows nonterminal/interrupted, reconcile the DB to the receipt (with an
+    # event) so history reflects proven completion. Fail-closed: any doubt
+    # leaves the DB untouched for manual review.
+    if receipt_state in ("succeeded", "blocked", "failed", "health_failed", "interrupted"):
+        try:
+            if state != receipt_state:
+                conn.execute("UPDATE jobs SET state=? WHERE id=?", (receipt_state, args.job_id))
+                conn.execute(
+                    "INSERT INTO events(job_id,created_at,event_type,detail) VALUES(?,?,?,?)",
+                    (args.job_id, _utcnow(), "reconcile-receipt",
+                     "DB state %s reconciled to validated receipt state %s" % (state, receipt_state)))
+                conn.commit()
+                print("reconciled DB state %s -> %s from validated receipt" % (state, receipt_state))
+                state = receipt_state
+        except Exception as exc:
+            print("WARN: could not reconcile DB state from receipt: %s" % exc)
+
     if args.clear_recovery:
         if not recovery:
             print("VERDICT: no updater remains; recovery_required already clear. Nothing to do.")

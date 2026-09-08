@@ -32,9 +32,12 @@ from .base import (
     VerifyResult,
 )
 from .registry import (
+    MUTATION_TIMEOUT_MARGIN_S,
+    attach_timed_out,
     check_disk,
     extract_version_token,
     fingerprint,
+    mutation_timeout_for,
     resolve_executable,
     required_space_bytes,
     run_fixed,
@@ -77,6 +80,88 @@ def _parse_units():
         if scope in ("system", "user") and name:
             units.append((scope, name))
     return units or list(DEFAULT_UNITS)
+
+
+def _service_units_from_settings():
+    # type: () -> List[Tuple[str, str]]
+    """Inventoried Hermes units via settings.service_units (config-owned).
+
+    Read defensively with defaults: settings.service_units is owned by the
+    config contract and may be absent (this adapter never creates config
+    keys). Accepted shapes: dict with hermes unit lists, or None. Any
+    unparsable shape falls back to _parse_units() (EGA_HERMES_UNITS env +
+    DEFAULT_UNITS). Never raises.
+    """
+    try:
+        from ..config import settings as _settings
+
+        raw = getattr(_settings, "service_units", None)
+    except Exception:
+        return _parse_units()
+    try:
+        if raw is None:
+            return _parse_units()
+        candidates = []  # type: List[object]
+        if isinstance(raw, dict):
+            for key in ("hermes", "hermes_units", "hermesUnits", "units"):
+                val = raw.get(key)
+                if isinstance(val, list):
+                    candidates = val
+                    break
+            else:
+                return _parse_units()
+        elif isinstance(raw, list):
+            candidates = raw
+        else:
+            return _parse_units()
+        parsed = []
+        for entry in candidates:
+            if isinstance(entry, str) and ":" in entry:
+                scope, _, name = entry.partition(":")
+                scope, name = scope.strip(), name.strip()
+                if scope in ("system", "user") and name:
+                    parsed.append((scope, name))
+            elif isinstance(entry, dict):
+                scope = str(entry.get("scope", "")).strip()
+                name = str(entry.get("name", "") or entry.get("unit", "")).strip()
+                if scope in ("system", "user") and name:
+                    parsed.append((scope, name))
+        return parsed or _parse_units()
+    except Exception:
+        return _parse_units()
+
+
+def _inventoried_units():
+    # type: () -> List[Tuple[str, str]]
+    """Single source for inventoried units: settings first, env fallback."""
+    try:
+        units = _service_units_from_settings()
+        if units:
+            return units
+    except Exception:
+        pass
+    return _parse_units()
+
+
+# Narrowly-scoped restart authority: ubuntu may run passwordless ONLY the
+# exact systemctl commands for the inventoried Hermes units listed in
+# deploy/etc/sudoers.d/ega-update-hermes.example (placeholder unit names
+# there are inventory-gated and must match _inventoried_units()).
+# Generic `sudo -n true` is NEVER used as authority proof.
+_SUDO = "/usr/bin/sudo"
+_SYSTEMCTL = "/bin/systemctl"
+
+
+def _allowed_show_argv(unit):
+    # type: (str) -> List[str]
+    """Exact allow-list shape for the authority probe of one system unit."""
+    return [_SUDO, "-n", _SYSTEMCTL, "--no-pager", "show", unit]
+
+
+def _allowed_restart_argv(unit):
+    # type: (str) -> List[str]
+    """Exact allow-list shape for restarting one system unit."""
+    return [_SUDO, "-n", _SYSTEMCTL, "restart", unit]
 
 
 class HermesAdapter(Adapter):
@@ -170,23 +255,47 @@ class HermesAdapter(Adapter):
                     info[key] = value.strip()
         return info
 
-    def _has_system_restart_authority(self):
-        # type: () -> Tuple[bool, str]
-        """Confirm authority to restart system units without prompting sudo.
+    def _has_system_restart_authority(self, units=None):
+        # type: (object) -> Tuple[bool, str]
+        """Confirm narrowly-scoped authority to restart system units.
 
-        Uses only non-mutating probes with fixed argv: uid check plus
-        `sudo -n true` (fails immediately when no cached credential; never
-        prompts). Missing authority blocks before mutation.
+        Never uses a generic sudo proof. For each inventoried system unit,
+        the ONLY accepted probe is the exact allow-list shape
+        `sudo -n systemctl --no-pager show <unit>` (see
+        deploy/etc/sudoers.d/ega-update-hermes.example, which grants ubuntu
+        passwordless ONLY those exact commands for the inventoried units).
+        The probe argv is validated against the allow-list shape before any
+        execution; anything outside the shape yields
+        BLOCKED_RESTART_AUTHORITY without running sudo. Missing authority
+        blocks before mutation (caller maps to install_method_unsupported
+        with BLOCKED_RESTART_AUTHORITY detail).
         """
         try:
             if os.geteuid() == 0:
                 return True, "running as root"
         except AttributeError:
             pass
-        probe = run_fixed(["/usr/bin/sudo", "-n", "true"], timeout=15)
-        if probe.ok():
-            return True, "passwordless sudo confirmed (non-mutating probe)"
-        return False, "no confirmed system restart authority for ubuntu; refusing to prompt sudo mid-job"
+        try:
+            check_units = list(units) if units is not None else _inventoried_units()
+        except Exception:
+            check_units = _parse_units()
+        system_units = [u for s, u in check_units if s == "system"]
+        if not system_units:
+            return True, "no system units in inventory; no elevated authority needed"
+        # Allow-list shape: exact argv per inventoried unit, nothing else.
+        allowed = set()
+        for _u in system_units:
+            allowed.add(tuple(_allowed_show_argv(_u)))
+            allowed.add(tuple(_allowed_restart_argv(_u)))
+        for _u in system_units:
+            probe_argv = _allowed_show_argv(_u)
+            if tuple(probe_argv) not in allowed:
+                return False, "BLOCKED_RESTART_AUTHORITY: probe for %s outside allow-list shape" % _u
+            probe = run_fixed(probe_argv, timeout=15)
+            if not probe.ok():
+                return False, ("BLOCKED_RESTART_AUTHORITY: no confirmed passwordless authority for %s "
+                               "(sudo show exit=%d); refusing to prompt sudo mid-job; install sudoers snippet per RUNBOOK)" % (_u, probe.exit_code))
+        return True, "narrowly-scoped passwordless authority confirmed for %d system unit(s) via sudo show probe(s)" % len(system_units)
 
     def _update_plan_probe(self):
         # type: () -> Tuple[str, str]
@@ -209,7 +318,7 @@ class HermesAdapter(Adapter):
         cleanliness, head, git_detail = self._git_state()
         owner = self._owner_of(HERMES_BIN)
         fp = fingerprint(HERMES_BIN, resolved, version, head, cleanliness, owner)
-        units = ["%s:%s" % (scope, unit) for scope, unit in _parse_units()]
+        units = ["%s:%s" % (scope, unit) for scope, unit in _inventoried_units()]
         state_dirs = [d for d in ("/home/ubuntu/.hermes", HERMES_REPO) if os.path.exists(d)]
         return InspectResult(
             tool=self.tool_id,
@@ -270,7 +379,7 @@ class HermesAdapter(Adapter):
         # type: () -> ActivityResult
         busy_units = []
         unknown_units = []
-        for scope, unit in _parse_units():
+        for scope, unit in _inventoried_units():
             info = self._unit_show(scope, unit)
             if info.get("LoadState") not in ("loaded",):
                 unknown_units.append("%s:%s(%s)" % (scope, unit, info.get("LoadState") or "no-loadstate"))
@@ -309,21 +418,22 @@ class HermesAdapter(Adapter):
             )
         caps = self._capabilities()
         need = required_space_bytes(STAGING_ESTIMATE_BYTES, BACKUP_ESTIMATE_BYTES)
-        system_units = [unit for scope, unit in _parse_units() if scope == "system"]
-        authority_ok, authority_detail = self._has_system_restart_authority()
+        inventoried = _inventoried_units()
+        system_units = [unit for scope, unit in inventoried if scope == "system"]
+        authority_ok, authority_detail = self._has_system_restart_authority(inventoried)
         restart_impact = "native restart handling; gateway/serve units %s" % ", ".join(
-            "%s:%s" % (scope, unit) for scope, unit in _parse_units())
+            "%s:%s" % (scope, unit) for scope, unit in inventoried)
         if system_units and not authority_ok:
-            restart_impact += " BLOCKED: %s" % authority_detail
+            restart_impact += " BLOCKED_RESTART_AUTHORITY: %s" % authority_detail
         backup_mode = "full" if caps.get("backup") else "quick-limited"
         return PlanResult(
             tool=self.tool_id, target=discovery.target, target_mode="native_latest",
             channel=HERMES_BRANCH, fingerprint=inspection.fingerprint,
-            services=["%s:%s" % (scope, unit) for scope, unit in _parse_units()],
+            services=["%s:%s" % (scope, unit) for scope, unit in inventoried],
             backup_scope={
-                "covered": "repo state + gateway config (native receipt)",
+                "covered": "repo state + gateway config capability + metadata (backup phase records capability+metadata only)",
                 "omitted": "4.8 GiB hermes home wholesale",
-                "consistency": "native updater receipt",
+                "consistency": "native --backup full backup executes inside the mutation command; backup phase alone is not a full backup",
                 "mode": backup_mode,
             },
             required_space_bytes=need or 0,
@@ -335,6 +445,11 @@ class HermesAdapter(Adapter):
 
     def backup(self, job_id):
         # type: (str) -> BackupResult
+        # Backup phase records capability + metadata ONLY. A requested full
+        # backup is performed natively via `hermes update --yes --backup`
+        # INSIDE the mutation command (see execute()); this phase never
+        # claims a full backup has occurred. execute() fails when a requested
+        # full backup lacks receipt/flag evidence.
         caps = self._capabilities()
         try:
             from ..config import settings as _settings
@@ -345,11 +460,11 @@ class HermesAdapter(Adapter):
         dest_dir = os.path.join(backup_root, job_id)
         mode = "full" if caps.get("backup") else "quick-limited"
         scope = {
-            "covered": "repo HEAD + status snapshot, gateway config (native receipt during update)",
+            "covered": "repo HEAD + status snapshot, gateway config capability+metadata (full backup executes natively inside mutation via --backup)",
             "omitted": "4.8 GiB hermes home wholesale",
-            "consistency": "git metadata snapshot + native receipt",
+            "consistency": "git metadata snapshot + native capability record; backup phase alone is not a full backup",
             "mode": ("%s (limited state protection, not full rollback)" % mode)
-            if mode != "full" else "full (native --backup)",
+            if mode != "full" else "full-requested (native --backup executes inside mutation; receipt required)",
         }
         cleanliness, head, git_detail = self._git_state()
         if cleanliness != "clean":
@@ -379,6 +494,15 @@ class HermesAdapter(Adapter):
 
     def execute(self, plan, job_id, activity_ack=False):
         # type: (PlanResult, str, bool) -> ExecuteResult
+        # Hermes is native_latest only: an exact-mode plan is an
+        # exact-target mismatch and is blocked (runner enforces exact-target
+        # centrally; adapters enforce their own check here).
+        if plan.target_mode == "exact":
+            _mismatch = ExecuteResult(
+                tool=self.tool_id, exit_code=3, before_version="",
+                after_version="", state="blocked", error_code="invalid_request",
+                error_detail="exact-target mismatch: hermes supports only target_mode=native_latest")
+            return attach_timed_out(_mismatch, False)
         ok, resolved, detail = resolve_executable(HERMES_BIN)
         if not ok:
             return ExecuteResult(
@@ -430,15 +554,17 @@ class HermesAdapter(Adapter):
                 tool=self.tool_id, exit_code=3, before_version=current.version,
                 after_version="", state="blocked", error_code="install_method_unsupported",
                 error_detail="noninteractive --yes unsupported locally")
-        system_units = [(s, u) for s, u in _parse_units() if s == "system"]
+        inventoried = _inventoried_units()
+        system_units = [(s, u) for s, u in inventoried if s == "system"]
         if system_units:
-            authority_ok, authority_detail = self._has_system_restart_authority()
+            authority_ok, authority_detail = self._has_system_restart_authority(inventoried)
             if not authority_ok:
-                return ExecuteResult(
+                _blocked = ExecuteResult(
                     tool=self.tool_id, exit_code=3, before_version=current.version,
                     after_version="", state="blocked",
                     error_code="install_method_unsupported",
-                    error_detail="system unit restart authority unconfirmed: %s" % authority_detail)
+                    error_detail="BLOCKED_RESTART_AUTHORITY: %s" % authority_detail)
+                return attach_timed_out(_blocked, False)
         backup_mode = str((plan.backup_scope or {}).get("mode", ""))
         argv = [HERMES_BIN, "update", "--yes"]
         if caps.get("backup") and backup_mode.startswith("full"):
@@ -450,34 +576,59 @@ class HermesAdapter(Adapter):
                 error_detail="full backup requested but native --backup unsupported; refusing silent downgrade")
         before = current.version
         before_head = current.commit
-        res = run_fixed(argv, timeout=1800)
-        self._emit("stdout", "$ hermes update --yes%s -> exit=%d"
-                   % (" --backup" if "--backup" in argv else "", res.exit_code))
+        # Shared contract: mutation subprocess timeout = step_timeout +
+        # registry.MUTATION_TIMEOUT_MARGIN_S (120s). Probes keep fixed
+        # timeouts; only this mutating update adds the margin.
+        mutation_to = mutation_timeout_for(plan, "updating", default=1800)
+        res = run_fixed(argv, timeout=mutation_to)
+        self._emit("stdout", "$ hermes update --yes%s -> exit=%d (mutation timeout %ds = step + %ds margin)"
+                   % (" --backup" if "--backup" in argv else "", res.exit_code,
+                      mutation_to, MUTATION_TIMEOUT_MARGIN_S))
         self._emit("stdout", (res.stdout or "")[-4000:])
         if res.stderr:
             self._emit("stderr", (res.stderr or "")[-4000:])
         if res.timed_out:
-            return ExecuteResult(
+            _tout = ExecuteResult(
                 tool=self.tool_id, exit_code=4, before_version=before,
                 after_version="", state="install_failed", error_code="timeout",
                 error_detail="hermes update timed out; possible partial install")
+            return attach_timed_out(_tout, True)
         if res.exit_code != 0:
             after_probe, _raw = self._version_probe()
-            return ExecuteResult(
+            _fail = ExecuteResult(
                 tool=self.tool_id, exit_code=4, before_version=before,
                 after_version=after_probe, state="install_failed",
                 error_code="install_failed",
                 error_detail="hermes update exit=%d" % res.exit_code)
+            return attach_timed_out(_fail, False)
+        # Full-backup receipt check: when the plan requested a full backup,
+        # the native --backup MUST have actually run inside this mutation.
+        # Require both the --backup flag in argv and backup receipt/flag
+        # evidence in output; otherwise fail (never silently downgrade).
+        if backup_mode.startswith("full"):
+            _combined = ((res.stdout or "") + "\n" + (res.stderr or "")).lower()
+            _has_flag = "--backup" in argv
+            _has_receipt = ("backup" in _combined)
+            if not (_has_flag and _has_receipt):
+                after_probe, _raw = self._version_probe()
+                _bfail = ExecuteResult(
+                    tool=self.tool_id, exit_code=4, before_version=before,
+                    after_version=after_probe, state="install_failed",
+                    error_code="backup_failed",
+                    error_detail="full backup requested but no backup receipt/flag evidence "
+                                 "(flag=%s receipt=%s); refusing to claim full backup" % (_has_flag, _has_receipt))
+                return attach_timed_out(_bfail, False)
         # Exit zero alone is never success: verify commit, diagnostics,
         # restart outcome, and running versions below (runner calls verify()).
         after_inspection = self.inspect()
         self._emit("stdout", "hermes before=%s@%s after=%s@%s" % (
             before, (before_head or "")[:12], after_inspection.version,
             (after_inspection.commit or "")[:12]))
-        return ExecuteResult(
+        _done = ExecuteResult(
             tool=self.tool_id, exit_code=0, before_version=before,
             after_version=after_inspection.version, state="succeeded",
             error_code="", error_detail="")
+        return attach_timed_out(_done, False)
 
     def verify(self):
         # type: () -> VerifyResult
@@ -500,7 +651,7 @@ class HermesAdapter(Adapter):
                 name="doctor", result="pass" if doctor.ok() else "fail",
                 mandatory=True, summary="doctor exit=%d" % doctor.exit_code))
         all_running = True
-        for scope, unit in _parse_units():
+        for scope, unit in _inventoried_units():
             info = self._unit_show(scope, unit)
             running = (info.get("LoadState") == "loaded"
                        and info.get("ActiveState") == "active"

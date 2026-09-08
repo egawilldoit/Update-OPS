@@ -24,7 +24,9 @@ from .db import connect, migrate
 async def lifespan(app: FastAPI):
     # type: (FastAPI) -> AsyncIterator[None]
     # Short migrate-at-startup only; request handlers use short
-    # transactions and never migrate per request.
+    # transactions and never migrate per request. A migration failure must
+    # fail startup/readiness (re-raise after rollback) so a
+    # schema-incompatible API never serves traffic.
     conn = connect(settings.db_path)
     try:
         migrate(conn)
@@ -34,6 +36,7 @@ async def lifespan(app: FastAPI):
             conn.rollback()
         except Exception:
             pass
+        raise
     finally:
         try:
             conn.close()

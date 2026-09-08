@@ -1,0 +1,36 @@
+# EGA Update Console — Hermes restart authority (EXAMPLE ONLY).
+#
+# Purpose: allow the tool-owner account `ubuntu` to restart ONLY the
+# inventoried Hermes gateway/serve units WITHOUT a password, so Hermes jobs
+# can restart services without interactive sudo. No generic sudo grant.
+#
+# Install (owner, over SSH):
+#   sudo cp deploy/etc/sudoers.d/ega-update-hermes.example /etc/sudoers.d/ega-update-hermes
+#   sudo chown root:root /etc/sudoers.d/ega-update-hermes
+#   sudo chmod 0440 /etc/sudoers.d/ega-update-hermes
+#   sudo visudo -c
+#
+# Inventory-gated placeholders: replace EVERY CHANGEME-* unit below with the
+# exact inventoried Hermes unit names from inventory.json /
+# settings.service_units (config-owned; e.g. "system:hermes-gateway.service").
+# The Hermes adapter validates every probe against this exact allow-list
+# shape (`sudo -n systemctl --no-pager show <unit>` and
+# `sudo -n systemctl restart <unit>`) and returns BLOCKED_RESTART_AUTHORITY
+# before mutation when authority is absent. A generic `sudo -n true` grant
+# is NEVER sufficient and must not be added.
+#
+# The adapter's exact probe shapes (must match below verbatim):
+#   /usr/bin/sudo -n /bin/systemctl --no-pager show <unit>
+#   /usr/bin/sudo -n /bin/systemctl restart <unit>
+#
+# --- EXAMPLE (placeholders; replace before use) ---
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl --no-pager show CHANGEME-hermes-gateway.service
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart CHANGEME-hermes-gateway.service
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl --no-pager show CHANGEME-hermes-serve.service
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart CHANGEME-hermes-serve.service
+
+# Uncomment and inventory-gate the lines below after replacing placeholders:
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl --no-pager show CHANGEME-hermes-gateway.service
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart CHANGEME-hermes-gateway.service
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl --no-pager show CHANGEME-hermes-serve.service
+# ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart CHANGEME-hermes-serve.service

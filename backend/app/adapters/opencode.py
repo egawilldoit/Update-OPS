@@ -30,10 +30,13 @@ from .base import (
     VerifyResult,
 )
 from .registry import (
+    MUTATION_TIMEOUT_MARGIN_S,
+    attach_timed_out,
     check_disk,
     compare_semver,
     extract_version_token,
     fingerprint,
+    mutation_timeout_for,
     nvm_paths,
     parse_semver,
     resolve_executable,
@@ -102,6 +105,48 @@ class OpenCodeAdapter(Adapter):
         if unit:
             return True, "configured unit %s" % unit
         return False, "no configured opencode server unit"
+
+    def _server_correlation(self, unit):
+        # type: (str) -> Tuple[str, str]
+        """Correlate a configured server unit with the new binary.
+
+        Returns (outcome, detail) where outcome in correlated|unknown.
+        Correlated requires: unit LoadState=loaded via `systemctl --user
+        show` (job units run as ubuntu user manager), ExecStart references
+        the configured OPENCODE_BIN (preserved flags are never rewritten),
+        and the resolved binary is the inventoried standalone. Anything less
+        is unknown (never success) so the caller restarts ONLY a correlated
+        inventoried service and records the restart outcome.
+        """
+        if not unit:
+            return "unknown", "no configured unit to correlate"
+        ok, resolved, _detail = resolve_executable(OPENCODE_BIN)
+        if not ok:
+            return "unknown", "binary unresolvable, cannot correlate unit %s" % unit
+        show = run_fixed(
+            ["/bin/systemctl", "--user", "show", unit,
+             "-p", "LoadState", "-p", "ExecStart"],
+            timeout=30)
+        if not show.ok():
+            return "unknown", "unit %s show failed (exit=%d); correlation unproven" % (
+                unit, show.exit_code)
+        load = ""
+        exec_start = ""
+        for line in show.stdout.splitlines():
+            if line.startswith("LoadState="):
+                load = line.partition("=")[2].strip()
+            elif line.startswith("ExecStart="):
+                exec_start = line.partition("=")[2].strip()
+        if load != "loaded":
+            return "unknown", "unit %s LoadState=%s (not loaded); correlation unproven" % (
+                unit, load or "?")
+        # Preserved flags: ExecStart must reference the inventoried binary;
+        # we never rewrite flags, only restart the unit as-is.
+        if OPENCODE_BIN not in exec_start and (resolved not in exec_start):
+            return "unknown", "unit %s ExecStart does not reference %s; server/binary correlation unproven" % (
+                unit, OPENCODE_BIN)
+        return "correlated", "unit %s correlated (LoadState=loaded, ExecStart references %s; flags preserved)" % (
+            unit, OPENCODE_BIN)
 
     def _resolve_target(self, current):
         # type: (str) -> Tuple[str, str, str]
@@ -249,9 +294,9 @@ class OpenCodeAdapter(Adapter):
             channel="stable", fingerprint=inspection.fingerprint,
             services=[os.environ.get("EGA_OPENCODE_UNIT", "")] if server_on else [],
             backup_scope={
-                "covered": "opencode config + opencode.db (consistent copy when quiesced)",
+                "covered": "opencode config + opencode.db via sqlite3 backup API when quiesced",
                 "omitted": "13 GiB state dir wholesale, caches, plugins, alternate NVM npm install",
-                "consistency": "quiesced file copy of config + sqlite db; live-server migration requires quiesce or block",
+                "consistency": "quiesced sqlite3 backup-API copy; bare file copy of a live DB is never sufficient; live-server migration requires quiesce or block",
                 "mode": "consistent-if-quiesced",
             },
             required_space_bytes=need or 0,
@@ -276,9 +321,9 @@ class OpenCodeAdapter(Adapter):
         import shutil as _shutil
 
         scope = {
-            "covered": "opencode config + opencode.db (consistent copy when quiesced)",
+            "covered": "opencode config + opencode.db via sqlite3 backup API when quiesced",
             "omitted": "13 GiB state dir wholesale, caches, plugins, alternate NVM npm install",
-            "consistency": "quiesced file copy; copying a live db alone is insufficient",
+            "consistency": "quiesced sqlite3 backup-API copy; bare file copy of a live DB is never sufficient",
         }
         try:
             from ..config import settings as _settings
@@ -313,15 +358,26 @@ class OpenCodeAdapter(Adapter):
                 unsupported_reason="backup_failed: cannot create %s: %s" % (dest_dir, exc))
         total = 0
         try:
+            # Quiesced sqlite3 backup-API copy (stdlib sqlite3 backup()).
+            # Bare file copies (copy2) of a live opencode.db/WAL/SHM are
+            # explicitly NOT used: writers were gated quiesced above, and the
+            # backup API copies a transactionally consistent snapshot
+            # including WAL content.
+            import sqlite3 as _sqlite3
+
             for db_path in dbs:
                 dest = os.path.join(dest_dir, os.path.basename(db_path))
-                _shutil.copy2(db_path, dest)
-                total += os.path.getsize(dest)
-                for suffix in ("-wal", "-shm"):
-                    sidecar = db_path + suffix
-                    if os.path.exists(sidecar):
-                        _shutil.copy2(sidecar, dest + suffix)
-                        total += os.path.getsize(dest + suffix)
+                _src = _sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=10.0)
+                try:
+                    _dst = _sqlite3.connect(dest, timeout=10.0)
+                    try:
+                        with _dst:
+                            _src.backup(_dst)
+                    finally:
+                        _dst.close()
+                finally:
+                    _src.close()
+                total += os.path.getsize(dest) if os.path.exists(dest) else 0
             # Config snapshot (small files only; never the state dir).
             if os.path.isdir(OPENCODE_CONFIG_DIR):
                 cfg_dest = os.path.join(dest_dir, "config")
@@ -338,6 +394,11 @@ class OpenCodeAdapter(Adapter):
                 tool=self.tool_id, supported=False, path="", scope=scope,
                 consistency=scope["consistency"], size_bytes=total,
                 unsupported_reason="backup_failed: %s" % exc)
+        except Exception as exc:
+            return BackupResult(
+                tool=self.tool_id, supported=False, path="", scope=scope,
+                consistency=scope["consistency"], size_bytes=total,
+                unsupported_reason="backup_failed: sqlite backup API failed: %s" % str(exc)[:300])
         return BackupResult(
             tool=self.tool_id, supported=True, path=dest_dir, scope=scope,
             consistency="quiesced-copy", size_bytes=total, unsupported_reason="")
@@ -405,35 +466,130 @@ class OpenCodeAdapter(Adapter):
                 error_detail=disk_detail[:500])
         before = current.version
         if before and before == plan.target:
-            return ExecuteResult(
+            _already = ExecuteResult(
                 tool=self.tool_id, exit_code=0, before_version=before,
                 after_version=before, state="already_current", error_code="",
                 error_detail="already at target %s; not upgrade evidence" % plan.target)
+            return attach_timed_out(_already, False)
+        # Activity->snapshot race: backup() quiesced writers at snapshot time,
+        # but a process may have started since. Recheck activity immediately
+        # before mutation (no snapshot reuse across the race); block/require
+        # ack on any change.
+        _recheck = self.activity()
+        if _recheck.state == "busy":
+            return ExecuteResult(
+                tool=self.tool_id, exit_code=3, before_version=before,
+                after_version="", state="blocked", error_code="activity_blocked",
+                error_detail="pre-mutation recheck: %s" % _recheck.evidence[:400])
+        if _recheck.state == "unknown" and not activity_ack:
+            return ExecuteResult(
+                tool=self.tool_id, exit_code=3, before_version=before,
+                after_version="", state="blocked", error_code="ack_required",
+                error_detail="pre-mutation recheck unknown requires ack: %s" % _recheck.evidence[:300])
         target = plan.target
+        # Shared contract: mutation subprocess timeout = step_timeout +
+        # registry.MUTATION_TIMEOUT_MARGIN_S (120s). Probes keep fixed
+        # timeouts; only this mutating upgrade adds the margin.
+        mutation_to = mutation_timeout_for(plan, "updating", default=1800)
         # Mutation template: explicit discovered target, curl method, fixed argv.
-        res = run_fixed([OPENCODE_BIN, "upgrade", target, "--method", "curl"], timeout=1800)
-        self._emit("stdout", "$ opencode upgrade <target> --method curl -> exit=%d" % res.exit_code)
+        res = run_fixed([OPENCODE_BIN, "upgrade", target, "--method", "curl"], timeout=mutation_to)
+        self._emit("stdout", "$ opencode upgrade <target> --method curl -> exit=%d (mutation timeout %ds = step + %ds margin)"
+                   % (res.exit_code, mutation_to, MUTATION_TIMEOUT_MARGIN_S))
         self._emit("stdout", (res.stdout or "")[-4000:])
         if res.stderr:
             self._emit("stderr", (res.stderr or "")[-4000:])
         if res.timed_out:
-            return ExecuteResult(
+            _tout = ExecuteResult(
                 tool=self.tool_id, exit_code=4, before_version=before,
                 after_version="", state="install_failed", error_code="timeout",
                 error_detail="opencode upgrade timed out; possible partial install")
+            return attach_timed_out(_tout, True)
         after, _raw = self._version_probe()
         if res.exit_code != 0:
-            return ExecuteResult(
+            _fail = ExecuteResult(
                 tool=self.tool_id, exit_code=4, before_version=before,
                 after_version=after, state="install_failed", error_code="install_failed",
                 error_detail="opencode upgrade exit=%d" % res.exit_code)
-        return ExecuteResult(
+            return attach_timed_out(_fail, False)
+        # Verify-equivalent path: exact final target equality. For target_mode
+        # exact the running binary MUST equal the planned target; anything
+        # else is a verification failure, never success (the runner also
+        # enforces this centrally; adapters enforce their own check here).
+        if plan.target_mode == "exact" and after != plan.target:
+            _mismatch = ExecuteResult(
+                tool=self.tool_id, exit_code=4, before_version=before,
+                after_version=after, state="install_failed", error_code="install_failed",
+                error_detail="exact-target mismatch: after=%s planned=%s" % (after or "?", plan.target))
+            return attach_timed_out(_mismatch, False)
+        # Correlated server restart: restart ONLY an inventoried configured
+        # service with preserved flags (plain `restart`, never rewriting
+        # ExecStart), record the outcome. If correlation cannot be
+        # established, do NOT restart; verify() will report unknown (never
+        # success) until manually correlated.
+        server_on, server_detail = self._server_configured()
+        if server_on:
+            _unit = os.environ.get("EGA_OPENCODE_UNIT", "").strip()
+            _outcome, _corr_detail = self._server_correlation(_unit)
+            self._emit("stdout", "server correlation %s: %s" % (_outcome, _corr_detail[:400]))
+            if _outcome == "correlated":
+                _restart = run_fixed(
+                    ["/bin/systemctl", "--user", "restart", _unit], timeout=120)
+                self._emit("stdout", "$ systemctl --user restart %s -> exit=%d (flags preserved)"
+                           % (_unit, _restart.exit_code))
+                if not _restart.ok():
+                    _rfail = ExecuteResult(
+                        tool=self.tool_id, exit_code=4, before_version=before,
+                        after_version=after, state="install_failed", error_code="install_failed",
+                        error_detail="correlated server restart failed for %s: exit=%d" % (_unit, _restart.exit_code))
+                    return attach_timed_out(_rfail, False)
+            else:
+                self._emit("stdout", "server/binary correlation unproven; skipping automatic restart; "
+                                     "verification will report unknown until manually correlated")
+        _done = ExecuteResult(
             tool=self.tool_id, exit_code=0, before_version=before,
             after_version=after, state="succeeded", error_code="",
             error_detail="")
+        return attach_timed_out(_done, False)
 
-    def verify(self):
-        # type: () -> VerifyResult
+    def _db_integrity(self):
+        # type: () -> Tuple[str, str]
+        """Measured state evidence: PRAGMA integrity_check on opencode.db.
+
+        Returns (result, detail) with result in pass|fail|unknown|
+        not_applicable. Read-only open (mode=ro) so the probe never mutates
+        live state. A hard-coded pass is never used.
+        """
+        dbs = self._db_paths()
+        if not dbs:
+            return "not_applicable", "no opencode.db present; nothing to integrity-check"
+        try:
+            import sqlite3 as _sqlite3
+
+            for db_path in dbs:
+                _conn = _sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=10.0)
+                try:
+                    _row = _conn.execute("PRAGMA integrity_check;").fetchone()
+                finally:
+                    _conn.close()
+                _val = str((_row[0] if _row else "") or "").strip().lower()
+                if _val != "ok":
+                    return "fail", "integrity_check failed for %s: %s" % (db_path, str((_row[0] if _row else "?"))[:200])
+            return "pass", "integrity_check ok on %d db(s) via read-only probe" % len(dbs)
+        except Exception as exc:
+            return "unknown", "integrity probe inconclusive: %s" % str(exc)[:300]
+
+    def verify(self, expected_target=""):
+        # type: (str) -> VerifyResult
+        """Verify CLI version + startup + correlated server + measured state.
+
+        expected_target (optional): when the caller knows the planned exact
+        target (execute() enforces it; the runner enforces it centrally),
+        equality is re-checked here and mismatch is a verification failure.
+        Without it the exact-target check is not_applicable (never assumed).
+        Server/binary correlation unproven yields unknown (never success).
+        State uses measured integrity/startup evidence, never a hard-coded
+        pass.
+        """
         checks = []  # type: List[CheckItem]
         version, raw = self._version_probe()
         checks.append(CheckItem(
@@ -443,6 +599,20 @@ class OpenCodeAdapter(Adapter):
         checks.append(CheckItem(
             name="cli_startup", result="pass" if startup.ok() else "fail", mandatory=True,
             summary="cli startup exit=%d" % startup.exit_code))
+        # Exact final target equality (verify-equivalent path).
+        if expected_target:
+            if version and version == expected_target:
+                checks.append(CheckItem(
+                    name="exact_target", result="pass", mandatory=True,
+                    summary="after %s equals planned exact target %s" % (version, expected_target)))
+            else:
+                checks.append(CheckItem(
+                    name="exact_target", result="fail", mandatory=True,
+                    summary="exact-target mismatch: after=%s planned=%s" % (version or "?", expected_target)))
+        else:
+            checks.append(CheckItem(
+                name="exact_target", result="not_applicable", mandatory=False,
+                summary="no expected target passed to verify; exact equality enforced in execute() + centrally by runner"))
         server_on, server_detail = self._server_configured()
         if not server_on:
             checks.append(CheckItem(
@@ -450,15 +620,30 @@ class OpenCodeAdapter(Adapter):
                 summary="no configured server; %s" % server_detail))
         else:
             unit = os.environ.get("EGA_OPENCODE_UNIT", "")
-            probe = run_fixed(
-                ["/bin/systemctl", "--user", "is-active", unit], timeout=30)
-            active = probe.ok() and probe.stdout.strip() == "active"
-            checks.append(CheckItem(
-                name="server_readiness", result="pass" if active else "fail", mandatory=True,
-                summary="unit %s active=%s" % (unit, active)))
+            outcome, corr_detail = self._server_correlation(unit)
+            if outcome != "correlated":
+                checks.append(CheckItem(
+                    name="server_readiness", result="unknown", mandatory=True,
+                    summary="server/binary correlation unproven (%s); verification unknown, never success" % corr_detail[:300]))
+            else:
+                probe = run_fixed(
+                    ["/bin/systemctl", "--user", "is-active", unit], timeout=30)
+                active = probe.ok() and probe.stdout.strip() == "active"
+                checks.append(CheckItem(
+                    name="server_readiness", result="pass" if active else "fail", mandatory=True,
+                    summary="correlated unit %s active=%s (%s; restart outcome recorded in execute)" % (unit, active, corr_detail[:200])))
+        integrity_result, integrity_detail = self._db_integrity()
         checks.append(CheckItem(
-            name="state_preserved", result="pass", mandatory=True,
-            summary="opencode.db/WAL/SHM, caches, plugins, and alternate install left untouched"))
+            name="state_preserved", result=integrity_result,
+            mandatory=(integrity_result in ("pass", "fail", "unknown") and integrity_result != "not_applicable") or integrity_result == "unknown",
+            summary="%s; quiesced sqlite3 backup-API copy required pre-mutation, startup probe exit=%d" % (
+                integrity_detail[:400], startup.exit_code)))
+        # state_preserved is mandatory unless there was no DB to check.
+        for _c in checks:
+            if _c.name == "state_preserved" and integrity_result == "not_applicable":
+                _c.mandatory = False
+            if _c.name == "state_preserved" and integrity_result == "unknown":
+                _c.mandatory = True
         passed = bool(version) and not any(
             c for c in checks if c.mandatory and c.result != "pass")
         return VerifyResult(

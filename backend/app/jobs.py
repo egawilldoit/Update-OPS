@@ -11,11 +11,13 @@ Rules (SPEC §7-§8):
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from .schemas import utcnow_iso
 
@@ -135,3 +137,82 @@ def set_recovery(conn, job_id, required=True):
         "INSERT INTO events(job_id,created_at,event_type,detail) VALUES(?,?,?,?)",
         (job_id, utcnow_iso(), "recovery_required" if required else "recovered",
          ""))
+
+
+def claim_with_nonce(conn, job_id, nonce):
+    # type: (sqlite3.Connection, str, str) -> bool
+    """Atomically claim an accepted job for a dispatch nonce (H-01).
+
+    Sets dispatch_nonce + preflight state in one UPDATE so a replayed
+    runner argv (wrong/empty nonce) can never claim or resume the job.
+    Returns True when this call performed the claim.
+    """
+    if not isinstance(nonce, str) or not nonce:
+        return False
+    now = utcnow_iso()
+    unit = "ega-update-job-%s.service" % (job_id[:8] if job_id else "")
+    try:
+        cur = conn.execute(
+            "UPDATE jobs SET dispatch_nonce=?, state='preflight',"
+            " step='preflight', started_at=?, heartbeat=?, runner_unit=?"
+            " WHERE id=? AND state='accepted'"
+            " AND (dispatch_nonce='' OR dispatch_nonce=?)",
+            (nonce, now, now, unit, job_id, nonce))
+    except sqlite3.OperationalError:
+        # Pre-migration database without dispatch_nonce: refuse to claim
+        # rather than launching an unprotected runner.
+        return False
+    if cur.rowcount != 1:
+        return False
+    conn.execute(
+        "INSERT INTO events(job_id,created_at,event_type,detail)"
+        " VALUES(?,?,?,?)", (job_id, now, "claimed", unit))
+    conn.commit()
+    return True
+
+
+def read_dispatcher_heartbeat(state_dir, max_age_s=20):
+    # type: (object, int) -> Dict[str, object]
+    """Read <state_dir>/dispatcher.heartbeat JSON {ts, pid}.
+
+    Returns {} when missing, unparseable, or stale (ts older than
+    max_age_s vs UTC now). Timestamps parse via fromisoformat.
+    """
+    try:
+        base = str(state_dir or "")
+    except Exception:
+        return {}
+    if not base:
+        return {}
+    path = os.path.join(base, "dispatcher.heartbeat")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw_ts = data.get("ts", "")
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return {}
+    text = raw_ts.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        ts = datetime.datetime.fromisoformat(text)
+    except Exception:
+        return {}
+    try:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        age_s = (now - ts).total_seconds()
+    except Exception:
+        return {}
+    try:
+        limit = float(max_age_s)
+    except (TypeError, ValueError):
+        limit = 20.0
+    if age_s > limit:
+        return {}
+    return data

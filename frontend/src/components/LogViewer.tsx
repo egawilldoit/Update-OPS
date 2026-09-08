@@ -4,9 +4,11 @@ import type { LogRecord } from "../api/client";
 export function LogViewer({
   records,
   truncated,
+  hasMore,
 }: {
   records: LogRecord[];
   truncated: boolean;
+  hasMore?: boolean;
 }): React.ReactElement {
   const [follow, setFollow] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
@@ -44,9 +46,16 @@ export function LogViewer({
           {copied ? "Copied" : "Copy as text"}
         </button>
         <span className="hint" role="note">
-          {records.length} records{truncated ? " — truncated, retention limits apply" : ""}
+          {records.length} records
+          {hasMore === true ? " — More records available" : ""}
+          {truncated ? " — truncated, retention limits apply" : ""}
         </span>
       </div>
+      {hasMore === true ? (
+        <p className="hint" role="note">
+          More records available — additional pages exist beyond this view.
+        </p>
+      ) : null}
       {truncated ? (
         <p className="warn" role="note">
           Log output was truncated (retention limits). Shown records are ordered and complete up to the cap.

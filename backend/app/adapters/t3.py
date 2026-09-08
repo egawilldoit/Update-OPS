@@ -38,10 +38,13 @@ from .base import (
     VerifyResult,
 )
 from .registry import (
+    MUTATION_TIMEOUT_MARGIN_S,
+    attach_timed_out,
     check_disk,
     compare_semver,
     extract_version_token,
     fingerprint,
+    mutation_timeout_for,
     nvm_paths,
     parse_semver,
     resolve_executable,
@@ -78,6 +81,34 @@ def _scrub(text):
     return scrubbed[:2000]
 
 
+def _deep_scrub(obj):
+    # type: (object) -> object
+    """Recursively redact sensitive keys (nested dicts/lists, case-insensitive).
+
+    Any dict key containing a _SENSITIVE_KEYS substring (case-insensitive)
+    has its value replaced by ***REDACTED***. Lists/tuples are walked
+    element-wise; scalars pass through unchanged. Used before persisting any
+    state-derived backup content. Redacted backups are recovery-limited
+    (secrets must be re-provisioned on restore) and callers record that
+    limitation.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            try:
+                lowered = str(key).lower()
+            except Exception:
+                lowered = ""
+            if any(s in lowered for s in _SENSITIVE_KEYS):
+                out[key] = "***REDACTED***"
+            else:
+                out[key] = _deep_scrub(value)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_deep_scrub(item) for item in obj]
+    return obj
+
+
 def _configured(name, default=""):
     # type: (str, str) -> str
     value = os.environ.get(name, default)
@@ -96,7 +127,11 @@ class T3Adapter(Adapter):
 
     def _inventory(self):
         # type: () -> Dict[str, object]
-        """Correlate unit + state path + executable + process + endpoint."""
+        """Correlate unit + state path + executable + process + endpoint.
+
+        All five pillars are recorded on every call; _inventory_gate()
+        requires each one. A state file alone is never a service.
+        """
         unit = _configured("EGA_T3_UNIT", T3_UNIT)
         state_path = _configured("EGA_T3_STATE_PATH", T3_STATE_HINT)
         endpoint = _configured("EGA_T3_ENDPOINT", "")
@@ -109,7 +144,7 @@ class T3Adapter(Adapter):
             "unit_load": "", "unit_active": "", "unit_sub": "", "unit_pid": "",
             "state_exists": False, "state_version": "", "state_scrubbed": "",
             "exec_path": "", "exec_resolved": "", "installed_version": "",
-            "process_hit": False, "endpoint_hint": "",
+            "process_hit": False, "process_checked": False, "endpoint_hint": "",
         }  # type: Dict[str, object]
         show = run_fixed(
             ["/bin/systemctl", "--user", "show", unit, "-p", "LoadState",
@@ -139,9 +174,14 @@ class T3Adapter(Adapter):
                 if isinstance(payload, dict):
                     raw_version = str(payload.get("version", "") or payload.get("t3_version", "") or "")
                     info["state_version"] = extract_version_token(raw_version) or raw_version[:50]
-                    scrubbed = {k: ("***REDACTED***" if any(s in k.lower() for s in _SENSITIVE_KEYS) else v)
-                                for k, v in payload.items()}
-                    info["state_scrubbed"] = json.dumps(scrubbed, sort_keys=True)[:1000]
+                    # Deep-scrub nested dicts/lists before any evidence use.
+                    scrubbed = _deep_scrub(payload)
+                    try:
+                        info["state_scrubbed"] = json.dumps(scrubbed, sort_keys=True)[:1000]
+                    except Exception:
+                        info["state_scrubbed"] = _scrub(str(scrubbed)[:1000])
+                else:
+                    info["state_scrubbed"] = _scrub(str(payload)[:1000])
             except Exception as exc:
                 info["state_scrubbed"] = "unreadable state file: %s" % str(exc)[:300]
         # Installed executable provenance: configured npx; PATH winners are
@@ -153,6 +193,7 @@ class T3Adapter(Adapter):
             info["exec_resolved"] = resolved
         proc = run_fixed(["/bin/ps", "-eo", "pid,comm,args"], timeout=30)
         if proc.ok():
+            info["process_checked"] = True
             for line in proc.stdout.splitlines():
                 lowered = line.lower()
                 if "t3code" in lowered or " t3 " in lowered:
@@ -170,15 +211,35 @@ class T3Adapter(Adapter):
 
     def _inventory_gate(self, info):
         # type: (Dict[str, object]) -> Tuple[bool, str]
-        """Fail-closed gate: every pillar must be proven before planning."""
+        """Fail-closed five-pillar gate: every pillar proven before planning.
+
+        Pillars (each recorded on info): (1) unit LoadState=loaded,
+        (2) state path exists, (3) executable provenance (configured npx
+        resolved), (4) matching process evidence (process probe ran; when the
+        unit is active a matching process must be observed), (5) endpoint
+        (port or endpoint configured). Launch mode must additionally be
+        managed-service. Any missing pillar yields unknown/blocked, never
+        success.
+        """
         missing = []
+        # Pillar 1: unit.
         if info.get("unit_load") != "loaded":
-            missing.append("service unit %s LoadState=%s" % (
+            missing.append("pillar unit: service unit %s LoadState=%s" % (
                 info.get("unit"), info.get("unit_load") or "unproven"))
-        if not info.get("port") and not info.get("endpoint"):
-            missing.append("port/endpoint unproven")
+        # Pillar 2: state path.
         if not info.get("state_path") or not info.get("state_exists"):
-            missing.append("state-path unproven")
+            missing.append("pillar state-path: unproven")
+        # Pillar 3: executable provenance.
+        if not info.get("exec_path") or not info.get("exec_resolved"):
+            missing.append("pillar executable-provenance: configured npx unresolved")
+        # Pillar 4: matching process.
+        if not info.get("process_checked"):
+            missing.append("pillar matching-process: process probe inconclusive")
+        elif str(info.get("unit_active") or "") == "active" and not info.get("process_hit"):
+            missing.append("pillar matching-process: unit active but no matching t3 process observed")
+        # Pillar 5: endpoint.
+        if not info.get("port") and not info.get("endpoint"):
+            missing.append("pillar endpoint: port/endpoint unproven")
         if not info.get("launch_mode"):
             # Infer conservatively: a loaded user unit with ExecStart implies
             # managed-service only when the unit is the official one.
@@ -195,9 +256,33 @@ class T3Adapter(Adapter):
 
     def _installed_version(self, info):
         # type: (Dict[str, object]) -> str
+        # Installed (state-file) version. Never used alone as running proof;
+        # see _running_version() for the process/endpoint-corroborated value.
         if info.get("state_version"):
             return str(info["state_version"])
         return ""
+
+    def _running_version(self, info):
+        # type: (Dict[str, object]) -> str
+        """Running version from process/endpoint evidence, never state alone.
+
+        Returns the state-file version ONLY when corroborated by process and
+        endpoint pillars (process probe ran, matching process when active,
+        plus a configured port/endpoint). Otherwise "" so callers report
+        unknown/blocked instead of success on state-file metadata alone.
+        """
+        state_version = str(info.get("state_version") or "")
+        if not state_version:
+            return ""
+        if not info.get("process_checked"):
+            return ""
+        if str(info.get("unit_active") or "") == "active" and not info.get("process_hit"):
+            return ""
+        if not info.get("port") and not info.get("endpoint"):
+            return ""
+        if not info.get("exec_resolved"):
+            return ""
+        return state_version
 
     def _nightly_metadata(self):
         # type: () -> Tuple[str, str]
@@ -228,7 +313,11 @@ class T3Adapter(Adapter):
         # type: () -> InspectResult
         info = self._inventory()
         gate_ok, gate_detail = self._inventory_gate(dict(info))
-        version = self._installed_version(info)
+        # Running version requires process/endpoint corroboration; a state
+        # file alone never yields a version here.
+        version = self._running_version(info)
+        if not version and info.get("state_version"):
+            gate_detail = (gate_detail or "") + "; state-file version %s uncorroborated by process/endpoint pillars" % str(info.get("state_version"))[:50]
         fp = fingerprint(
             str(info.get("unit", "")), str(info.get("state_path", "")),
             str(info.get("exec_resolved", "")), version,
@@ -267,7 +356,12 @@ class T3Adapter(Adapter):
             return DiscoverResult(
                 tool=self.tool_id, target="", target_mode="unknown",
                 channel="nightly", available=False, unknown_reason=error)
-        current = self._installed_version(info)
+        current = self._running_version(info)
+        # When the running version is uncorroborated (no process/endpoint
+        # evidence), fall back to no current for downgrade comparison but
+        # never treat the state file alone as a running proof downstream.
+        if not current:
+            current = ""
         if current:
             cmp_res = compare_semver(candidate, current)
             if cmp_res is None:
@@ -318,16 +412,17 @@ class T3Adapter(Adapter):
                 already_current=False,
             )
         info = self._inventory()
-        already = bool(info.get("state_version") and info["state_version"] == discovery.target)
+        running = self._running_version(info)
+        already = bool(running and running == discovery.target)
         need = required_space_bytes(STAGING_ESTIMATE_BYTES, BACKUP_ESTIMATE_BYTES)
         return PlanResult(
             tool=self.tool_id, target=discovery.target, target_mode="exact",
             channel="nightly", fingerprint=inspection.fingerprint,
             services=["user:%s" % info["unit"]],
             backup_scope={
-                "covered": "service state snapshot (%s) + unit definition" % info.get("state_path"),
+                "covered": "service state snapshot (%s) + unit definition (deep-scrubbed; recovery-limited)" % info.get("state_path"),
                 "omitted": "runtime caches, downloaded toolchains",
-                "consistency": "quiesced state copy; writers quiesced before copy",
+                "consistency": "quiesced-copy ONLY when writers quiesced (unit stopped or manager-confirmed idle); else consistent-backup-unavailable",
                 "mode": "consistent-if-quiesced",
             },
             required_space_bytes=need or 0,
@@ -342,9 +437,9 @@ class T3Adapter(Adapter):
         # type: (str) -> BackupResult
         info = self._inventory()
         scope = {
-            "covered": "service state snapshot + unit definition",
+            "covered": "service state snapshot + unit definition (deep-scrubbed; recovery-limited: secrets redacted, re-provision on restore)",
             "omitted": "runtime caches, downloaded toolchains",
-            "consistency": "quiesced state copy",
+            "consistency": "quiesced-copy ONLY when writers quiesced; else consistent-backup-unavailable",
         }
         gate_ok, gate_detail = self._inventory_gate(dict(info))
         if not gate_ok:
@@ -352,6 +447,23 @@ class T3Adapter(Adapter):
                 tool=self.tool_id, supported=False, path="", scope=scope,
                 consistency=scope["consistency"], size_bytes=0,
                 unsupported_reason="backup_unsupported: %s" % _scrub(gate_detail)[:400])
+        # Quiescence gate: quiesced-copy ONLY when writers were actually
+        # quiesced (unit stopped/inactive or manager-confirmed idle via
+        # activity()). Otherwise consistent-backup-unavailable -> blocked
+        # when a consistent backup is required.
+        try:
+            _activity = self.activity()
+            _writers_quiesced = (_activity.state == "idle" and str(info.get("unit_active") or "") != "active")
+        except Exception:
+            _writers_quiesced = False
+        if not _writers_quiesced:
+            return BackupResult(
+                tool=self.tool_id, supported=False, path="", scope=scope,
+                consistency="consistent-backup-unavailable", size_bytes=0,
+                unsupported_reason="backup_unsupported: consistent-backup-unavailable: writers not quiesced "
+                                   "(unit %s active=%s activity=%s); stop unit or confirm idle before consistent backup"
+                % (info.get("unit"), info.get("unit_active") or "?",
+                   getattr(_activity, "state", "?") if "_activity" in locals() else "?"))
         try:
             from ..config import settings as _settings
 
@@ -366,25 +478,23 @@ class T3Adapter(Adapter):
             if state_path and os.path.isfile(state_path):
                 dest = os.path.join(dest_dir, "service-state.json")
                 # Backup scrub method: state content is never copied verbatim.
-                # JSON objects are re-serialized with sensitive keys (tokens,
-                # secrets, authorization fields per _SENSITIVE_KEYS) replaced
-                # by ***REDACTED***; non-JSON content falls back to the
-                # pattern scrubber _scrub() before writing the backup file.
+                # JSON payloads are deep-scrubbed recursively (nested
+                # dicts/lists, case-insensitive key match per _SENSITIVE_KEYS);
+                # non-JSON content falls back to the pattern scrubber _scrub().
+                # Redacted backups are recovery-limited (secrets must be
+                # re-provisioned on restore); that limitation is recorded in
+                # scope/consistency and in the backup file header.
                 with open(state_path, "r", encoding="utf-8") as _fh:
                     _raw_state = _fh.read()
                 try:
                     _payload = json.loads(_raw_state)
                 except Exception:
                     _payload = None
-                if isinstance(_payload, dict):
-                    _scrubbed = {
-                        k: ("***REDACTED***"
-                            if any(s in str(k).lower() for s in _SENSITIVE_KEYS)
-                            else v)
-                        for k, v in _payload.items()
-                    }
+                if isinstance(_payload, (dict, list)):
+                    _scrubbed = _deep_scrub(_payload)
                     with open(dest, "w", encoding="utf-8") as _out:
-                        json.dump(_scrubbed, _out, sort_keys=True)
+                        json.dump({"_note": "recovery-limited: sensitive keys redacted, re-provision on restore",
+                                   "data": _scrubbed}, _out, sort_keys=True)
                 else:
                     with open(dest, "w", encoding="utf-8") as _out:
                         _out.write(_scrub(_raw_state))
@@ -428,10 +538,11 @@ class T3Adapter(Adapter):
                 recipe = "launch recipe: mode=%s unit=%s state=%s endpoint=%s" % (
                     state_mode, info.get("unit"), info.get("state_path"), "[redacted]")
                 self._emit("stdout", _scrub(recipe))
-            return ExecuteResult(
-                tool=self.tool_id, exit_code=3, before_version=self._installed_version(info),
+            _blocked = ExecuteResult(
+                tool=self.tool_id, exit_code=3, before_version=self._running_version(info),
                 after_version="", state="blocked", error_code="install_method_unsupported",
                 error_detail=_scrub(gate_detail)[:500])
+            return attach_timed_out(_blocked, False)
         current = self.inspect()
         if plan.fingerprint and current.fingerprint != plan.fingerprint:
             return ExecuteResult(
@@ -467,47 +578,66 @@ class T3Adapter(Adapter):
                 error_detail=disk_detail[:500])
         before = current.version
         if before and before == plan.target:
-            return ExecuteResult(
+            _already = ExecuteResult(
                 tool=self.tool_id, exit_code=0, before_version=before,
                 after_version=before, state="already_current", error_code="",
                 error_detail="already at nightly %s; not upgrade evidence" % plan.target)
+            return attach_timed_out(_already, False)
         npx = nvm_paths()["npx"]
         ok, _resolved, detail = resolve_executable(npx)
         if not ok:
-            return ExecuteResult(
+            _bad = ExecuteResult(
                 tool=self.tool_id, exit_code=3, before_version=before,
                 after_version="", state="blocked", error_code="install_method_unsupported",
                 error_detail=detail)
-        # Official managed user-service mutation template only.
+            return attach_timed_out(_bad, False)
+        # Official managed user-service mutation template only. Shared
+        # contract: mutation timeout = step_timeout + 120s margin (probes
+        # keep fixed timeouts).
         spec = "t3@%s" % plan.target
-        res = run_fixed([npx, "--yes", spec, "service", "update"], timeout=1800)
-        self._emit("stdout", "$ npx --yes <pinned-t3> service update -> exit=%d" % res.exit_code)
+        mutation_to = mutation_timeout_for(plan, "updating", default=1800)
+        res = run_fixed([npx, "--yes", spec, "service", "update"], timeout=mutation_to)
+        self._emit("stdout", "$ npx --yes <pinned-t3> service update -> exit=%d (mutation timeout %ds = step + %ds margin)"
+                   % (res.exit_code, mutation_to, MUTATION_TIMEOUT_MARGIN_S))
         self._emit("stdout", _scrub(res.stdout or "")[-4000:])
         if res.stderr:
             self._emit("stderr", _scrub(res.stderr or "")[-4000:])
-        after = self._installed_version(self._inventory())
+        after = self._running_version(self._inventory())
         if res.timed_out:
-            return ExecuteResult(
+            _tout = ExecuteResult(
                 tool=self.tool_id, exit_code=4, before_version=before,
                 after_version=after, state="install_failed", error_code="timeout",
                 error_detail="t3 service update timed out; possible partial install")
+            return attach_timed_out(_tout, True)
         if res.exit_code != 0:
             combined = ((res.stdout or "") + "\n" + (res.stderr or "")).lower()
             if "rollback" in combined or "restored" in combined:
-                return ExecuteResult(
+                _rb = ExecuteResult(
                     tool=self.tool_id, exit_code=4, before_version=before,
                     after_version=after, state="install_failed",
                     error_code="install_failed",
                     error_detail="native rollback after failed update (restored %s); recorded as unsuccessful requested update"
                     % (after or "unknown"))
-            return ExecuteResult(
+                return attach_timed_out(_rb, False)
+            _fail = ExecuteResult(
                 tool=self.tool_id, exit_code=4, before_version=before,
                 after_version=after, state="install_failed", error_code="install_failed",
                 error_detail="t3 service update exit=%d" % res.exit_code)
-        return ExecuteResult(
+            return attach_timed_out(_fail, False)
+        # Exact final target equality: for target_mode exact the running
+        # version MUST equal the planned target, else verification failure
+        # (runner enforces centrally; adapters enforce their own check).
+        if plan.target_mode == "exact" and after != plan.target:
+            _mismatch = ExecuteResult(
+                tool=self.tool_id, exit_code=4, before_version=before,
+                after_version=after, state="install_failed", error_code="install_failed",
+                error_detail="exact-target mismatch: after=%s planned=%s" % (after or "?", plan.target))
+            return attach_timed_out(_mismatch, False)
+        _done = ExecuteResult(
             tool=self.tool_id, exit_code=0, before_version=before,
             after_version=after, state="succeeded", error_code="",
             error_detail="")
+        return attach_timed_out(_done, False)
 
     def _endpoint_probe(self, info):
         # type: (Dict[str, object]) -> Tuple[str, str]
@@ -531,8 +661,16 @@ class T3Adapter(Adapter):
             return "pass", "endpoint reachable (http 200; readiness only)"
         return "fail", "endpoint http %s" % status
 
-    def verify(self):
-        # type: () -> VerifyResult
+    def verify(self, expected_target=""):
+        # type: (str) -> VerifyResult
+        """Verify running version + unit + endpoint + pinning + exact target.
+
+        expected_target (optional): when the caller knows the planned exact
+        target, equality is enforced here (mismatch is failure). Without it
+        the exact-target check records the runner-central + execute-local
+        enforcement as not_applicable. Running version always requires
+        process/endpoint corroboration, never the state file alone.
+        """
         checks = []  # type: List[CheckItem]
         info = self._inventory()
         gate_ok, gate_detail = self._inventory_gate(dict(info))
@@ -543,12 +681,25 @@ class T3Adapter(Adapter):
             return VerifyResult(
                 tool=self.tool_id, version="", checks=checks, passed=False,
                 error_code="health_failed", error_detail="t3 inventory gate unverified")
-        running_version = self._installed_version(self._inventory())
+        running_version = self._running_version(self._inventory())
         checks.append(CheckItem(
             name="running_version",
             result="pass" if running_version else "fail", mandatory=True,
-            summary=("running version %s" % running_version) if running_version
+            summary=("running version %s (process/endpoint corroborated)" % running_version) if running_version
             else "required running-version evidence missing; state-file metadata alone insufficient"))
+        if expected_target:
+            if running_version and running_version == expected_target:
+                checks.append(CheckItem(
+                    name="exact_target", result="pass", mandatory=True,
+                    summary="running %s equals planned exact target %s" % (running_version, expected_target)))
+            else:
+                checks.append(CheckItem(
+                    name="exact_target", result="fail", mandatory=True,
+                    summary="exact-target mismatch: running=%s planned=%s" % (running_version or "?", expected_target)))
+        else:
+            checks.append(CheckItem(
+                name="exact_target", result="not_applicable", mandatory=False,
+                summary="no expected target passed to verify; exact equality enforced in execute() + centrally by runner"))
         ready = (info.get("unit_active") == "active" and info.get("unit_sub") == "running")
         checks.append(CheckItem(
             name="unit_readiness", result="pass" if ready else "fail", mandatory=True,

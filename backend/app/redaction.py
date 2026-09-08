@@ -29,6 +29,15 @@ PATTERNS = [
 MAX_LINE = 8192
 REPLACEMENT = "***REDACTED***"
 
+# Decoded-text carry (chars) retained across feed() calls so a PEM block
+# split across chunk boundaries is still redacted. The private-key regex runs
+# over (carry + new_text) BEFORE line-splitting; a trailing incomplete block
+# (BEGIN without END) is held back and re-scanned with the next chunk.
+# flush() scans whatever carry remains.
+_PEM_BEGIN_MARKER = "-----BEGIN"
+_PEM_END_MARKER = "-----END"
+_PEM_CARRY_MAX = 8192
+
 
 def strip_controls(text):
     # type: (str) -> str
@@ -52,12 +61,36 @@ def redact_text(text, secrets=()):
 
 
 class StreamRedactor:
-    """Incremental UTF-8 decoder + line buffer + redaction."""
+    """Incremental UTF-8 decoder + line buffer + redaction.
+
+    Multiline secrets: an 8KB decoded-text carry holds a trailing incomplete
+    PEM block (``-----BEGIN`` without a later ``-----END``) across feed()
+    calls. The private-key pattern runs over (carry + new_text) before
+    line-splitting so a block split across reads is replaced as one unit;
+    flush() redacts whatever carry remains.
+    """
 
     def __init__(self, secrets=()):
         # type: (tuple) -> None
         self._buf = bytearray()
         self._secrets = tuple(secrets or ())
+        self._carry = ""
+
+    def _redact_lines(self, blob):
+        # type: (str) -> List[str]
+        """Apply the PEM regex globally, then per-line redact. Blob must
+        end at a line boundary (or be a final flush payload)."""
+        blob = PATTERNS[4][1].sub(REPLACEMENT, blob)
+        lines = blob.split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        out = []
+        for line in lines:
+            line = strip_controls(line)
+            if len(line) > MAX_LINE:
+                line = line[:MAX_LINE] + "…[truncated-line]"
+            out.append(redact_text(line, self._secrets))
+        return out
 
     def feed(self, chunk):
         # type: (bytes) -> List[str]
@@ -66,20 +99,36 @@ class StreamRedactor:
         parts = text.split("\n")
         complete, remainder = parts[:-1], parts[-1]
         self._buf = bytearray(remainder.encode("utf-8", errors="replace"))
-        out = []
-        for line in complete:
-            line = strip_controls(line)
-            if len(line) > MAX_LINE:
-                line = line[:MAX_LINE] + "…[truncated-line]"
-            out.append(redact_text(line, self._secrets))
-        return out
+        new_text = "".join(line + "\n" for line in complete)
+        combined = self._carry + new_text
+        if not combined:
+            return []
+        begin_idx = combined.rfind(_PEM_BEGIN_MARKER)
+        end_idx = combined.rfind(_PEM_END_MARKER)
+        emit_raw = combined
+        if begin_idx != -1 and (end_idx == -1 or end_idx < begin_idx):
+            line_start = combined.rfind("\n", 0, begin_idx) + 1
+            emit_raw = combined[:line_start]
+            hold_raw = combined[line_start:]
+            if len(hold_raw) > _PEM_CARRY_MAX:
+                overflow = hold_raw[:-_PEM_CARRY_MAX]
+                hold_raw = hold_raw[-_PEM_CARRY_MAX:]
+                overflow = overflow.replace(
+                    _PEM_BEGIN_MARKER, REPLACEMENT)
+                emit_raw = emit_raw + overflow
+            self._carry = hold_raw
+        else:
+            self._carry = ""
+        if not emit_raw:
+            return []
+        return self._redact_lines(emit_raw)
 
     def flush(self):
         # type: () -> List[str]
-        if not self._buf:
-            return []
-        text = strip_controls(self._buf.decode("utf-8", errors="replace"))
+        tail = self._buf.decode("utf-8", errors="replace")
         self._buf = bytearray()
-        if len(text) > MAX_LINE:
-            text = text[:MAX_LINE] + "…[truncated-line]"
-        return [redact_text(text, self._secrets)]
+        combined = self._carry + tail
+        self._carry = ""
+        if not combined:
+            return []
+        return self._redact_lines(combined)

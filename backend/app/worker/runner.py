@@ -1,27 +1,42 @@
-"""Job runner: phase machine + adapter invocation (subagent B owned).
+"""Job runner: phase machine + adapter invocation.
 
 Phases: accepted -> preflight -> backup -> updating -> verifying -> succeeded,
 with blocked / failed / health_failed / interrupted terminals. The runner owns
-the execution lock for the full procedure; updater descendants remain in its
-cgroup. Dispatcher logic (dispatch.py) is untouched.
+the execution lock for the full procedure and the hard deadline for every
+phase (adapter plan step timeouts; adapters run mutations with
+step_timeout + registry.MUTATION_TIMEOUT_MARGIN_S so the runner fires first).
+Dispatcher launches via the ubuntu user manager with a dispatch nonce
+(``runner <job-id> <nonce>``); the runner verifies the nonce against
+jobs.dispatch_nonce (and state==preflight) before any mutation and exits 6
+without touching the tool on mismatch (H-01 replay protection).
 
 Rules honored:
 - Preflight rechecks plan freshness, fingerprint, activity (incl. recorded
   ack), disk floor, git cleanliness, install-method support, and backup
-  capability. Any failure yields blocked with a reason; files/Git stay intact.
+  capability; refreshes jobs.before_version from the live inspect version
+  (H-02). Any failure yields blocked with a reason; files/Git stay intact.
 - Backup runs via adapter.backup; failure blocks before mutation.
-- Execute runs via adapter.execute under per-step hard timeouts. No
-  inactivity-only kill. On hard timeout the runner terminates the job process
-  tree gracefully (SIGTERM), then forcibly (SIGKILL) after a grace period,
-  records possible partial installation, and runs bounded recovery checks.
+- Execute runs via adapter.execute under the runner-owned hard deadline. Any
+  timeout (thread deadline, ProcResult.timed_out, ExecuteResult.timed_out, or
+  error_code=='timeout') funnels into the hard-timeout path: SIGTERM/SIGKILL
+  the tree, best-effort ``systemctl --user stop/kill`` of the runner's own
+  unit, /proc survivor verification, bounded read-only recovery checks, then
+  terminal failed/interrupted + recovery_required whenever completion is not
+  fully proved.
 - Verify runs via adapter.verify. Installer nonzero exit yields failed even
   when the old version stays healthy. Zero exit plus mandatory check failure
-  yields health_failed. Missing required verification never yields success.
+  yields health_failed. Exact-target plans (target_mode=='exact') yield
+  health_failed/exact_target_mismatch when after_version != plan target,
+  regardless of adapter opinion. Missing required verification never yields
+  success.
 - stdout/stderr stream through redaction.StreamRedactor with per-job sequence
-  numbers, JSONL flush at least every second, and a 20 MiB/job cap (persisting
-  stops but pipes keep draining, with a truncation marker). A partial final
-  record after a crash is tolerated. A persisted redacted completion receipt
-  is required; success is never returned without a durable completion record.
+  numbers starting at 1, JSONL flush at least every second, and a 20 MiB/job
+  cap (persisting stops but pipes keep draining, with the unchanged
+  truncation marker). A partial final record after a crash is tolerated. A
+  persisted redacted completion receipt (receipts.build_receipt) is required;
+  success is never returned without durable evidence: JobLog, check, and
+  receipt write failures set a sticky flag that finalize maps to
+  interrupted/storage_failure.
 - A DB write failure before mutation blocks. During execution the redacted
   receipt is preserved where possible and recovery_required is marked after
   reconciliation. No retry, no browser cancellation.
@@ -35,6 +50,7 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -52,7 +68,13 @@ EXIT_VERIFY_FAILED = 5
 EXIT_INTERRUPTED = 6
 
 
-# -- process tree termination (cgroup approximation) ------------------------
+# -- process tree termination (systemd-first + /proc-verify) ------------------
+# The dispatcher launches each job as its own user-manager unit with
+# KillMode=control-group, so systemd reaps the unit cgroup on exit. The
+# runner additionally terminates its own tree directly (SIGTERM then SIGKILL)
+# and, on hard timeout, best-effort ``systemctl --user stop/kill`` of its own
+# recorded unit. Nothing is assumed dead: survivors are verified with a
+# read-only /proc scan of the job process tree before recovery checks run.
 
 def _descendant_pids(root):
     # type: (int) -> List[int]
@@ -93,10 +115,11 @@ def terminate_tree(grace_s=TERMINATE_GRACE_S):
     # type: (float) -> None
     """SIGTERM the job tree, then SIGKILL survivors after grace.
 
-    Under systemd the unit cgroup is additionally reaped on runner exit;
-    this covers native updater descendants and delegated services that a
-    plain child kill would leave behind. Killing only the shell is never
-    treated as proof that mutation stopped.
+    Systemd-first: the runner unit uses KillMode=control-group so the unit
+    cgroup is reaped on runner exit; this direct signalling covers native
+    updater descendants promptly. Callers must verify with a /proc scan
+    afterwards; killing only the shell is never treated as proof that
+    mutation stopped.
     """
     _signal_tree(signal.SIGTERM)
     deadline = time.time() + max(1.0, float(grace_s))
@@ -107,19 +130,104 @@ def terminate_tree(grace_s=TERMINATE_GRACE_S):
     _signal_tree(signal.SIGKILL)
 
 
+def _systemd_terminate_unit(unit):
+    # type: (str) -> None
+    """Best-effort ``systemctl --user stop/kill`` of the runner's own unit.
+
+    Fixed argv, shell=False, bounded timeouts. Never raises; failures are
+    reported by the later /proc verification, never assumed away.
+    """
+    if not unit:
+        return
+    for args in (["systemctl", "--user", "stop", unit],
+                 ["systemctl", "--user", "kill", unit]):
+        try:
+            subprocess.run(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15, shell=False, check=False)
+        except Exception:
+            continue
+
+
+def _no_live_descendants():
+    # type: () -> bool
+    """True when the /proc scan finds no live descendants of this process."""
+    return not _descendant_pids(os.getpid())
+
+
+def _job_processes_alive(job_id):
+    # type: (str) -> list
+    """Read-only /proc scan for processes still carrying the job id."""
+    found = []
+    short = (job_id or "")[:8]
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        return found
+    for pid in pids:
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode(
+                    "utf-8", errors="replace")
+        except Exception:
+            continue
+        if (job_id and job_id in cmd) or (
+                short and "ega-update" in cmd and short in cmd):
+            found.append({"pid": int(pid), "cmdline": cmd[:300]})
+    return found
+
+
+def _is_timeout_result(exec_result):
+    # type: (Any) -> bool
+    """True for any adapter-reported timeout signal.
+
+    Covers ExecuteResult.timed_out, ProcResult-style timed_out attrs, and
+    error_code=='timeout' so every adapter timeout funnels into the runner
+    hard-timeout path (single timeout owner: the runner).
+    """
+    try:
+        if bool(getattr(exec_result, "timed_out", False)):
+            return True
+    except Exception:
+        pass
+    try:
+        if isinstance(exec_result, dict):
+            code = exec_result.get("error_code", "")
+        else:
+            code = getattr(exec_result, "error_code", "")
+        if code == "timeout":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _exact_target_mismatch(target_mode, target, after_version):
+    # type: (object, object, object) -> bool
+    """Central exact-target guard: exact plans must land exactly on target."""
+    try:
+        if str(target_mode or "") != "exact":
+            return False
+        return str(after_version or "") != str(target or "")
+    except Exception:
+        return False
+
+
 # -- redacted JSONL log ------------------------------------------------------
 
 def _known_secrets():
     # type: () -> tuple
     """Known secret values for redaction (never logged).
 
-    Reads via backend.app.config.load_secret_values when present;
-    import-guarded with an empty fallback so there is no hard dependency.
+    Reads via backend.app.config.load_secret_values(settings); the settings
+    object is always passed explicitly (never a bare call). Import-guarded
+    with an empty fallback so there is no hard dependency.
     """
     try:
         from ..config import load_secret_values as _loader
+        from ..config import settings as _settings
 
-        values = _loader()
+        values = _loader(_settings)
         return tuple(v for v in (values or ()) if v)
     except Exception:
         return ()
@@ -132,9 +240,14 @@ class JobLog(object):
         # type: (str, int, tuple) -> None
         self.path = path
         self.cap_bytes = int(cap_bytes)
-        self.seq = 0
+        # Log sequence starts at 1: the first record is seq=1, so a reader
+        # with after=0 delivers everything.
+        self.seq = 1
         self.bytes_written = 0
         self.truncated = False
+        # Sticky evidence flag: any persistence failure maps finalize away
+        # from success (never success without durable evidence).
+        self.persist_failed = False
         self._fh = None
         self._last_flush = time.time()
         self._lock = threading.Lock()
@@ -211,7 +324,7 @@ class JobLog(object):
                     self._fh.write(json.dumps(marker) + "\n")
                     self._fh.flush()
                 except OSError:
-                    pass
+                    self.persist_failed = True
             self.seq += 1
             return
         try:
@@ -219,13 +332,14 @@ class JobLog(object):
             self.bytes_written += len(encoded.encode("utf-8"))
             self.seq += 1
         except OSError:
+            self.persist_failed = True
             return
         now = time.time()
         if now - self._last_flush >= 1.0:
             try:
                 self._fh.flush()
             except OSError:
-                pass
+                self.persist_failed = True
             self._last_flush = now
 
     def emit(self, stream, text):
@@ -271,7 +385,7 @@ class JobLog(object):
                             self._write_record(name, line)
                     self._fh.flush()
                 except OSError:
-                    pass
+                    self.persist_failed = True
                 self._last_flush = time.time()
 
     def close(self):
@@ -284,16 +398,17 @@ class JobLog(object):
                     try:
                         self._fh.close()
                     except OSError:
-                        pass
+                        self.persist_failed = True
                     self._fh = None
 
 
 # -- runner -------------------------------------------------------------------
 
 class Runner(object):
-    def __init__(self, job_id):
-        # type: (str) -> None
+    def __init__(self, job_id, nonce=""):
+        # type: (str, str) -> None
         self.job_id = job_id
+        self.expected_nonce = nonce or ""
         self.conn = None  # type: Optional[sqlite3.Connection]
         self.job = None  # type: Optional[Dict[str, Any]]
         self.plan_row = None  # type: Optional[Dict[str, Any]]
@@ -302,6 +417,10 @@ class Runner(object):
         self._lock_fh = None
         self._stop = threading.Event()
         self._timed_out = False
+        # Sticky evidence flag: JobLog/check/receipt write failures converge
+        # finalize to interrupted/storage_failure (never success without
+        # durable evidence).
+        self._evidence_failed = False
         self.tool_id = ""
         self.before_version = ""
         self.after_version = ""
@@ -390,7 +509,57 @@ class Runner(object):
         self.log = JobLog(
             os.path.join(log_dir, "%s.jsonl" % self.job_id), cap,
             secrets=_known_secrets())
-        self.log.open()
+        try:
+            self.log.open()
+        except Exception:
+            self._evidence_failed = True
+            try:
+                self.log.close()
+            except Exception:
+                pass
+            self.log = None
+
+    def _verify_nonce(self):
+        # type: () -> Tuple[bool, str]
+        """H-01 replay protection: argv nonce must equal the claimed row.
+
+        Checks expected_nonce == jobs.dispatch_nonce (non-empty) and
+        state==preflight before any mutation or tool touch. No DB writes
+        here; callers exit 6 without touching the tool on failure.
+        """
+        try:
+            expected = self.expected_nonce or ""
+        except Exception:
+            expected = ""
+        if not expected:
+            return False, "missing dispatch nonce; refusing replay"
+        try:
+            row = dict(self.job or {})
+        except Exception:
+            return False, "job row unreadable; refusing replay"
+        try:
+            stored = row.get("dispatch_nonce", "") or ""
+            state = row.get("state", "") or ""
+        except Exception:
+            return False, "job row unreadable; refusing replay"
+        if not stored or stored != expected:
+            return False, "dispatch nonce mismatch; refusing replay"
+        if state != "preflight":
+            return False, "job not in preflight (state=%s); refusing replay" % state
+        return True, ""
+
+    def _own_unit(self):
+        # type: () -> str
+        try:
+            assert self.conn is not None
+            row = self.conn.execute(
+                "SELECT runner_unit FROM jobs WHERE id=?",
+                (self.job_id,)).fetchone()
+            if row is not None:
+                return str(row["runner_unit"] or "")
+        except Exception:
+            pass
+        return "ega-update-job-%s.service" % self.job_id[:8]
 
     def emit(self, stream, line):
         # type: (str, str) -> None
@@ -488,6 +657,20 @@ class Runner(object):
         if expected_fp and inspection.fingerprint != expected_fp:
             return False, "fingerprint_changed", \
                 "installation changed since plan; fresh plan required"
+        # H-02: overwrite jobs.before_version with the fresh preflight
+        # inspect version before any mutation (reservation-time observed
+        # versions may be stale).
+        try:
+            fresh_before = getattr(inspection, "version", "") or ""
+            if fresh_before and fresh_before != self.before_version:
+                self.conn.execute(
+                    "UPDATE jobs SET before_version=? WHERE id=?",
+                    (fresh_before, self.job_id))
+                self.conn.commit()
+                self.before_version = fresh_before
+        except Exception as exc:
+            return False, "storage_failure", \
+                "before_version record unwritable: %s" % str(exc)[:300]
         # 4. Activity incl. recorded ack.
         try:
             activity = self.adapter.activity()
@@ -612,32 +795,70 @@ class Runner(object):
             return False, box["error"], "error"
         return True, box.get("value"), "ok"
 
+    def _hard_timeout_recovery(self, timeout_s, reason):
+        # type: (float, str) -> None
+        """Single-owner hard-timeout path: terminate, systemd stop/kill own
+        unit (best effort), /proc-verify no survivors, bounded read-only
+        recovery checks. Callers terminalize failed/interrupted with
+        recovery_required whenever completion is not fully proved."""
+        self._timed_out = True
+        self._event("hard timeout (%s) after %ds; SIGTERM job tree,"
+                    " grace %ds then SIGKILL; best-effort systemctl --user"
+                    " stop/kill own unit"
+                    % (reason, int(timeout_s), TERMINATE_GRACE_S))
+        try:
+            terminate_tree(TERMINATE_GRACE_S)
+        except Exception:
+            pass
+        try:
+            _systemd_terminate_unit(self._own_unit())
+        except Exception:
+            pass
+        try:
+            if not _no_live_descendants():
+                self._event("timeout verify: descendants alive after"
+                            " terminate; treating as unresolved")
+            leftovers = _job_processes_alive(self.job_id)
+            if leftovers:
+                self._event("timeout verify: %d job processes still carry"
+                            " job id; treating as unresolved"
+                            % len(leftovers))
+        except Exception:
+            pass
+        # Bounded recovery checks: probe installation without mutating.
+        try:
+            recovery = self._call_in_thread(
+                lambda: self.adapter.verify(),
+                min(120.0, timeout_s / 4.0 or 120.0))
+            if recovery[0] and recovery[1] is not None:
+                self._record_checks(recovery[1])
+                self.after_version = getattr(
+                    recovery[1], "version", "") or self.after_version
+        except Exception:
+            pass
+        self._event("timeout recovery: possible partial installation;"
+                    " recovery_required set")
+
     def _do_execute(self, plan, timeout_s):
         # type: (Any, float) -> Any
+        # Single timeout owner: the runner deadline is the adapter plan step
+        # timeout. Adapters run their mutating run_fixed call with
+        # step_timeout + registry.MUTATION_TIMEOUT_MARGIN_S so this deadline
+        # always fires first; any adapter timeout report funnels here too.
         activity_ack = bool((self.job or {}).get("ack", ""))
         finished, value, status = self._call_in_thread(
             lambda: self.adapter.execute(plan, self.job_id, activity_ack=activity_ack),
             timeout_s)
         if status == "timeout":
-            self._timed_out = True
-            self._event("hard timeout after %ds; SIGTERM job tree, grace %ds then SIGKILL"
-                        % (int(timeout_s), TERMINATE_GRACE_S))
-            terminate_tree(TERMINATE_GRACE_S)
-            # Bounded recovery checks: probe installation without mutating.
-            try:
-                recovery = self._call_in_thread(
-                    lambda: self.adapter.verify(), min(120.0, timeout_s / 4.0 or 120.0))
-                if recovery[0] and recovery[1] is not None:
-                    self._record_checks(recovery[1])
-                    self.after_version = getattr(recovery[1], "version", "") or self.after_version
-            except Exception:
-                pass
-            self._event("timeout recovery: possible partial installation; recovery_required set")
+            self._hard_timeout_recovery(timeout_s, "runner deadline")
             return None
         if status == "interrupted":
             return None
         if status == "error":
             raise value
+        if _is_timeout_result(value):
+            self._hard_timeout_recovery(timeout_s, "adapter timeout report")
+            return None
         return value
 
     def _do_verify(self, timeout_s):
@@ -674,6 +895,7 @@ class Runner(object):
                      1 if entry["mandatory"] else 0, entry["summary"], _now_iso()))
             self.conn.commit()
         except Exception as exc:
+            self._evidence_failed = True
             self._event("check persistence failed: %s" % str(exc)[:300])
 
     # -- receipts + finalize ---------------------------------------------------
@@ -686,22 +908,34 @@ class Runner(object):
 
     def _write_receipt(self, state):
         # type: (str) -> bool
-        """Atomically persist the redacted completion receipt. Never raw output."""
-        receipt = {
-            "schema_version": 1,
-            "job_id": self.job_id,
-            "tool": self.tool_id,
-            "state": state,
-            "exit_code": self.exit_code,
-            "error_code": self.error_code,
-            "error_detail": (self.error_detail or "")[:2000],
-            "before_version": self.before_version,
-            "after_version": self.after_version,
-            "backup_summary": self.backup_summary,
-            "checks": self.checks,
-            "log_truncated": bool(self.log.truncated) if self.log else False,
-            "finished_at": _now_iso(),
-        }
+        """Atomically persist the redacted completion receipt. Never raw output.
+
+        Built via receipts.build_receipt so ALL string values are redacted
+        first (known secrets + patterns). Any write failure sets the sticky
+        evidence flag.
+        """
+        try:
+            from ..receipts import build_receipt
+        except Exception as exc:
+            self._evidence_failed = True
+            self.error_detail = ("%s; receipt builder unavailable: %s" % (
+                self.error_detail, exc))[:2000]
+            return False
+        try:
+            receipt = build_receipt(
+                self.job_id, self.tool_id, state,
+                self.before_version, self.after_version,
+                self.exit_code, self.error_code, self.checks,
+                _now_iso(),
+                error_detail=self.error_detail or "",
+                backup_summary=self.backup_summary or "",
+                log_truncated=bool(self.log.truncated) if self.log else False,
+            )
+        except Exception as exc:
+            self._evidence_failed = True
+            self.error_detail = ("%s; receipt build failed: %s" % (
+                self.error_detail, exc))[:2000]
+            return False
         path = self._receipt_path()
         try:
             parent = os.path.dirname(path)
@@ -723,16 +957,41 @@ class Runner(object):
                 pass
             return True
         except OSError as exc:
+            self._evidence_failed = True
             self.error_detail = ("%s; receipt unwritable: %s" % (
                 self.error_detail, exc))[:2000]
             return False
 
+    def _evidence_failed_now(self):
+        # type: () -> bool
+        try:
+            if self._evidence_failed:
+                return True
+            if self.log is not None and getattr(
+                    self.log, "persist_failed", False):
+                return True
+        except Exception:
+            pass
+        return False
+
     def _finish(self, state, exit_code, error_code="", error_detail="",
                 recovery_required=False):
         # type: (str, int, str, str, bool) -> int
-        """Durable terminal record: receipt first, then DB. Returns exit code."""
+        """Durable terminal record: receipt first, then DB. Returns exit code.
+
+        Any sticky evidence failure (JobLog/check/receipt writes) maps a
+        would-be success to interrupted/storage_failure: never success
+        without durable evidence.
+        """
         from ..jobs import set_recovery
 
+        if state == "succeeded" and self._evidence_failed_now():
+            state = "interrupted"
+            exit_code = EXIT_INTERRUPTED
+            error_code = "storage_failure"
+            error_detail = ("evidence persistence failed; %s"
+                            % (error_detail or ""))[:2000]
+            recovery_required = True
         self.exit_code = exit_code
         self.error_code = error_code
         self.error_detail = error_detail
@@ -740,6 +999,17 @@ class Runner(object):
             self._event("final: state=%s exit=%d error=%s %s" % (
                 state, exit_code, error_code, (error_detail or "")[:300]))
             self.log.flush()
+            if state == "succeeded" and self._evidence_failed_now():
+                # Final flush failed: same mapping, before any receipt.
+                state = "interrupted"
+                exit_code = EXIT_INTERRUPTED
+                error_code = "storage_failure"
+                error_detail = ("evidence persistence failed; %s"
+                                % (error_detail or ""))[:2000]
+                recovery_required = True
+                self.exit_code = exit_code
+                self.error_code = error_code
+                self.error_detail = error_detail
         receipt_ok = self._write_receipt(state)
         if state == "succeeded" and not receipt_ok:
             # Never success without a durable completion record.
@@ -799,6 +1069,15 @@ class Runner(object):
                                     "job load failed: %s" % str(exc)[:300])
         if not ok:
             return self._fail_early("invalid_request", detail)
+        # H-01: verify the dispatch nonce before any mutation or tool touch.
+        # Mismatch/empty exits 6 without touching the tool (no adapter calls,
+        # no log, no lock, no DB writes beyond the read above).
+        try:
+            nonce_ok, nonce_detail = self._verify_nonce()
+        except Exception:
+            nonce_ok, nonce_detail = False, "nonce verification crashed"
+        if not nonce_ok:
+            return self._fail_early("interrupted", nonce_detail)
         self._open_log()
         self._install_signal_handlers()
         # Runner owns the execution lock for the full procedure.
@@ -970,6 +1249,18 @@ class Runner(object):
                     for c in mandatory_bad)[:500]
             return self._finish("health_failed", EXIT_VERIFY_FAILED, "health_failed",
                                 detail[:1000])
+        # P0-06 central exact-target: exact plans must land exactly on target,
+        # regardless of adapter opinion.
+        try:
+            target_mode = getattr(plan, "target_mode", "")
+            target = getattr(plan, "target", "")
+        except Exception:
+            target_mode, target = "", ""
+        if _exact_target_mismatch(target_mode, target, self.after_version):
+            return self._finish(
+                "health_failed", EXIT_VERIFY_FAILED, "exact_target_mismatch",
+                "exact target %r not observed (after=%r)"
+                % (target, self.after_version))
         self._event("job succeeded before=%s after=%s%s" % (
             self.before_version, self.after_version,
             " (already-current; not upgrade evidence)" if exec_state == "already_current" else ""))
@@ -1016,13 +1307,16 @@ def main(argv=None):
     # type: (Optional[List[str]]) -> int
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help"):
-        sys.stdout.write("usage: ega-update-runner <job-id>\n")
+        sys.stdout.write("usage: ega-update-runner <job-id> <nonce>\n")
         return EXIT_INVALID
-    job_id = args[0]
-    if len(job_id) < 8 or len(args) > 1:
-        sys.stderr.write("runner: invalid job id\n")
+    if len(args) != 2:
+        sys.stderr.write("runner: invalid argv (want <job-id> <nonce>)\n")
         return EXIT_INVALID
-    runner = Runner(job_id)
+    job_id, nonce = args[0], args[1]
+    if len(job_id) < 8 or not nonce:
+        sys.stderr.write("runner: invalid job id or empty nonce\n")
+        return EXIT_INVALID
+    runner = Runner(job_id, nonce)
     try:
         return runner.run()
     except Exception:
