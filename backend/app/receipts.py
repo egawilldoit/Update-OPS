@@ -40,16 +40,24 @@ CHECK_RESULTS = ("pass", "fail", "unknown", "not_applicable")
 # allowed set — do not accept arbitrary strings.
 SUCCESS_OUTCOMES = ("succeeded", "already_current")
 
+# Explicit recovery-disposition vocabulary for successful receipts
+# (G06). Normal successful runner output uses exactly "none". Empty,
+# unknown, pending, required, or garbage values are rejected — success
+# must state its recovery disposition, not omit it. Non-success states
+# keep their own explicit values (required, clear-pending-reconcile)
+# and are NOT constrained to this set.
+RECOVERY_RESOLVED_VALUES = ("none",)
+
 
 def _known_secrets():
     # type: () -> tuple
-    try:
-        from .config import load_secret_values, settings
+    # G05: no silent degradation. A configured-but-broken secret source
+    # raises SecretSourceError so receipt generation fails instead of
+    # emitting raw external text.
+    from .config import load_secret_values, settings
 
-        values = load_secret_values(settings)
-        return tuple(v for v in (values or ()) if v)
-    except Exception:
-        return ()
+    values = load_secret_values(settings)
+    return tuple(v for v in (values or ()) if v)
 
 
 def _redact_str(value):
@@ -250,9 +258,12 @@ def validate_receipt(data):
             return False, "succeeded requires evidence_durable"
         if str(data.get("cleanup_status", "") or "") != "resolved":
             return False, "succeeded requires cleanup_status == resolved"
-        if str(data.get("recovery_disposition", "") or "") == "required":
-            return False, "succeeded contradicts recovery_disposition " \
-                "== required"
+        if str(data.get("recovery_disposition", "") or "") not in \
+                RECOVERY_RESOLVED_VALUES:
+            return False, "succeeded requires recovery_disposition in " \
+                "%r; got %r" % (
+                    list(RECOVERY_RESOLVED_VALUES),
+                    str(data.get("recovery_disposition", ""))[:50])
         if data.get("target_mode") == "exact" and \
                 data.get("after_version") != data.get("target"):
             return False, "exact target not observed"
@@ -363,10 +374,10 @@ def check_binding(data, job_row, plan_row=None, filename_job_id=""):
                     SUCCESS_OUTCOMES:
                 return False, "succeeded requires install_outcome in %r" \
                     % (list(SUCCESS_OUTCOMES),)
-            if str(data.get("recovery_disposition", "") or "") == \
-                    "required":
-                return False, "succeeded contradicts recovery_disposition" \
-                    " == required"
+            if str(data.get("recovery_disposition", "") or "") not in \
+                    RECOVERY_RESOLVED_VALUES:
+                return False, "succeeded requires recovery_disposition " \
+                    "in %r" % (list(RECOVERY_RESOLVED_VALUES),)
     except Exception as exc:
         return False, "binding check crashed: %s" % exc
     return True, ""

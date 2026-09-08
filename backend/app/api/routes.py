@@ -1618,8 +1618,14 @@ def get_job_logs(job_id: str, request: Request):
             conn.close()
         except Exception:
             pass
-    # File read happens outside any DB transaction.
-    page = _read_log_page(job_id, after, limit)
+    # File read happens outside any DB transaction. Any failure here —
+    # including a broken secret source for re-redaction (G05) — fails
+    # closed with 503 rather than serving weakened evidence.
+    try:
+        page = _read_log_page(job_id, after, limit)
+    except Exception:
+        return deps.error_envelope(
+            503, "unavailable", "log evidence unavailable", "")
     return _ok(page)
 
 

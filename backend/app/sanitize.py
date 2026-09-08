@@ -97,21 +97,21 @@ def sanitize_json(obj, secrets=()):
     return obj
 
 
-def parse_secrets_file(path):
+def parse_secrets_content(content):
     # type: (str) -> Tuple[str, ...]
-    """One shared env-style parser (R34). Returns values only.
+    """Single shared env-style parser (G05: the one authority).
 
     Accepts KEY=value (single/double quotes, export prefix, # comments)
-    and bare secret lines. Values shorter than 4 chars are ignored.
-    Missing/unreadable files yield (). Never raises, never logs values.
+    and bare secret lines; returns VALUES only. Values shorter than 4
+    chars are ignored. Pure function over text: never touches the
+    filesystem, never raises on content, never logs values.
     """
+    out = []
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            content = fh.read()
+        lines = str(content or "").splitlines()
     except Exception:
         return ()
-    out = []
-    for raw in content.splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -130,6 +130,25 @@ def parse_secrets_file(path):
         if len(value) >= 4:
             out.append(value)
     return tuple(out)
+
+
+def parse_secrets_file(path):
+    # type: (str) -> Tuple[str, ...]
+    """One shared env-style parser (R34). Returns values only.
+
+    Accepts KEY=value (single/double quotes, export prefix, # comments)
+    and bare secret lines. Values shorter than 4 chars are ignored.
+    Missing/unreadable files yield (). Never raises, never logs values.
+
+    NOTE: config.load_secret_values is the strict variant for durable
+    evidence paths (missing-when-configured raises SecretSourceError).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except Exception:
+        return ()
+    return parse_secrets_content(content)
 
 
 class SanitizingStream(object):

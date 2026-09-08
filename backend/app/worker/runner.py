@@ -136,17 +136,16 @@ def _known_secrets():
     """Known secret values for redaction (never logged).
 
     Reads via backend.app.config.load_secret_values(settings); the settings
-    object is always passed explicitly (never a bare call). Import-guarded
-    with an empty fallback so there is no hard dependency.
+    object is always passed explicitly (never a bare call). G05: no
+    silent degradation — a configured-but-broken secret source raises
+    SecretSourceError so JobLog initialization fails instead of
+    persisting with zero secrets.
     """
-    try:
-        from ..config import load_secret_values as _loader
-        from ..config import settings as _settings
+    from ..config import load_secret_values as _loader
+    from ..config import settings as _settings
 
-        values = _loader(_settings)
-        return tuple(v for v in (values or ()) if v)
-    except Exception:
-        return ()
+    values = _loader(_settings)
+    return tuple(v for v in (values or ()) if v)
 
 
 class JobLog(object):
@@ -457,6 +456,9 @@ class Runner(object):
 
     def _open_log(self):
         # type: () -> None
+        # G05: durable log initialization is a mutation gate. Secrets
+        # failure raises from _known_secrets; an unopenable log raises
+        # here. run() maps both to blocked BEFORE any mutation.
         settings = self._settings()
         log_dir = getattr(settings, "log_dir", "/var/lib/ega-update/logs")
         cap = int(getattr(settings, "per_job_log_cap_bytes", 20 * 1024 * 1024))
@@ -465,13 +467,14 @@ class Runner(object):
             secrets=_known_secrets())
         try:
             self.log.open()
-        except Exception:
+        except Exception as exc:
             self._evidence_failed = True
             try:
                 self.log.close()
             except Exception:
                 pass
             self.log = None
+            raise OSError("job log unavailable: %s" % exc)
 
     def _verify_nonce(self):
         # type: () -> Tuple[bool, str]
@@ -1665,7 +1668,17 @@ class Runner(object):
                 (self.job or {}).get("state", "preflight") or "preflight")
         except Exception:
             self._known_state = "preflight"
-        self._open_log()
+        # G05: JobLog initialization must establish redaction safety
+        # BEFORE any mutation can occur. A secrets-unavailable log (or
+        # an unwritable log dir) blocks here with a retryable blocked
+        # outcome — no mutation has run yet, so no recovery is needed.
+        try:
+            self._open_log()
+        except Exception as exc:
+            return self._finish("blocked", EXIT_BLOCKED, "storage_failure",
+                                "log initialization failed; mutation "
+                                "refused without durable evidence: %s"
+                                % str(exc)[:300])
         self._install_signal_handlers()
         # Runner owns the execution lock for the full procedure.
         locked, lock_detail = self._acquire_execution_lock()

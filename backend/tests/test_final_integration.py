@@ -960,6 +960,134 @@ def test_g01_no_duplicated_adapter_gate_comment():
     assert len(hits) <= 1, hits
 
 
+# -- G05 secret-source fail-closed ---------------------------------------------------
+
+def test_g05_absent_by_design_yields_empty_set():
+    """No configured secret source is a valid empty set (G05) —
+    distinct from a broken source, which must raise."""
+    from backend.app.config import load_secret_values
+
+    class _Settings(object):
+        secrets_file = ""
+
+    assert load_secret_values(_Settings()) == ()
+
+
+def test_g05_configured_missing_unreadable_raise(tmp_path):
+    from backend.app.config import SecretSourceError, load_secret_values
+
+    class _Settings(object):
+        secrets_file = str(tmp_path / "no-such-secrets.env")
+
+    with pytest.raises(SecretSourceError):
+        load_secret_values(_Settings())
+
+    class _DirSettings(object):
+        secrets_file = str(tmp_path)
+
+    with pytest.raises(SecretSourceError):
+        load_secret_values(_DirSettings())
+
+
+def test_g05_empty_file_yields_empty_set_not_failure(tmp_path):
+    """A present-but-empty secrets file parses to no values without
+    failing: absence of VALUES is not source failure."""
+    from backend.app.config import load_secret_values
+
+    path = tmp_path / "empty.env"
+    path.write_text("# only comments\nab\n", encoding="utf-8")
+
+    class _Settings(object):
+        secrets_file = str(path)
+
+    assert load_secret_values(_Settings()) == ()
+
+
+def test_g05_receipt_build_fails_not_raw(monkeypatch):
+    """build_receipt with a broken secret source raises instead of
+    emitting raw external text (G05)."""
+    from backend.app import receipts as receipts_lib
+    from backend.app.config import SecretSourceError
+
+    def _boom(_settings=None):
+        raise SecretSourceError("unreadable")
+
+    monkeypatch.setattr(
+        "backend.app.config.load_secret_values", _boom)
+    # receipts imports the loader lazily per call, so the patch applies.
+    with pytest.raises(Exception):
+        receipts_lib.build_receipt(
+            "j", "hermes", "failed", "1.0", "1.0", 4,
+            "token-bearing-boom", [], "2026-09-08T00:00:00+00:00")
+
+
+def test_g05_log_init_failure_blocks_before_mutation(tmp_path, monkeypatch):
+    """JobLog initialization failure (here: secret source down) stops
+    the job BEFORE any mutation. The secrets outage also breaks the
+    terminal DB write (tx boundary is equally strict), so the runner
+    exits interrupted with nothing mutated and no replay possible —
+    the dispatcher reconciler later marks the never-launched attempt
+    interrupted. What matters: no success, no mutation, no replay."""
+    from backend.app import jobs as jobs_lib
+    from backend.app.admission import admit
+    from backend.app.config import SecretSourceError
+    from backend.app.worker import runner as runner_lib
+
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-g05", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "" and created
+    assert jobs_lib.claim_with_nonce(conn, jid, "n-g05") is True
+    conn.close()
+
+    def _boom(_settings=None):
+        raise SecretSourceError("unreadable")
+
+    monkeypatch.setattr(
+        "backend.app.config.load_secret_values", _boom)
+    # Point the runner at the test DB without touching prod settings.
+    from backend.app.config import settings as settings_lib
+    import backend.app.worker.runner as runner_mod
+    old_db = settings_lib.db_path
+    settings_lib.db_path = str(tmp_path / "f.db")
+    try:
+        runner = runner_mod.Runner(jid, "n-g05")
+        rc = runner.run()
+    finally:
+        settings_lib.db_path = old_db
+    assert rc == runner_lib.EXIT_INTERRUPTED
+    verify = db_lib.connect(str(tmp_path / "f.db"))
+    try:
+        state = verify.execute(
+            "SELECT state, before_version, after_version FROM jobs"
+            " WHERE id=?", (jid,)).fetchone()
+        assert state["state"] in ("preflight", "interrupted")
+        assert state["before_version"] == ""
+        assert state["after_version"] == ""
+        assert jobs_lib.consume_attempt(verify, jid, "n-g05") is False
+    finally:
+        verify.close()
+
+
+# -- G06 resolved recovery disposition -------------------------------------------------
+
+def test_g06_success_recovery_disposition_allowlist():
+    """state==succeeded allows exactly the resolved values (G06):
+    'none' passes; empty/unknown/pending/required/garbage fail."""
+    from backend.app import receipts as receipts_lib
+
+    base = _f04_good()
+    assert receipts_lib.validate_receipt(base)[0] is True
+    for bad in ("", "unknown", "pending", "required", "garbage",
+                "clear-pending-reconcile"):
+        mutated = dict(base)
+        mutated["recovery_disposition"] = bad
+        valid, _why = receipts_lib.validate_receipt(mutated)
+        assert valid is False, bad
+
+
 # -- G04 privilege profile truth ---------------------------------------------------
 
 def test_g04_privilege_fields_in_fingerprint():

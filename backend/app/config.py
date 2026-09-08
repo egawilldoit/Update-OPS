@@ -289,34 +289,47 @@ def get_adapter_timeouts(s=None):
     return out
 
 
+class SecretSourceError(Exception):
+    """A CONFIGURED secret source failed to load (G05).
+
+    Distinct from 'no secrets configured' (empty secrets_file, which
+    validly yields ()). Durable evidence paths must fail closed on
+    this error — never degrade to an empty secret set and persist.
+    """
+
+
 def load_secret_values(s):
     # type: (object) -> Tuple[str, ...]
     """Return known secret values for redaction (never logs values).
 
-    Reads non-empty stripped lines from ``s.secrets_file``. A missing or
-    unreadable file yields ``()`` so readers stay fail-closed without
-    raising. Callers pass the values to redaction only, never to logs or
-    error details.
+    Strict (G05): values parsed with the single shared parser
+    (sanitize.parse_secrets_content). An empty/unset ``secrets_file``
+    means no secrets by design and yields ``()``. A CONFIGURED but
+    missing/unreadable file raises SecretSourceError — callers on
+    durable evidence paths must fail closed instead of persisting
+    with zero secrets. Callers pass the values to redaction only,
+    never to logs or error details.
     """
     try:
         path = getattr(s, "secrets_file", "") or "/etc/ega-update/secrets.env"
-    except Exception:
-        return ()
+    except Exception as exc:
+        raise SecretSourceError("settings unreadable: %s" % exc)
     if not isinstance(path, str) or not path:
         return ()
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-    except OSError:
-        return ()
-    except Exception:
-        return ()
-    out = []
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped:
-            out.append(stripped)
-    return tuple(out)
+    except OSError as exc:
+        raise SecretSourceError(
+            "secret file unreadable: %s" % str(exc)[:200])
+    except Exception as exc:
+        raise SecretSourceError(
+            "secret source failed: %s" % str(exc)[:200])
+    try:
+        from .sanitize import parse_secrets_content
+        return parse_secrets_content(content)
+    except Exception as exc:
+        raise SecretSourceError("secret parse failed: %s" % exc)
 
 
 settings = load_settings()
