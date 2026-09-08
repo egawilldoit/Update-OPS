@@ -95,10 +95,9 @@ admission service and receipts v2 binding.
 ## Final static integration addendum (F01–F16, main-agent pass)
 
 Previous baseline `679bacec77a5ba684e99cfec4160df5c5a69fb11`. This
-pass: uncommitted at matrix-update time — exact resulting SHA recorded
-as `PENDING:final-sha` until the implementation commit lands (this
-marker is the explicit placeholder required before a SHA exists; the
-report carries the final SHA). Every row: `implemented-static`,
+pass landed as implementation head
+`a664f1162f8ac3e2be2f6c4d6e59756761836671` (replacing the
+`PENDING:final-sha` placeholder used while the SHA did not yet exist). Every row: `implemented-static`,
 result `NOT EXECUTED — IMPLEMENTATION PHASE`. No runtime PASS claimed.
 New regression artifacts: `backend/tests/test_final_integration.py`
 (F01–F16 blocks), `backend/tests/test_deploy_bootstrap.py` (F06–F10
