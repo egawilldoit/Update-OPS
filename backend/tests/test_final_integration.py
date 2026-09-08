@@ -1101,10 +1101,13 @@ def test_g04_privilege_fields_in_fingerprint():
     assert baseline
     contract = build_owner_contract(None)
     assert contract.get("runner_no_new_privileges") == "false"
-    assert contract.get("scope_no_new_privileges") == "false"
+    assert contract.get("probe_no_new_privileges") == "false"
+    assert contract.get("phase_privilege_source") == "runner"
     assert contract.get("privilege_profile") == "owner-exec-nnp-off"
+    assert "scope_no_new_privileges" not in contract
     for key, value in (("runner_no_new_privileges", "true"),
-                       ("scope_no_new_privileges", "true"),
+                       ("probe_no_new_privileges", "true"),
+                       ("phase_privilege_source", "scope"),
                        ("privilege_profile", "owner-exec-nnp-on")):
         altered = dict(contract)
         altered[key] = value
@@ -1130,12 +1133,49 @@ def test_g04_launch_argv_matches_fingerprint():
 
 
 def test_g04_probe_apply_share_privilege_profile():
-    """Probe scopes and runner units launch from the same contract env
-    keys: no profile divergence between preview and apply (F04)."""
-    import inspect
-    from backend.app.owner_env import TRANSIENT_SETENV_KEYS
-    from backend.app.worker import phase_run as phase_run_lib
+    """Probe services and runner services launch from the same contract
+    env keys and the same shared service properties (H04): no profile
+    divergence between preview and apply. Probes are transient
+    SERVICES (never --scope from the NNP-on dispatcher)."""
+    from backend.app.owner_env import (TRANSIENT_PROBE_PROPERTIES,
+                                       TRANSIENT_RUNNER_PROPERTIES,
+                                       TRANSIENT_SETENV_KEYS,
+                                       build_owner_contract,
+                                       build_probe_cmd,
+                                       build_transient_cmd,
+                                       contract_env,
+                                       transient_probe_name)
 
+    support_lib.test_release_root()
+    assert TRANSIENT_PROBE_PROPERTIES is TRANSIENT_RUNNER_PROPERTIES
+    assert dict(TRANSIENT_PROBE_PROPERTIES).get(
+        "NoNewPrivileges") == "no"
+    contract = build_owner_contract(None)
+    env = contract_env(contract)
+    service = transient_probe_name("12345678-1234-1234-1234-123456789abc")
+    assert service == \
+        "ega-update-probe-12345678123412341234123456789abc.service"
+    probe_cmd = build_probe_cmd(
+        service, "/rel", env, "/rel/venv/bin/python",
+        "12345678-1234-1234-1234-123456789abc",
+        "/l/req.payload.json", "/l/req.result.json",
+        "/l/req.stream", "inspect", 60.0)
+    assert "--scope" not in probe_cmd
+    assert "--wait" in probe_cmd
+    assert "--unit=%s" % service in probe_cmd
+    assert "--property=NoNewPrivileges=no" in probe_cmd
+    assert "-m" in probe_cmd and "backend.app.worker.phase_run" in \
+        probe_cmd
+    runner_cmd = build_transient_cmd(
+        "ega-update-job-abc.service", "/rel", env,
+        "/rel/venv/bin/python", "job-id", "n-g04")
+    probe_setenv = sorted(
+        part for part in probe_cmd if part.startswith("--setenv="))
+    runner_setenv = sorted(
+        part for part in runner_cmd if part.startswith("--setenv="))
+    assert probe_setenv and probe_setenv == runner_setenv
+    import inspect
+    from backend.app.worker import phase_run as phase_run_lib
     scope_src = inspect.getsource(phase_run_lib._scope_argv)
     assert "TRANSIENT_SETENV_KEYS" in scope_src
     for key in ("PATH", "HOME", "USER", "XDG_RUNTIME_DIR",

@@ -2,11 +2,15 @@
 
 Two halves:
 - Worker (this module's main): runs ONE phase body in a coordinator-owned
-  scope. Never touches the database.
-- Coordinator (run_supervised_phase, same module for single ownership):
-  launches the worker inside a per-phase transient scope, tails its
-  sanitized stream live, enforces a monotonic deadline by killing the
-  SCOPE (never its own unit), proves quiescence, and returns the result.
+  unit. Never touches the database.
+- Coordinator (run_supervised_phase / run_supervised_probe, same module
+  for single ownership): launches update phases inside per-phase
+  transient scopes under the job runner, and authoritative probes
+  inside transient probe SERVICES with the same NNP-off owner profile
+  as the runner (H04 — never inherited scopes from the NNP-on
+  dispatcher), tails sanitized stream live, enforces a monotonic
+  deadline by killing the UNIT (never its own unit), proves
+  quiescence, and returns the result.
   No phase Python outlives coordinator-declared termination: the worker
   is an OS process inside the killed cgroup, not a thread.
 """
@@ -631,6 +635,191 @@ def _kill_scope_wait_empty(scope, grace_s=10.0):
         return False
 
 
+def _write_launch_files(payload, payload_path, result_path,
+                        stream_path):
+    # type: (dict, str, str, str) -> str
+    """Atomically write the worker payload; clear stale result/stream.
+
+    Returns "" on success, else a failure reason (fail closed).
+    """
+    try:
+        parent = os.path.dirname(os.path.abspath(payload_path))
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        tmp = "%s.tmp-%d" % (payload_path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True, default=str)
+        os.replace(tmp, payload_path)
+        for stale in (result_path, stream_path):
+            try:
+                if os.path.exists(stale):
+                    os.remove(stale)
+            except OSError:
+                pass
+    except OSError as exc:
+        return "launch files unwritable: %s" % exc
+    except Exception as exc:
+        return "payload unbuildable: %s" % exc
+    return ""
+
+
+def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
+                        deadline, emit, cancel_event):
+    # type: (object, str, str, str, str, float, object, object) -> tuple
+    """Supervise one launched worker process to completion (N10, H03).
+
+    Shared by phase scopes and probe services: live stream tailing,
+    monotonic deadline, cancel support, scope/service kill + proven
+    quiescence on timeout, H03 exit proof (the unit must be confirmed
+    stopped before any result delivers — a unit that will not empty is
+    a timeout), then result-file delivery. Returns
+    (ok, data, error, timed_out) with the phase-runner contract.
+    unit_kind names the unit in quiescence messages ("phase scope" or
+    "probe service").
+    """
+    offset = [0]
+    timed_out = False
+    cancelled = False
+
+    def _tail():
+        # type: () -> None
+        try:
+            with open(stream_path, "rb") as fh:
+                fh.seek(offset[0])
+                chunk = fh.read(256 * 1024)
+                offset[0] += len(chunk)
+        except OSError:
+            return
+        except Exception:
+            return
+        try:
+            text = chunk.decode("utf-8", errors="replace")
+        except Exception:
+            return
+        for raw in text.split("\n"):
+            if not raw.strip():
+                continue
+            try:
+                record = json.loads(raw)
+                line = str(record.get("line", ""))
+                stream = str(record.get("stream", "stdout"))
+            except Exception:
+                continue
+            if stream not in ("stdout", "stderr", "event"):
+                stream = "stdout"
+            try:
+                emit(stream, line)
+            except Exception:
+                continue
+
+    grace = min(30.0, max(5.0, deadline / 10.0))
+    started = time.monotonic()
+    while True:
+        if cancel_event is not None:
+            try:
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+            except Exception:
+                pass
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is not None:
+            break
+        if time.monotonic() - started > deadline:
+            timed_out = True
+            break
+        _tail()
+        time.sleep(0.25)
+    if timed_out or cancelled:
+        if _kill_scope_wait_empty(unit, grace):
+            _tail()
+        else:
+            _tail()
+            return False, {}, \
+                "%s not quiescent after kill" % unit_kind, True
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _tail()
+        if cancelled:
+            return False, {}, "phase cancelled", True
+        return False, {}, "phase deadline exceeded", True
+    try:
+        rc = proc.wait(timeout=30)
+    except Exception:
+        rc = -1
+    _tail()
+    try:
+        _, err = proc.communicate(timeout=5)
+    except Exception:
+        err = b""
+    # H03: completion must PROVE unit exit, not assume it. The worker
+    # process ended, but stray unit children (which carry no hex
+    # marker, so no later scan can see them) would otherwise leak into
+    # the next phase or past terminalization. A unit that will not
+    # empty is a timeout: survivors exist, so the caller must keep
+    # recovery, exactly as on deadline expiry.
+    try:
+        from .. import units as _units_mod
+        _unit_info = _units_mod.query_unit(unit, timeout_s=5)
+        _unit_state = str(
+            (_unit_info or {}).get("state", "unknown"))
+    except Exception:
+        _unit_state = "unknown"
+    if _unit_state != "confirmed_stopped":
+        if _kill_scope_wait_empty(unit, grace):
+            _tail()
+        else:
+            _tail()
+            return False, {}, \
+                "%s not quiescent after completion" % unit_kind, True
+    if int(rc or 0) not in (0,):
+        detail = ""
+        try:
+            detail = (err or b"").decode("utf-8",
+                                         errors="replace")[:500]
+        except Exception:
+            pass
+        # A nonzero worker exit with a valid result file still
+        # delivers data (e.g. probe-level failures); missing result
+        # is what fails.
+        try:
+            with open(result_path, "r", encoding="utf-8") as fh:
+                result = json.load(fh)
+        except Exception:
+            return False, {}, \
+                "phase worker exit=%s %s" % (rc, detail), False
+        if not isinstance(result, dict) or "ok" not in result:
+            return False, {}, \
+                "phase worker exit=%s %s" % (rc, detail), False
+        if result.get("ok"):
+            return True, result.get("data", {}) or {}, "", False
+        data = result.get("data", {}) or {}
+        return False, data, str(
+            data.get("error_detail", data.get(
+                "error_code", "phase failed")))[:500], False
+    try:
+        with open(result_path, "r", encoding="utf-8") as fh:
+            result = json.load(fh)
+    except Exception:
+        return False, {}, "phase result missing", False
+    if not isinstance(result, dict) or "ok" not in result:
+        return False, {}, "phase result malformed", False
+    if result.get("ok"):
+        return True, result.get("data", {}) or {}, "", False
+    data = result.get("data", {}) or {}
+    return False, data, str(
+        data.get("error_detail", data.get(
+            "error_code", "phase failed")))[:500], False
+
+
 def run_supervised_phase(tool_id, job_id, phase, payload_extra,
                          timeout_s, settings, log_dir, emit,
                          op="", cancel_event=None, env=None):
@@ -709,22 +898,10 @@ def run_supervised_phase(tool_id, job_id, phase, payload_extra,
                     payload[key] = value
     except Exception:
         return False, {}, "payload unbuildable", False
-    try:
-        parent = os.path.dirname(os.path.abspath(payload_path))
-        if parent and not os.path.exists(parent):
-            os.makedirs(parent, mode=0o700, exist_ok=True)
-        tmp = "%s.tmp-%d" % (payload_path, os.getpid())
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, sort_keys=True, default=str)
-        os.replace(tmp, payload_path)
-        for stale in (result_path, stream_path):
-            try:
-                if os.path.exists(stale):
-                    os.remove(stale)
-            except OSError:
-                pass
-    except OSError as exc:
-        return False, {}, "phase files unwritable: %s" % exc, False
+    _files_error = _write_launch_files(payload, payload_path,
+                                         result_path, stream_path)
+    if _files_error:
+        return False, {}, "phase files: %s" % _files_error, False
     try:
         argv = _scope_argv(scope, release, config_path, venv_python,
                            job_id, phase, payload_path, result_path,
@@ -741,148 +918,119 @@ def run_supervised_phase(tool_id, job_id, phase, payload_extra,
                          start_new_session=True)
     except Exception as exc:
         return False, {}, "phase spawn failed: %s" % exc, False
-    offset = [0]
-    timed_out = False
-    cancelled = False
-
-    def _tail():
-        # type: () -> None
-        try:
-            with open(stream_path, "rb") as fh:
-                fh.seek(offset[0])
-                chunk = fh.read(256 * 1024)
-                offset[0] += len(chunk)
-        except OSError:
-            return
-        except Exception:
-            return
-        try:
-            text = chunk.decode("utf-8", errors="replace")
-        except Exception:
-            return
-        for raw in text.split("\n"):
-            if not raw.strip():
-                continue
-            try:
-                record = json.loads(raw)
-                line = str(record.get("line", ""))
-                stream = str(record.get("stream", "stdout"))
-            except Exception:
-                continue
-            if stream not in ("stdout", "stderr", "event"):
-                stream = "stdout"
-            try:
-                emit(stream, line)
-            except Exception:
-                continue
-
-    started = time.monotonic()
-    grace = min(30.0, max(5.0, deadline / 10.0))
     try:
-        while True:
-            if cancel_event is not None:
-                try:
-                    if cancel_event.is_set():
-                        cancelled = True
-                        break
-                except Exception:
-                    pass
+        return _supervise_launched(proc, scope, "phase scope",
+                                   result_path, stream_path, deadline,
+                                   emit, cancel_event)
+    finally:
+        for path in (payload_path, result_path, stream_path):
             try:
-                rc = proc.poll()
-            except Exception:
-                rc = None
-            if rc is not None:
-                break
-            if time.monotonic() - started > deadline:
-                timed_out = True
-                break
-            _tail()
-            time.sleep(0.25)
-        if timed_out or cancelled:
-            if _kill_scope_wait_empty(scope, grace):
-                _tail()
-            else:
-                _tail()
-                return False, {}, \
-                    "phase scope not quiescent after kill", True
-            try:
-                proc.wait(timeout=15)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            _tail()
-            if cancelled:
-                return False, {}, "phase cancelled", True
-            return False, {}, "phase deadline exceeded", True
-        try:
-            rc = proc.wait(timeout=30)
-        except Exception:
-            rc = -1
-        _tail()
-        try:
-            _, err = proc.communicate(timeout=5)
-        except Exception:
-            err = b""
-        # H03: normal completion must PROVE scope exit, not assume it.
-        # The worker process ended, but stray scope children (which
-        # carry no hex marker, so no later scan can see them) would
-        # otherwise leak into the next phase or past terminalization.
-        # A scope that will not empty is a timeout: survivors exist, so
-        # the caller must keep recovery, exactly as on deadline expiry.
-        try:
-            from .. import units as _units_mod
-            _scope_info = _units_mod.query_unit(scope, timeout_s=5)
-            _scope_state = str(
-                (_scope_info or {}).get("state", "unknown"))
-        except Exception:
-            _scope_state = "unknown"
-        if _scope_state != "confirmed_stopped":
-            if _kill_scope_wait_empty(scope, grace):
-                _tail()
-            else:
-                _tail()
-                return False, {}, \
-                    "phase scope not quiescent after completion", True
-        if int(rc or 0) not in (0,):
-            detail = ""
-            try:
-                detail = (err or b"").decode("utf-8",
-                                             errors="replace")[:500]
-            except Exception:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
                 pass
-            # A nonzero worker exit with a valid result file still
-            # delivers data (e.g. probe-level failures); missing result
-            # is what fails.
-            try:
-                with open(result_path, "r", encoding="utf-8") as fh:
-                    result = json.load(fh)
-            except Exception:
-                return False, {}, \
-                    "phase worker exit=%s %s" % (rc, detail), False
-            if not isinstance(result, dict) or "ok" not in result:
-                return False, {}, \
-                    "phase worker exit=%s %s" % (rc, detail), False
-            if result.get("ok"):
-                return True, result.get("data", {}) or {}, "", False
-            data = result.get("data", {}) or {}
-            return False, data, str(
-                data.get("error_detail", data.get(
-                    "error_code", "phase failed")))[:500], False
-        try:
-            with open(result_path, "r", encoding="utf-8") as fh:
-                result = json.load(fh)
-        except Exception:
-            return False, {}, "phase result missing", False
-        if not isinstance(result, dict) or "ok" not in result:
-            return False, {}, "phase result malformed", False
-        if result.get("ok"):
-            return True, result.get("data", {}) or {}, "", False
-        data = result.get("data", {}) or {}
-        return False, data, str(
-            data.get("error_detail", data.get(
-                "error_code", "phase failed")))[:500], False
+
+
+def run_supervised_probe(tool_id, request_id, payload_extra,
+                         timeout_s, settings, log_dir, emit,
+                         op="", env=None):
+    # type: (...) -> tuple
+    """Run one authoritative owner probe in a transient SERVICE (H04).
+
+    The probe service launches from the SAME canonical owner contract
+    and the SAME shared service properties (KillMode=control-group,
+    Restart=no, NoNewPrivileges=no) as the job runner service, so
+    preview observes the identical privilege/restart-authority reality
+    as apply — never an inherited scope from the NNP-on dispatcher.
+    Phase workers stay scopes under the runner (their parent already
+    carries the intended profile); probe/request scopes are never
+    used for authoritative reads.
+
+    Returns (ok, data, error, timed_out) with the same contract as
+    run_supervised_phase, including the H03 exit proof: a probe
+    service that will not stop prevents successful completion.
+    Stream lines are delivered to emit() live; payload/result/stream
+    files are removed afterwards (best effort).
+    """
+    import subprocess as _sp
+
+    try:
+        deadline = max(5.0, float(timeout_s))
+    except (TypeError, ValueError):
+        deadline = 60.0
+    try:
+        from ..owner_env import (build_probe_cmd, resolved_paths,
+                                 transient_probe_name)
+    except Exception as exc:
+        return False, {}, "owner env contract: %s" % exc, False
+    try:
+        paths = resolved_paths(settings)
+        release = paths.get("release_root", "")
+        venv_python = paths.get("venv_python", "")
+        config_path = paths.get("config_path", "") or \
+            os.environ.get("EGA_CONFIG_FILE", "") or \
+            "/etc/ega-update/config.json"
+        if not release or not venv_python:
+            return False, {}, "owner paths unresolvable", False
+    except ValueError as exc:
+        return False, {}, "release unresolvable: %s" % exc, False
+    except Exception as exc:
+        return False, {}, "owner paths: %s" % exc, False
+    try:
+        service = transient_probe_name(request_id or "")
+    except ValueError as exc:
+        return False, {}, "probe service refused: %s" % exc, False
+    except Exception as exc:
+        return False, {}, "probe service unbuildable: %s" % exc, False
+    uid = str(request_id or "").replace("/", "_")
+    payload_path = os.path.join(log_dir, "%s.probe.payload.json" % uid)
+    result_path = os.path.join(log_dir, "%s.probe.result.json" % uid)
+    stream_path = os.path.join(log_dir, "%s.probe.stream" % uid)
+    try:
+        from ..owner_env import (build_owner_contract, contract_env,
+                                 contract_fingerprint)
+        if not isinstance(env, dict) or not env:
+            env = contract_env(build_owner_contract(settings))
+        expected_fp = contract_fingerprint(
+            build_owner_contract(settings))
+    except Exception as exc:
+        return False, {}, "owner contract unbuildable: %s" % exc, False
+    if not expected_fp:
+        return False, {}, "owner contract fingerprint empty", False
+    payload = {"tool_id": tool_id, "job_id": request_id,
+               "phase": "probe", "op": op or "",
+               "env_fingerprint": expected_fp}
+    try:
+        if isinstance(payload_extra, dict):
+            for key, value in payload_extra.items():
+                if isinstance(key, str):
+                    payload[key] = value
+    except Exception:
+        return False, {}, "payload unbuildable", False
+    _files_error = _write_launch_files(payload, payload_path,
+                                       result_path, stream_path)
+    if _files_error:
+        return False, {}, "probe files: %s" % _files_error, False
+    try:
+        argv = build_probe_cmd(service, release, env, venv_python,
+                               request_id, payload_path, result_path,
+                               stream_path, op, deadline)
+    except ValueError as exc:
+        return False, {}, "probe launch refused: %s" % exc, False
+    if not (os.path.isfile("/usr/bin/systemd-run")
+            and os.access("/usr/bin/systemd-run", os.X_OK)):
+        return False, {}, \
+            "systemd-run missing; refusing unsupervised probe", False
+    try:
+        proc = _sp.Popen(argv, stdout=_sp.DEVNULL, stderr=_sp.PIPE,
+                         stdin=_sp.DEVNULL, cwd=release, shell=False,
+                         start_new_session=True)
+    except Exception as exc:
+        return False, {}, "probe spawn failed: %s" % exc, False
+    try:
+        return _supervise_launched(proc, service, "probe service",
+                                   result_path, stream_path, deadline,
+                                   emit, None)
     finally:
         for path in (payload_path, result_path, stream_path):
             try:

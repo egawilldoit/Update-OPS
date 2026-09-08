@@ -284,17 +284,22 @@ def build_owner_contract(settings=None, inventory=None, release_path="",
         "lc_all": str(environ.get("LC_ALL", "") or ""),
         "lc_ctype": str(environ.get("LC_CTYPE", "") or ""),
         "tz": str(environ.get("TZ", "") or ""),
-        # F04 privilege truth: job execution runs WITHOUT
-        # NoNewPrivileges so the inventoried Hermes sudo path
-        # (`sudo -n systemctl restart <unit>` under the narrow
+        # H04 privilege truth: job execution AND authoritative probes
+        # run WITHOUT NoNewPrivileges so the inventoried Hermes sudo
+        # path (`sudo -n systemctl restart <unit>` under the narrow
         # sudoers allow-list) can elevate. With no_new_privs set,
         # setuid elevation is blocked and every Hermes system-unit
-        # restart would fail. The API/worker services (which never
-        # elevate) keep NoNewPrivileges=true; only job execution —
-        # transient runner units and phase scopes — is NNP-off. The
+        # restart would fail. Probes run as transient SERVICES with the
+        # same NNP-off property as the runner (never as inherited
+        # scopes from the NNP-on dispatcher); phase scopes carry no NNP
+        # property of their own — they inherit the runner service's
+        # NNP-off context, recorded here as phase_privilege_source.
+        # The API/worker services (which never elevate) keep
+        # NoNewPrivileges=true; only owner execution is NNP-off. The
         # fingerprint describes this reality, not the reverse.
         "runner_no_new_privileges": "false",
-        "scope_no_new_privileges": "false",
+        "probe_no_new_privileges": "false",
+        "phase_privilege_source": "runner",
         "privilege_profile": "owner-exec-nnp-off",
         "manager_scope": "user",
         "config_identity": str(config_id or ""),
@@ -434,19 +439,27 @@ def env_fingerprint(env):
 
 # -- canonical transient launch contract (one source, N-wave-3 cleanup) ----
 # Dispatcher, templates, docs, and tests derive from these values. Any
-# divergence is a defect: exactly one mechanism launches job runners.
-
-TRANSIENT_RUNNER_PROPERTIES = (
+# divergence is a defect. H04: job runner services AND authoritative
+# probe services launch from this ONE property tuple — preview and
+# apply execute under the same NNP-off owner profile. Phase scopes
+# inherit the runner service context and carry no properties of their
+# own, so they are not listed here.
+TRANSIENT_EXEC_PROPERTIES = (
     ("KillMode", "control-group"),
     ("Restart", "no"),
-    # F04: explicit NoNewPrivileges=no. The default is already off, but
-    # the fingerprint binds runner_no_new_privileges=false, so the
-    # launch argv states it outright: job execution must be able to use
-    # the inventoried Hermes sudo path, which no_new_privs would block
-    # (setuid elevation ignored -> sudo fails -> every Hermes system
-    # restart becomes BLOCKED_RESTART_AUTHORITY). Templates mirror this.
+    # F04/H04: explicit NoNewPrivileges=no. The default is already off,
+    # but the fingerprint binds runner/probe_no_new_privileges=false,
+    # so launch argv states it outright: owner execution must be able
+    # to use the inventoried Hermes sudo path, which no_new_privs
+    # would block (setuid elevation ignored -> sudo fails -> every
+    # Hermes system restart becomes BLOCKED_RESTART_AUTHORITY).
+    # Templates mirror this.
     ("NoNewPrivileges", "no"),
 )
+
+TRANSIENT_RUNNER_PROPERTIES = TRANSIENT_EXEC_PROPERTIES
+
+TRANSIENT_PROBE_PROPERTIES = TRANSIENT_EXEC_PROPERTIES
 
 TRANSIENT_SETENV_KEYS = (
     "EGA_CONFIG_FILE",
@@ -489,6 +502,71 @@ def build_transient_cmd(unit, working_dir, env, python, job_id, nonce):
     for prop, val in TRANSIENT_RUNNER_PROPERTIES:
         cmd.append("--property=%s=%s" % (prop, val))
     cmd += [python, "-m", "backend.app.worker.runner", job_id, nonce]
+    return cmd
+
+
+def transient_probe_name(request_id):
+    # type: (str) -> str
+    """Transient probe service unit for one probe request (H04).
+
+    ega-update-probe-<request-stem>.service on the ubuntu user
+    manager. The stem keeps hex/dashes only (probe request ids are
+    UUIDs); anything else fails closed with ValueError — the probe
+    launcher refuses rather than guessing a unit name.
+    """
+    try:
+        stem = "".join(
+            ch for ch in str(request_id or "").replace("-", "")
+            if ch.isalnum()).lower()[:32]
+    except Exception:
+        stem = ""
+    if not stem:
+        raise ValueError("probe request id unusable for a unit name")
+    return "ega-update-probe-%s.service" % stem
+
+
+def build_probe_cmd(service, working_dir, env, python, request_id,
+                    payload_path, result_path, stream_path, op,
+                    deadline_s):
+    # type: (str, str, Dict[str, str], str, str, str, str, str, str, float) -> List[str]
+    """Exact systemd-run --user argv for one authoritative probe (H04).
+
+    A transient SERVICE (never --scope): --wait so the coordinator
+    supervises it exactly like a phase scope, --collect, the shared
+    TRANSIENT_PROBE_PROPERTIES (KillMode=control-group, Restart=no,
+    NoNewPrivileges=no — the same NNP-off owner profile as the job
+    runner), allow-listed --setenv from the same canonical contract
+    env, then the release interpreter running the probe worker.
+    """
+    if not service or not request_id:
+        raise ValueError("service and request_id are required")
+    for token in (working_dir, python, payload_path, result_path,
+                  stream_path):
+        if not token or not isinstance(token, str):
+            raise ValueError("probe launch token missing")
+        if "\0" in token:
+            raise ValueError("probe launch token invalid")
+    if "/" in service or " " in service:
+        raise ValueError("probe service name invalid")
+    cmd = ["systemd-run", "--user", "--wait", "--collect",
+           "--unit=%s" % service,
+           "--working-directory=%s" % working_dir]
+    for key in TRANSIENT_SETENV_KEYS:
+        try:
+            value = (env or {}).get(key, "")
+        except Exception:
+            value = ""
+        if value:
+            cmd.append("--setenv=%s=%s" % (key, value))
+    for prop, val in TRANSIENT_PROBE_PROPERTIES:
+        cmd.append("--property=%s=%s" % (prop, val))
+    cmd += [python, "-m", "backend.app.worker.phase_run",
+            request_id, "probe",
+            "--payload", payload_path, "--result", result_path,
+            "--stream", stream_path,
+            "--deadline-s", "%.1f" % max(1.0, float(deadline_s or 60.0))]
+    if op:
+        cmd += ["--op", str(op)]
     return cmd
 
 

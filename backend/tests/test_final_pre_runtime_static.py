@@ -633,3 +633,222 @@ def test_h03_completion_unreapable_scope_is_timeout(tmp_path,
         env={"PATH": "/usr/bin:/bin"})
     assert ok is False and timed_out is True
     assert "not quiescent after completion" in error
+
+
+# -- H04 probe/apply privilege parity ------------------------------------------
+
+def test_h04_probe_service_name_shapes():
+    from backend.app.owner_env import transient_probe_name
+
+    assert transient_probe_name(
+        "12345678-1234-1234-1234-123456789abc") == \
+        "ega-update-probe-12345678123412341234123456789abc.service"
+    for bad in ("", "!!!", "///", "   "):
+        try:
+            transient_probe_name(bad)
+        except ValueError:
+            continue
+        raise AssertionError("accepted %r" % (bad,))
+
+
+def test_h04_probe_cmd_is_service_not_scope():
+    """Authoritative probe launcher is a transient SERVICE with the
+    shared NNP-off properties — never --scope."""
+    from backend.app.owner_env import (TRANSIENT_PROBE_PROPERTIES,
+                                       TRANSIENT_RUNNER_PROPERTIES,
+                                       build_probe_cmd)
+
+    assert TRANSIENT_PROBE_PROPERTIES is TRANSIENT_RUNNER_PROPERTIES
+    cmd = build_probe_cmd(
+        "ega-update-probe-abc.service", "/rel",
+        {"PATH": "/usr/bin:/bin", "HOME": "/home/ubuntu",
+         "USER": "ubuntu", "LOGNAME": "ubuntu"},
+        "/rel/venv/bin/python", "req-1",
+        "/l/req.payload.json", "/l/req.result.json",
+        "/l/req.stream", "inspect", 60.0)
+    assert "--scope" not in cmd
+    assert "--wait" in cmd
+    assert "--collect" in cmd
+    assert "--unit=ega-update-probe-abc.service" in cmd
+    assert "--property=NoNewPrivileges=no" in cmd
+    assert "--property=KillMode=control-group" in cmd
+    assert "--property=Restart=no" in cmd
+    assert "backend.app.worker.phase_run" in cmd
+    assert "probe" in cmd
+
+
+def test_h04_probe_cmd_rejects_bad_names():
+    from backend.app.owner_env import build_probe_cmd
+
+    for service in ("", "bad name.service", "bad/name.service"):
+        try:
+            build_probe_cmd(
+                service, "/rel", {}, "/rel/venv/bin/python", "req-1",
+                "/a", "/b", "/c", "inspect", 60.0)
+        except ValueError:
+            continue
+        raise AssertionError("accepted %r" % (service,))
+
+
+def test_h04_contract_encodes_probe_runner_truth():
+    from backend.app.owner_env import build_owner_contract
+
+    support_lib.test_release_root()
+    contract = build_owner_contract(None)
+    assert contract.get("runner_no_new_privileges") == "false"
+    assert contract.get("probe_no_new_privileges") == "false"
+    assert contract.get("phase_privilege_source") == "runner"
+    assert contract.get("privilege_profile") == "owner-exec-nnp-off"
+    assert "scope_no_new_privileges" not in contract
+    assert str(contract.get("sudo_profile", "")).startswith("sha256:")
+
+
+def test_h04_privilege_fields_participate_in_fingerprint():
+    from backend.app.owner_env import (build_owner_contract,
+                                       contract_fingerprint)
+
+    support_lib.test_release_root()
+    baseline = contract_fingerprint(build_owner_contract(None))
+    assert baseline
+    for key, value in (("runner_no_new_privileges", "true"),
+                       ("probe_no_new_privileges", "true"),
+                       ("phase_privilege_source", "scope"),
+                       ("privilege_profile", "owner-exec-nnp-on"),
+                       ("sudo_profile", "sha256:tampered")):
+        altered = dict(build_owner_contract(None))
+        altered[key] = value
+        assert contract_fingerprint(altered) not in ("", baseline), key
+
+
+def test_h04_probe_privilege_change_invalidates_plan(tmp_path):
+    """A plan bound under a different probe privilege profile is
+    refused at admission (preview/apply parity is fingerprinted)."""
+    from backend.app.admission import admit
+    from backend.app.owner_env import (build_owner_contract,
+                                       contract_fingerprint)
+
+    support_lib.test_release_root()
+    conn = _fresh_db(tmp_path)
+    row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    altered = dict(build_owner_contract(None))
+    altered["probe_no_new_privileges"] = "true"
+    stale_fp = contract_fingerprint(altered)
+    assert stale_fp
+    conn.execute("UPDATE plans SET env_fingerprint=? WHERE id=?",
+                 (stale_fp, row["id"]))
+    conn.commit()
+    support_lib.test_release_root()
+    _jid, created, err = _admit(conn, row["id"], "k-h04-fp")
+    assert err == "config_changed" and not created, err
+    conn.close()
+
+
+def test_h04_probe_wiring_uses_service_launcher(tmp_path, monkeypatch):
+    """Dispatcher probes execute through run_supervised_probe (the
+    transient-service path), preserving leases/deadlines/sanitize."""
+    from backend.app.worker import dispatch as dispatch_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    support_lib.test_release_root()
+    seen = {}
+
+    def _fake_probe(tool_id, request_id, payload_extra, timeout_s,
+                    settings, log_dir, emit, op="", env=None):
+        seen["argv"] = (tool_id, request_id, op, timeout_s)
+        seen["env"] = dict(env or {})
+        return True, {"activity": "idle"}, "", False
+
+    monkeypatch.setattr(phase_run_lib, "run_supervised_probe",
+                        _fake_probe)
+    status, payload = dispatch_lib._execute_probe_op(
+        "hermes", "inspect", "req-h04")
+    assert status == "ok" and payload.get("activity") == "idle"
+    assert seen["argv"][1] == "req-h04"
+    assert seen["env"].get("USER") == "ubuntu"
+
+    def _fake_timeout(*args, **kwargs):
+        return False, {}, "probe deadline exceeded", True
+
+    monkeypatch.setattr(phase_run_lib, "run_supervised_probe",
+                        _fake_timeout)
+    status, payload = dispatch_lib._execute_probe_op(
+        "hermes", "inspect", "req-h04")
+    assert status == "error"
+
+
+def test_h04_probe_launch_failure_fails_closed(tmp_path, monkeypatch):
+    """Missing systemd-run or an unusable request id refuses the probe
+    without a result."""
+    from backend.app.worker import phase_run as phase_run_lib
+
+    settings = _phase_run_settings(monkeypatch, tmp_path)
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(
+        os.path, "isfile",
+        lambda p: False if p == "/usr/bin/systemd-run" else
+        real_isfile(p))
+    ok, _data, error, timed_out = \
+        phase_run_lib.run_supervised_probe(
+            "hermes", str(uuid.uuid4()), {"op": "inspect"}, 60.0,
+            settings, str(tmp_path), lambda s, line: None,
+            op="inspect", env={"PATH": "/usr/bin:/bin"})
+    assert ok is False and timed_out is False
+    assert "systemd-run" in error
+    ok, _data, error, timed_out = \
+        phase_run_lib.run_supervised_probe(
+            "hermes", "", {"op": "inspect"}, 60.0, settings,
+            str(tmp_path), lambda s, line: None, op="inspect",
+            env={"PATH": "/usr/bin:/bin"})
+    assert ok is False and timed_out is False
+    assert "refused" in error or "unbuildable" in error
+
+
+def test_h04_unstopped_probe_service_blocks_success(tmp_path,
+                                                   monkeypatch):
+    """A probe service that will not stop prevents successful probe
+    completion (H03 exit proof applies to probe services)."""
+    from backend.app import units as units_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    settings = _phase_run_settings(monkeypatch, tmp_path)
+    _patch_phase_spawn(monkeypatch)
+    monkeypatch.setattr(
+        phase_run_lib, "_kill_scope_wait_empty",
+        lambda service, grace: False)
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=5: {"state": "live", "unit": unit,
+                                   "detail": ""})
+    req_id = str(uuid.uuid4())
+    _FakePopen.result_path = os.path.join(
+        str(tmp_path), "%s.probe.result.json" % req_id)
+    _FakePopen.result_body = {"ok": True, "data": {"activity": "idle"}}
+    ok, _data, error, timed_out = \
+        phase_run_lib.run_supervised_probe(
+            "hermes", req_id, {"op": "inspect"}, 60.0, settings,
+            str(tmp_path), lambda s, line: None, op="inspect",
+            env={"PATH": "/usr/bin:/bin"})
+    assert ok is False and timed_out is True
+    assert "probe service not quiescent after completion" in error
+
+
+def test_h04_stopped_probe_service_delivers(tmp_path, monkeypatch):
+    from backend.app import units as units_lib
+    from backend.app.worker import phase_run as phase_run_lib
+
+    settings = _phase_run_settings(monkeypatch, tmp_path)
+    _patch_phase_spawn(monkeypatch)
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=5: {"state": "confirmed_stopped",
+                                   "unit": unit, "detail": ""})
+    req_id = str(uuid.uuid4())
+    _FakePopen.result_path = os.path.join(
+        str(tmp_path), "%s.probe.result.json" % req_id)
+    _FakePopen.result_body = {"ok": True, "data": {"activity": "idle"}}
+    ok, data, error, timed_out = phase_run_lib.run_supervised_probe(
+        "hermes", req_id, {"op": "inspect"}, 60.0, settings,
+        str(tmp_path), lambda s, line: None, op="inspect",
+        env={"PATH": "/usr/bin:/bin"})
+    assert ok is True and timed_out is False, error
+    assert data.get("activity") == "idle"

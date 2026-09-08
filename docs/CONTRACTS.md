@@ -129,10 +129,14 @@ example). Unknown estimates block. No wholesale archiving of the observed
   node/npm/npx/xdg/dbus/locale/nnp-policy/manager-scope/config-identity/
   sudo-profile); runner launch args, probe launch args, and environment
   fingerprint all derive from it — never reconstructed per module.
-  Privilege truth (G04): job execution is NNP-off
-  (`runner/scope_no_new_privileges=false`,
+  Privilege truth (G04/H04): owner execution is NNP-off
+  (`runner/probe_no_new_privileges=false`,
+  `phase_privilege_source=runner`,
   `privilege_profile=owner-exec-nnp-off`) so the inventoried Hermes
-  sudo path can elevate; the fingerprint binds it. Release pointer
+  sudo path can elevate; the fingerprint binds it. Authoritative probes
+  run as transient probe SERVICES with the same NNP-off properties as
+  the runner service (never inherited scopes from the NNP-on
+  dispatcher); phase scopes inherit the runner context. Release pointer
   resolved once per job into `jobs.release_path`;
   preview and apply share it; the phase worker recomputes and refuses
   on mismatch.

@@ -253,12 +253,14 @@ def _sanitize_payload(payload):
 
 def _execute_probe_op(tool_id, op, request_id=""):
     # type: (str, str, str) -> Tuple[str, Dict[str, Any]]
-    """Run one probe op supervised (N10, F03): a worker process inside
-    an owned scope with a monotonic deadline AND the canonical contract
-    env — the exact environment execution phases receive. A hanging
-    read-only probe can never wedge the dispatcher loop.
+    """Run one probe op supervised (N10, F03, H04): a worker process
+    inside a transient probe SERVICE with the same NNP-off owner
+    profile as the job runner — never an inherited scope from the
+    NNP-on dispatcher — plus a monotonic deadline AND the canonical
+    contract env, the exact environment execution phases receive.
+    A hanging read-only probe can never wedge the dispatcher loop.
     Returns (status, payload)."""
-    from .phase_run import run_supervised_phase
+    from .phase_run import run_supervised_probe
     from ..owner_env import build_owner_contract, contract_env
 
     try:
@@ -272,8 +274,8 @@ def _execute_probe_op(tool_id, op, request_id=""):
     except Exception as exc:
         return "error", {"reason": "owner contract unbuildable: %s" % exc}
     try:
-        ok, data, error, timed_out = run_supervised_phase(
-            tool_id, request_id or "probe", "probe", {"op": op},
+        ok, data, error, timed_out = run_supervised_probe(
+            tool_id, request_id or "probe", {"op": op},
             PROBE_OP_TIMEOUT_S, settings, log_dir,
             lambda _s, _l: None, op=op, env=env)
     except Exception as exc:
