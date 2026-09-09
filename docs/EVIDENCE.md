@@ -160,6 +160,13 @@ Evidence pin: implementation SHA
 `6c11ece066219f2aac1b23fbded82bd1aae8f66f` (code + tests +
 substantive docs). This pin commit is docs-only.
 
+Pre-real-update acceptance pin: implementation SHA
+`698557cd078c870beb8375bcad9a7c55496144f4` (all closure code,
+tests, locks, and substantive docs). Acceptance executed at
+`b794c1d` (identical executable content; only docs prose added
+after) plus this docs-only pin. No managed-tool, systemd,
+production, deployment, or main-branch mutation at any point.
+
 ## Main-agent core corrective addendum (senior review R01–R36, Gate A–C)
 
 Branch `feat/v1-implementation`, previous baseline `2e0f898`, this pass
