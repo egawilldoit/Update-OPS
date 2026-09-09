@@ -219,6 +219,25 @@ def test_shell_wrappers_thin_exec():
 
 
 # ---------------------------------------------------------------------------
+# worker unit: explicit user-bus environment (deployment acceptance)
+# ---------------------------------------------------------------------------
+
+def test_worker_unit_user_bus_env():
+    """The worker service runs user-scope systemd proof and --user
+    launches, but system units with User= inherit no XDG/DBUS bus
+    address — without explicit Environment directives every
+    user-scope query fails and reconcile holds forever. Assert the
+    deployed contract on parsed [Service] directives (comments and
+    worker.env overrides aside)."""
+    text = _read_text("systemd", "ega-update-worker.service")
+    directives = [ln.strip() for ln in text.splitlines()
+                  if ln.strip().startswith("Environment=")]
+    assert "Environment=XDG_RUNTIME_DIR=/run/user/1001" in directives
+    assert "Environment=DBUS_SESSION_BUS_ADDRESS=" \
+        "unix:path=/run/user/1001/bus" in directives
+
+
+# ---------------------------------------------------------------------------
 # runner templates: canonical 2-arg form, documentation only
 # ---------------------------------------------------------------------------
 
