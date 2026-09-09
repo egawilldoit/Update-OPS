@@ -7,7 +7,7 @@ Sources: `DOC/PRD-UPDATE SYSTEM.md`, `DOC/SPEC-UPDATE SYSTEM.md`, `DOC/spec_scri
 
 | Area | Owner | Files |
 | --- | --- | --- |
-| Shared contracts, backend core, DB, auth, jobs, manifests | main agent | `docs/CONTRACTS.md`, `backend/app/__init__.py`, `backend/app/config.py`, `backend/app/db.py`, `backend/app/models.py`, `backend/app/schemas.py`, `backend/app/auth.py`, `backend/app/redaction.py`, `backend/app/jobs.py`, `backend/app/main.py` (skeleton only), `backend/app/adapters/base.py`, `backend/requirements.txt`, `backend/requirements.pinned.txt`, `frontend/package.json`, `README.md`, `docs/DEPENDENCIES.md` |
+| Shared contracts, backend core, DB, auth, jobs, manifests | main agent | `docs/CONTRACTS.md`, `backend/app/__init__.py`, `backend/app/config.py`, `backend/app/db.py`, `backend/app/models.py`, `backend/app/schemas.py`, `backend/app/auth.py`, `backend/app/redaction.py`, `backend/app/jobs.py`, `backend/app/main.py` (skeleton only), `backend/app/adapters/base.py`, `backend/requirements.txt`, `backend/requirements.in`, `frontend/package.json`, `frontend/package-lock.json`, `README.md`, `docs/DEPENDENCIES.md` |
 | Frontend + API integration | subagent A | `frontend/**` (except `frontend/package.json` which is frozen), `backend/app/api/**`, `backend/app/main.py` (route wiring only, no schema/contract changes) |
 | Tool adapters + script wrappers | subagent B | `backend/app/adapters/{codex,opencode,hermes,t3,claude}.py`, `backend/app/worker/runner.py` (adapter invocation only), `scripts/*` |
 | systemd / deployment / recovery docs | subagent C | `systemd/*`, `deploy/**`, `docs/RUNBOOK.md`, `docs/INVENTORY.md`, `deploy/etc/inventory.schema.json`, `backend/app/worker/reconcile.py`, `backend/migrations/*` (numbered SQL only) |

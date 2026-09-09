@@ -31,12 +31,18 @@ the TS compiler API. ESLint/typescript-eslint stacks stay out of V1.
 | requests | 2.32.5 | transitive JWKS fetch client (pinned; refresh at deploy if superseded) |
 
 `cryptography` and `starlette` resolve transitively via `PyJWT[crypto]` and
-`fastapi`; their exact versions are recorded by `pip freeze` at release time,
-not invented here.
+`fastapi`; their exact versions plus hashes live in the committed lock
+`backend/requirements.txt` (generated from `backend/requirements.in` with
+`pip-compile --generate-hashes` under Python 3.10; see the `.in` header
+for the exact command). Direct versions are never modernized silently.
 
-## Deferred
+## Locks (committed, reproducible)
 
-No `package-lock.json` / `pip freeze` contents are invented. Generation:
-`npm install --package-lock-only` + `pip freeze` in the deploy environment
-(see `backend/requirements.pinned.txt`). Runtime acceptance not executed in
-this phase, per instruction.
+* Frontend: `frontend/package-lock.json`, generated under Node 24.18.0 /
+  npm 11.19.1. Verify with `rm -rf node_modules && npm ci` (must pass),
+  then `npm run typecheck` and `npm run build`. Regeneration via
+  `npm install --package-lock-only` must not diff unexpectedly.
+* Backend: `backend/requirements.txt` is the hash lock
+  (`pip install --require-hashes -r backend/requirements.txt` must
+  pass in a fresh venv). Direct pins live in `backend/requirements.in`;
+  transitive pins + hashes are resolved output, never hand-edited.
