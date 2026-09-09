@@ -819,6 +819,25 @@ def test_synthetic_release_validates_clean(tmp_path):
     assert _run_validator(mod, tree) == 0
 
 
+def test_synthetic_tunnel_enabled_validates_clean(tmp_path):
+    """Explicit tunnel mode with valid tunnel material passes the FULL
+    8-section validation (installer --enable-tunnel path). Proves the
+    strict tunnel gate admits real inputs — placeholders and missing
+    credentials still fail via the negative matrix."""
+    mod = _load_validator()
+    tree = _synthetic_tree(tmp_path, "syntun")
+    creds = os.path.join(tree["etc"], "cloudflared", "credentials.json")
+    with open(os.path.join(tree["tunnel"]), "w", encoding="utf-8") as fh:
+        fh.write(
+            "tunnel: synthetic-tunnel-abc123\n"
+            "credentials-file: %s\n"
+            "ingress:\n"
+            "  - hostname: console.example.net\n"
+            "    service: http://127.0.0.1:8771\n" % creds)
+    os.chmod(tree["tunnel"], 0o640)
+    assert _run_validator(mod, tree) == 0
+
+
 def test_synthetic_release_negative_matrix(tmp_path):
     """18 rejection scenarios, each failing closed (R12): 17 tree
     mutations plus the rollback-compat case. Every case builds a
