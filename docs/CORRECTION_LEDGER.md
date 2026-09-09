@@ -181,3 +181,55 @@ apply preserves, failed keeps recovery, tampered refused with
 flags/lease intact, live scope holds everything, live delegated
 service holds, crash-after-success E2E → second-job admission.
 Write-only.
+
+# Pre-real-update closure (implementation + non-destructive runtime)
+
+Baseline `114b327`. All fixes below are committed on
+`feat/v1-implementation`; runtime evidence comes only from disposable
+worktrees/venvs/DBs (no managed-tool, systemd, production, or
+deployment mutation).
+
+## Failure ledger closure (29 verified suite failures, all dispositioned)
+
+| Failure(s) | Classification | Fix |
+| --- | --- | --- |
+| h01 rollback / n15 predicate never fires | TEST (upper-vs-lowercase needle) | normalize both sides |
+| n09 / h04 `stale_plan` vs `config_changed` | TEST (row tampering simulates TRACE 8, not drift) | true env-drift simulation via patched contract |
+| opencode/t3/adapter-timeout fakes | TEST (fake drift: missing scope_unit/env) | fakes match current contracts |
+| hermes-sudo / g04-hermes / lifespan / n16 / install-ordering / f15 | TEST (whole-file/prose substring brittleness) | behavioral + directive/command-order assertions |
+| canonical_argv `cmd[-4:]` vs 5 items | TEST (impossible slice) | `cmd[-5:]` |
+| f11 mutation fake | TEST (unbound method) | bound `self` signature |
+| f11 event fake job | TEST (nonexistent job vs intentional FK=ON) | real admitted job fixture |
+| claim/api busy (3) | TEST (raw transition never releases leases per F02) | reconcile+release pattern |
+| drain unknown-plan status | TEST (over-strict 503 pin; refusal preserved as 4xx + no side effects) | 4xx + no-job/no-lease assertions |
+| sanitizer markers (2) | TEST (stale `***REDACTED***` literal) | current contract markers |
+| f05 raw-ledger fixtures (2) | TEST (raw SQL bypasses Python-managed ledger v3 requires) | engine-built states via migrate(target=) |
+| f03 bus variants | TEST (live bus shadows dict overrides) | neutralize bus source in test |
+| validator tmpdir token | TEST (dirname self-collision) | neutral mkdtemp |
+| retention orphan plan | TEST expectation correct; PRODUCT falsy-zero (`or 1`) bug | `or 0` + regression via existing test |
+| t3 staging gate | TEST (registry probe unfaked) | fake `_staging_estimate` |
+| g05 empty-string semantic | PRODUCT vs documented contract | empty/unset/None → `()`; configured paths strict |
+| SSH stale verdict (P2) | PRODUCT (pre-read snapshot) | verdict from persisted re-read |
+| validator SCHEMA_VERSION alias | PRODUCT (validator demanded a name the engine never defined) | CODE_VERSION fallback mirroring compat path |
+| f14 /var/lib writes | ENVIRONMENT coupling in test | hermetic loader patch |
+| concurrent reservation flake | TEST timing (plus stale_plan-vs-busy on reused plan) | Barrier determinism + fresh plan probe; 50/50 green |
+| JWT short key warning | TEST hygiene | 32B synthetic key |
+
+## Product corrections in closure
+
+- G05 final: missing attribute / None / `""` → `()`; non-string →
+  SecretSourceError; configured path read-or-raise. Deployed
+  Settings always carry the V1 default path, so worker/API paths
+  stay fail-closed. Nine behavior tests.
+- SSH reconcile: final verdict re-reads persisted
+  state/unresolved/recovery_required; stale pre-read can no longer
+  print a false UNRESOLVED. Crash-success → exit 0 resolved;
+  ambiguous → nonzero; `--clear-recovery` preserved. Three tests.
+- Retention: orphan-plan cascade `or 1` → `or 0` (falsy-zero guard).
+- Validator: `CODE_VERSION` accepted where `SCHEMA_VERSION` demanded
+  (mirrors the compat path); synthetic 18-scenario negative matrix
+  plus positive case committed as regression.
+- Deps: `frontend/package-lock.json` committed (deterministic across
+  generations); `backend/requirements.in` + hashed
+  `backend/requirements.txt` via pip-tools (no version changes);
+  placeholder `requirements.pinned.txt` removed.

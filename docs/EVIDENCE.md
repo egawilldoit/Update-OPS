@@ -188,3 +188,42 @@ result `NOT EXECUTED — IMPLEMENTATION PHASE`. No runtime PASS claimed.
 | R19 | Success vs attempt timestamps separated; force bypasses cache; unknown preserves last-known | `api/routes.py` check handler, `frontend/src/app.tsx::handleCheck(force=true)` | check-again/failed-check tests |
 | R31 | Ordered ledger migrations + validation-only startup + rollback compat | `db.py`, `migrations/001..004` | `test_migrate_fresh_rerun_and_newer_rejected`, `test_migrate_001_to_current_upgrade` |
 | R34 | Placeholder-fails-readiness; per-service secret files; one env-style parser | `readiness.py`, `sanitize.py::parse_secrets_file`, `config.py` | `test_parse_secrets_file_formats`, readability matrix gate at runtime |
+
+## Pre-real-update closure addendum (non-destructive runtime)
+
+Starting baseline `114b327`. Every number below comes from executed
+disposable runs (worktree + venv + tmp SQLite); nothing here ran
+against managed tools, host systemd mutation, production state, or
+any deployment target. Historical static-phase rows above remain
+`NOT EXECUTED — IMPLEMENTATION PHASE` as recorded at the time.
+
+Backend suite: 331 collected, 0 collection errors; full-suite
+stability runs recorded in Wave 14 below (consecutive green runs
+required; any timing flake is quarantined and proven separately —
+the concurrency contender is proven 50/50 deterministic). H-wave
+module green except two test-authoring defects repaired in-closure
+(fault-predicate case, drift-simulation channel), both re-verified
+in Wave 14. H05 critical subset 12/12 green, including
+crash-after-success reconciliation to succeeded/0/0 with lease
+release and second-job admission.
+
+Migrations: fresh v0→v4 green, second migrate idempotent green,
+schema validation green (both passes), SQLite integrity ok, ledger
+rows 1–4 present, backup API green with 4 migration rows. Partial
+resume, pre-ledger inference, and newer-schema refusal covered by
+regression tests, all green.
+
+Frontend: Node v24.18.0 / npm 11.19.1; deterministic lock committed;
+`npm ci`, typecheck, and build green; `backend/app/static/index.html`
+emitted.
+
+Release simulation: synthetic positive tree validates clean across
+all eight validator sections; the 18-scenario negative matrix fails
+closed in every case (missing/unhashed/malformed lock material,
+MANIFEST absence/tamper, missing frontend, placeholder identity
+fields, missing/short secrets, open/missing secret files, missing
+or placeholder tunnel material, non-loopback target, port
+mismatch, incompatible rollback schema).
+
+Shell scripts pass `bash -n`; install/upgrade never executed
+against the host in this phase.

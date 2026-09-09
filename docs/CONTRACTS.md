@@ -43,7 +43,11 @@ proving unit confirmed-stopped + no execution-marked processes + no
 unresolved delegated mutation, disposes the lease (F02/G02/G03). A
 valid receipt proves outcome, never quiescence. Runner argv is
 `runner <job-id> <nonce>` and refuses
-mismatches with exit 6 before any mutation.
+mismatches with exit 6 before any mutation. Proven successful
+reconciliation atomically persists `succeeded/unresolved=0/
+recovery_required=0` before release (H05-final); the SSH verdict is
+derived from a persisted post-reconciliation re-read, never a
+pre-reconciliation snapshot (SSH-P2).
 
 Steps mirror states plus `not_applicable` only when the adapter declares it in `plan()`
 before execution. Step timeouts come from adapter `plan().timeouts`.
@@ -201,7 +205,10 @@ Frontend: `react==19.2.8`, `react-dom==19.2.8`, `@types/react==19.2.18`,
 `@types/react-dom==19.2.7`, `vite==8.1.5`, `@vitejs/plugin-react==6.1.1`,
 `typescript==7.0.2`. Backend: `fastapi==0.136.1`, `pydantic==2.13.5`,
 `pydantic-settings==2.15.0`, `uvicorn==0.52.4`, `PyJWT==2.13.0` (+`cryptography`
-via `PyJWT[crypto]`), `requests`+`cryptography` resolved at deploy (no invented lockfile).
+via `PyJWT[crypto]`), `requests` (+ transitive pins + hashes, all resolved).
 Python `>=3.10,<3.14`; Node `24.18.0`; npm `11.19.1` (shared runtimes untouched).
-No lockfile contents invented; `pip freeze`/`npm` lock generation is deferred to
-the deploy environment and documented.
+Committed reproducible locks: `frontend/package-lock.json` (Node 24.18.0 /
+npm 11.19.1) and hashed `backend/requirements.txt` generated from
+`backend/requirements.in` via `pip-compile --generate-hashes` under
+Python 3.10 (`pip install --require-hashes` verified); direct versions
+are never modernized silently (see `docs/DEPENDENCIES.md`).

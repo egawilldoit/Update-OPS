@@ -46,3 +46,5 @@ for the exact command). Direct versions are never modernized silently.
   (`pip install --require-hashes -r backend/requirements.txt` must
   pass in a fresh venv). Direct pins live in `backend/requirements.in`;
   transitive pins + hashes are resolved output, never hand-edited.
+  Generation toolchain: Python 3.10.12, pip-tools 7.6.1
+  (`pip-compile --generate-hashes --resolver=backtracking`), PyPI.
