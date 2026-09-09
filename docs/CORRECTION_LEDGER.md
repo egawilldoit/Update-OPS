@@ -258,3 +258,25 @@ kept clean.
   compile/diff review and repaired by immediate follow-up commits
   before final acceptance; the acceptance SHA below contains the
   repaired files, verified green.
+
+# Pre-Cloudflare closure (local install flow, user bus, T3 evidence)
+
+- Installer tunnel decoupling (`--enable-tunnel`; default local
+  validates 7 sections, never enables/starts tunnel; tunnel section
+  stays strict; tunnel-scoped credentials.json optional in secrets
+  table but enforced by the tunnel gate).
+- Worker user-bus drop-in rendered from the tool owner's UID
+  (`render-worker-bus-env.sh`); generic template UID-free; worker
+  verified carrying bus env in production `/proc` + systemd
+  environment. (Supersedes the template-embedded approach.)
+- Credential-table + engine-alias corrections from synthetic
+  validation (CODE_VERSION fallback; already landed).
+- Shell ID-guard quoting repaired in all six operator wrappers +
+  `bash -n` regression.
+- T3: identity proven read-only (unit, versioned child process,
+  socket owner, state files, versions dir); operator inventory
+  written from proven values only; discovery remains fail-closed
+  on the process-token pillar (exact remaining reason recorded;
+  gates not weakened).
+- Provisional Access identity values flagged for the Cloudflare
+  phase; API never exposed beyond loopback.
