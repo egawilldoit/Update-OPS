@@ -183,7 +183,8 @@ def test_shell_scripts_parse_clean():
                                            errors="replace")[:500])
 
 
-def test_shell_wrappers_thin_exec():    for parts in _WRAPPERS:
+def test_shell_wrappers_thin_exec():
+    for parts in _WRAPPERS:
         text = _read_text(*parts)
         name = "/".join(parts)
         # Banned R12 bug pattern: `if ! ...` status-clobber shape. Wrappers
