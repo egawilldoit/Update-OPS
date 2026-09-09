@@ -635,3 +635,279 @@ def test_evidence_no_pass():
     import re
     assert re.search(r"\|\s*PASS\s*\|", text) is None
     assert "MC-01" in text and "MC-10" in text
+
+
+# -- synthetic release validation (Wave 12) ----------------------------------------
+
+def _synthetic_tree(tmp_path, name="synrel"):
+    """Build a minimal VALID synthetic release + etc tree under tmp.
+    No production paths touched. Returns dict of key paths. All
+    strings avoid placeholder tokens (CHANGEME/example.invalid/TODO)
+    so the tree passes the placeholder gates by construction."""
+    import hashlib as _hashlib
+    import shutil as _shutil
+
+    root = str(tmp_path / name)
+    rel = os.path.join(root, "release")
+    etc = os.path.join(root, "etc")
+    os.makedirs(rel, exist_ok=True)
+    os.makedirs(os.path.join(etc, "cloudflared"), exist_ok=True)
+    os.makedirs(os.path.join(rel, "backend", "migrations"),
+                exist_ok=True)
+
+    def _write(path, content, mode):
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(path, mode)
+
+    staged = []
+    # Minimal import-safe package init (validator imports the release
+    # db module; only its SCHEMA_VERSION/migrate/connect surface).
+    _write(os.path.join(rel, "backend", "app", "__init__.py"),
+           '"""Synthetic release package (validator fixture)."""\n', 0o644)
+    staged.append("backend/app/__init__.py")
+    _shutil.copyfile(
+        _repo_path("backend", "app", "db.py"),
+        os.path.join(rel, "backend", "app", "db.py"))
+    os.chmod(os.path.join(rel, "backend", "app", "db.py"), 0o644)
+    staged.append("backend/app/db.py")
+    for fname in ("001_init.sql", "002_execution_hardening.sql",
+                  "003_corrective.sql", "004_leases_env.sql"):
+        _shutil.copyfile(
+            _repo_path("backend", "migrations", fname),
+            os.path.join(rel, "backend", "migrations", fname))
+        staged.append("backend/migrations/%s" % fname)
+    _shutil.copyfile(
+        _repo_path("backend", "requirements.txt"),
+        os.path.join(rel, "backend", "requirements.txt"))
+    staged.append("backend/requirements.txt")
+    _write(os.path.join(rel, "backend", "app", "static", "index.html"),
+           "<html><body>synthetic console</body></html>\n", 0o644)
+    staged.append("backend/app/static/index.html")
+    _write(os.path.join(rel, "systemd", "ega-update-api.service"),
+           "[Service]\nEnvironment=EGA_LISTEN_PORT=8771\n", 0o644)
+    # MANIFEST exactly as staging writes it (sha256sum over backend/**).
+    lines = []
+    for relpath in sorted(staged):
+        if not relpath.startswith("backend/"):
+            continue
+        digest = _hashlib.sha256()
+        with open(os.path.join(rel, relpath), "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        lines.append("%s  %s\n" % (digest.hexdigest(), relpath))
+    _write(os.path.join(rel, "MANIFEST"), "".join(lines), 0o644)
+
+    config = {
+        "team_domain": "https://console-update.example.net",
+        "audience": "synthetic-audience-001",
+        "owner_emails": ["owner@example.net"],
+        "public_origin": "https://console.example.net",
+        "listen_port": 8771,
+        "csrf_secret": "synthetic-csrf-secret-32-chars-min",
+        "state_dir": os.path.join(root, "state"),
+        "db_path": os.path.join(root, "state", "state.db"),
+    }
+    _write(os.path.join(etc, "config.json"),
+           json.dumps(config, sort_keys=True), 0o640)
+    _write(os.path.join(etc, "api.env"), "", 0o640)
+    _write(os.path.join(etc, "worker.env"), "", 0o640)
+    _write(os.path.join(etc, "csrf.secret"),
+           "synthetic-csrf-file-secret-32-chars", 0o600)
+    _write(os.path.join(etc, "tunnel.env"), "", 0o600)
+    _write(os.path.join(etc, "secrets.env"), "", 0o640)
+    _write(os.path.join(etc, "cloudflared", "credentials.json"),
+           '{"tunnel": "synthetic"}', 0o600)
+    tunnel_cfg = os.path.join(etc, "cloudflared", "config.yml")
+    _write(tunnel_cfg,
+           "tunnel: synthetic-tunnel-abc123\n"
+           "credentials-file: %s\n"
+           "ingress:\n"
+           "  - hostname: console.example.net\n"
+           "    service: http://127.0.0.1:8771\n" % os.path.join(
+               etc, "cloudflared", "credentials.json"), 0o640)
+    dropin = os.path.join(root, "10-port.conf")
+    _write(dropin, "[Service]\nEnvironment=EGA_LISTEN_PORT=8771\n",
+           0o644)
+    return {"root": root, "release": rel, "etc": etc,
+            "config": os.path.join(etc, "config.json"),
+            "tunnel": tunnel_cfg, "dropin": dropin}
+
+
+def _run_validator(mod, tree, extra=()):
+    """Run the validator hermetically: snapshot/restore sys.path and
+    the backend modules (check_migrations purges + reimports db)."""
+    saved_path = list(sys.path)
+    saved_mods = {k: v for k, v in sys.modules.items()
+                  if k == "backend" or k.startswith("backend.")}
+    try:
+        return mod.main(["--release", tree["release"],
+                         "--config", tree["config"],
+                         "--skip-owner-check",
+                         "--tunnel-config", tree["tunnel"],
+                         "--port-dropin", tree["dropin"]] + list(extra))
+    finally:
+        sys.path[:] = saved_path
+        for key in [k for k in sys.modules
+                    if k == "backend" or k.startswith("backend.")]:
+            if key not in saved_mods:
+                del sys.modules[key]
+        for key, value in saved_mods.items():
+            sys.modules[key] = value
+
+
+def test_synthetic_release_validates_clean(tmp_path):
+    """Positive case: every validator section passes on a well-formed
+    synthetic tree (R12)."""
+    mod = _load_validator()
+    tree = _synthetic_tree(tmp_path)
+    assert _run_validator(mod, tree) == 0
+
+
+def test_synthetic_release_negative_matrix(tmp_path):
+    """18 rejection scenarios, each failing closed (R12): 17 tree
+    mutations plus the rollback-compat case. Every case builds a
+    fresh tree so failures cannot leak across scenarios."""
+    mod = _load_validator()
+
+    def _fresh():
+        return _synthetic_tree(
+            tmp_path, "synneg-%s" % uuid.uuid4().hex[:8])
+
+    def _write(path, content, mode=0o644):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(path, mode)
+
+    cases = []
+
+    # 1. missing migrations dir.
+    def _c01(tree):
+        import shutil as _shutil
+        _shutil.rmtree(os.path.join(tree["release"], "backend",
+                                    "migrations"))
+    cases.append(_c01)
+    # 2. unhashed requirements.
+    def _c02(tree):
+        _write(os.path.join(tree["release"], "backend",
+                            "requirements.txt"),
+               "fastapi==0.136.1\n")
+    cases.append(_c02)
+    # 3. malformed hash lock (no hashes at all).
+    def _c03(tree):
+        _write(os.path.join(tree["release"], "backend",
+                            "requirements.txt"),
+               "not a lockfile {{{{\n")
+    cases.append(_c03)
+    # 4. missing MANIFEST.
+    def _c04(tree):
+        os.remove(os.path.join(tree["release"], "MANIFEST"))
+    cases.append(_c04)
+    # 5. file modified after MANIFEST.
+    def _c05(tree):
+        with open(os.path.join(tree["release"], "backend", "app",
+                               "static", "index.html"),
+                  "a", encoding="utf-8") as fh:
+            fh.write("tampered")
+    cases.append(_c05)
+    # 6. missing frontend index.
+    def _c06(tree):
+        os.remove(os.path.join(tree["release"], "backend", "app",
+                               "static", "index.html"))
+    cases.append(_c06)
+    # 7-9. placeholder team domain / audience / public origin.
+    for _key, _bad in (("team_domain", "https://CHANGEME.invalid"),
+                       ("audience", "CHANGEME-aud"),
+                       ("public_origin", "https://h.example.invalid")):
+        def _c789(tree, _key=_key, _bad=_bad):
+            with open(tree["config"], "r", encoding="utf-8") as fh:
+                config = json.load(fh)
+            config[_key] = _bad
+            _write(tree["config"], json.dumps(config, sort_keys=True),
+                   0o640)
+        cases.append(_c789)
+    # 10. missing owner.
+    def _c10(tree):
+        with open(tree["config"], "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+        config["owner_emails"] = []
+        _write(tree["config"], json.dumps(config, sort_keys=True),
+               0o640)
+    cases.append(_c10)
+    # 11. missing CSRF secret.
+    def _c11(tree):
+        with open(tree["config"], "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+        config["csrf_secret"] = ""
+        os.remove(os.path.join(tree["etc"], "csrf.secret"))
+        _write(tree["config"], json.dumps(config, sort_keys=True),
+               0o640)
+    cases.append(_c11)
+    # 12. too-open secrets file.
+    def _c12(tree):
+        os.chmod(os.path.join(tree["etc"], "secrets.env"), 0o644)
+    cases.append(_c12)
+    # 13. missing secrets.env.
+    def _c13(tree):
+        os.remove(os.path.join(tree["etc"], "secrets.env"))
+    cases.append(_c13)
+    # 14. missing tunnel credentials.
+    def _c14(tree):
+        os.remove(os.path.join(tree["etc"], "cloudflared",
+                               "credentials.json"))
+    cases.append(_c14)
+    # 15. placeholder tunnel hostname.
+    def _c15(tree):
+        _write(tree["tunnel"],
+               "tunnel: synthetic-tunnel-abc123\n"
+               "credentials-file: %s\n"
+               "ingress:\n"
+               "  - hostname: CHANGEME-update-console.example.invalid\n"
+               "    service: http://127.0.0.1:8771\n" % os.path.join(
+                   tree["etc"], "cloudflared", "credentials.json"),
+               0o640)
+    cases.append(_c15)
+    # 16. non-loopback tunnel target.
+    def _c16(tree):
+        _write(tree["tunnel"],
+               "tunnel: synthetic-tunnel-abc123\n"
+               "credentials-file: %s\n"
+               "ingress:\n"
+               "  - hostname: console.example.net\n"
+               "    service: http://10.0.0.9:8771\n" % os.path.join(
+                   tree["etc"], "cloudflared", "credentials.json"),
+               0o640)
+    cases.append(_c16)
+    # 17. port mismatch.
+    def _c17(tree):
+        _write(tree["dropin"],
+               "[Service]\nEnvironment=EGA_LISTEN_PORT=9999\n", 0o644)
+    cases.append(_c17)
+    assert len(cases) == 17
+    for index, mutate in enumerate(cases):
+        tree = _fresh()
+        mutate(tree)
+        assert _run_validator(mod, tree) != 0, "case %d" % (index + 1)
+    # 18. incompatible rollback schema (different harness:
+    # --check-compat on prior v4 vs candidate v5).
+    import re as _re
+    import shutil as _shutil
+
+    tree = _fresh()
+    path = os.path.join(tree["release"], "backend", "app", "db.py")
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    bumped, count = _re.subn(r"CODE_VERSION\s*=\s*4",
+                             "CODE_VERSION = 5", text, count=1)
+    assert count == 1
+    _write(path, bumped, 0o644)
+    old = os.path.join(tree["root"], "oldrel")
+    os.makedirs(os.path.join(old, "backend", "app"), exist_ok=True)
+    _shutil.copyfile(
+        _repo_path("backend", "app", "db.py"),
+        os.path.join(old, "backend", "app", "db.py"))
+    assert mod._schema_version_of(old) == 4
+    assert mod.main(["--check-compat", old, tree["release"]]) != 0

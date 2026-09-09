@@ -139,6 +139,11 @@ def check_migrations(release):
         return "migration ledger import failed: %s" % str(exc)[:300]
     try:
         ver = getattr(db_mod, "SCHEMA_VERSION", None)
+        if ver is None:
+            # Engine names the constant CODE_VERSION (same contract as
+            # _schema_version_of below); accept either, never block a
+            # real release on the alias.
+            ver = getattr(db_mod, "CODE_VERSION", None)
         if not isinstance(ver, int) or ver < 1:
             return "db SCHEMA_VERSION invalid: %r" % (ver,)
     except Exception as exc:
