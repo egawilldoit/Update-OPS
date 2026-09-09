@@ -57,7 +57,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$PLAN_ID$JOB_ID" in
-    *"/"*|*"\"*|*\.\.*)
+    *"/"*|*"\\"*|*\.\.*)
         echo "update-claude.sh: IDs must not contain path characters" >&2
         exit 2
         ;;

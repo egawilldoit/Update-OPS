@@ -123,7 +123,7 @@ done
 
 # IDs are opaque handles, not paths: reject path characters up front.
 case "$PLAN_ID$JOB_ID$IDEM_KEY" in
-    *"/"*|*"\"*|*\.\.*)
+    *"/"*|*"\\"*|*\.\.*)
         echo "agent-update: IDs must not contain path characters" >&2
         exit 2
         ;;

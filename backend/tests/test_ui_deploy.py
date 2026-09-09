@@ -152,8 +152,38 @@ _WRAPPERS = [
 ]
 
 
-def test_shell_wrappers_thin_exec():
-    for parts in _WRAPPERS:
+def test_shell_scripts_parse_clean():
+    """Every shipped shell entrypoint must parse (`bash -n`): a
+    syntax-broken operator wrapper fails closed at parse time, so
+    this gates the quoting/pattern shapes statically. Read-only
+    check — nothing is executed."""
+    import shutil as _shutil
+    import subprocess as _sp
+
+    if _shutil.which("bash") is None:
+        pytest.skip("bash unavailable")
+    scripts = [
+        ("deploy", "scripts", "install.sh"),
+        ("deploy", "scripts", "upgrade.sh"),
+        ("scripts", "agent-update"),
+        ("scripts", "common.sh"),
+        ("scripts", "update-codex.sh"),
+        ("scripts", "update-hermes.sh"),
+        ("scripts", "update-opencode.sh"),
+        ("scripts", "update-t3.sh"),
+        ("scripts", "update-claude.sh"),
+    ]
+    for parts in scripts:
+        path = _repo_path(*parts)
+        proc = _sp.run(["bash", "-n", path],
+                       stdout=_sp.PIPE, stderr=_sp.PIPE, timeout=60)
+        assert proc.returncode == 0, \
+            "%s: %s" % ("/".join(parts),
+                        proc.stderr.decode("utf-8",
+                                           errors="replace")[:500])
+
+
+def test_shell_wrappers_thin_exec():    for parts in _WRAPPERS:
         text = _read_text(*parts)
         name = "/".join(parts)
         # Banned R12 bug pattern: `if ! ...` status-clobber shape. Wrappers
