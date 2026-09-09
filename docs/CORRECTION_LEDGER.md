@@ -233,3 +233,28 @@ deployment mutation).
   generations); `backend/requirements.in` + hashed
   `backend/requirements.txt` via pip-tools (no version changes);
   placeholder `requirements.pinned.txt` removed.
+
+# Closure acceptance (Wave 14)
+
+Acceptance worktree detached at the pushed candidate; hash-locked
+venv (`--require-hashes`); all gates executed there, primary tree
+kept clean.
+
+- Full suite 3/3 green (342 passed, 0 failed, 0 warnings each).
+- Concurrency contender 50/50 green (barrier-deterministic).
+- H-wave 69/69, H05 critical 12/12 (crash-after-success E2E green).
+- Migration v0→v4 green twice, validation green twice, integrity
+  ok with ledger 1–4, backup green with 4 rows.
+- Frontend (Node 24.18.0 / npm 11.19.1): `npm ci` from the committed
+  lock green, typecheck green, build green with
+  `backend/app/static/index.html` emitted; lock regeneration no-diff.
+- Synthetic release: positive tree validates clean (all 8 sections);
+  18-scenario negative matrix fails closed in every case.
+- Shell: `bash -n` green on deploy scripts, agent wrappers, and
+  common.sh (ID-guard quoting repaired in-closure).
+- Post-acceptance structural repairs: retention try-block
+  restoration and wrapper-test structure restoration. Both defects
+  were introduced by edit tooling, pushed, then caught by
+  compile/diff review and repaired by immediate follow-up commits
+  before final acceptance; the acceptance SHA below contains the
+  repaired files, verified green.

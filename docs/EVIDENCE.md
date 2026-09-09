@@ -197,15 +197,13 @@ against managed tools, host systemd mutation, production state, or
 any deployment target. Historical static-phase rows above remain
 `NOT EXECUTED — IMPLEMENTATION PHASE` as recorded at the time.
 
-Backend suite: 331 collected, 0 collection errors; full-suite
-stability runs recorded in Wave 14 below (consecutive green runs
-required; any timing flake is quarantined and proven separately —
-the concurrency contender is proven 50/50 deterministic). H-wave
-module green except two test-authoring defects repaired in-closure
-(fault-predicate case, drift-simulation channel), both re-verified
-in Wave 14. H05 critical subset 12/12 green, including
-crash-after-success reconciliation to succeeded/0/0 with lease
-release and second-job admission.
+Backend suite: 342 collected, 0 collection errors; full suite
+green 3 consecutive times (342 passed each, 0 warnings), run from a
+detached acceptance worktree in a hash-locked venv
+(`pip install --require-hashes`). Concurrency contender deterministic
+via barrier, proven 50/50. H-wave module 69/69 green; H05 critical
+subset 12/12 green, including crash-after-success reconciliation
+to succeeded/0/0 with lease release and second-job admission.
 
 Migrations: fresh v0→v4 green, second migrate idempotent green,
 schema validation green (both passes), SQLite integrity ok, ledger
