@@ -169,6 +169,70 @@ def test_sanitizer_invalid_utf8_fails_closed():
         stream.feed(b"\xff\xfe invalid \xff\n")
 
 
+# -- disk/backup preconditions (K01-K05, M09) -------------------------------------
+
+def test_space_need_floor_reserve_and_unknown():
+    """R28 budget math: floor dominates tiny estimates, reserve adds,
+    unknown/negative/zero estimates block with reasons."""
+    import types as _types
+    from backend.app.worker import runner as runner_lib
+
+    runner = runner_lib.Runner("job-space", "n")
+    plan = _types.SimpleNamespace(budgets={}, space_fs={},
+                                  required_space_bytes=100)
+    need, _paths, unknown = runner._space_need(plan, {"/x": 50}, 1000,
+                                               200)
+    assert unknown == "" and need == 1000
+    need, _paths, unknown = runner._space_need(
+        plan, {"/x": 5000}, 1000, 200)
+    assert unknown == "" and need == 5200 + 100
+    _need, _paths, unknown = runner._space_need(
+        plan, {"/x": -1}, 1000, 200)
+    assert unknown != ""
+    _need, _paths, unknown = runner._space_need(
+        _types.SimpleNamespace(budgets={}, space_fs={},
+                               required_space_bytes=0),
+        {}, 1000, 200)
+    assert unknown != ""
+
+
+def test_check_disk_allows_and_blocks(tmp_path):
+    """Real filesystem measurement: tiny need passes, impossible
+    need fails closed with a reason (K01-K03)."""
+    from backend.app.adapters import registry as registry_lib
+
+    ok, _detail, _per = registry_lib.check_disk([str(tmp_path)], 1)
+    assert ok is True
+    ok, detail, _per = registry_lib.check_disk([str(tmp_path)],
+                                               10 ** 21)
+    assert ok is False and detail != ""
+
+
+def test_backup_failure_is_explicit(tmp_path):
+    """M09: missing source and unwritable destination fail with an
+    explicit nonzero status — never a success claim, never a
+    corrupt destination accepted as good."""
+    from backend.app import db as db_lib
+
+    # A directory is not a database: explicit failure, no output file.
+    assert db_lib._backup_command(
+        str(tmp_path), str(tmp_path / "out.db")) == 3
+    assert not os.path.exists(str(tmp_path / "out.db"))
+    src = str(tmp_path / "src.db")
+    conn = db_lib.connect(src)
+    assert db_lib.migrate(conn) == db_lib.CODE_VERSION
+    conn.commit()
+    conn.close()
+    locked = str(tmp_path / "locked")
+    os.makedirs(locked, exist_ok=True)
+    os.chmod(locked, 0o500)
+    try:
+        assert db_lib._backup_command(
+            src, os.path.join(locked, "out.db")) == 3
+    finally:
+        os.chmod(locked, 0o700)
+
+
 def test_parse_secrets_file_formats(tmp_path):
     path = str(tmp_path / "s.env")
     with open(path, "w", encoding="utf-8") as fh:
