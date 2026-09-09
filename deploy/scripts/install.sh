@@ -10,7 +10,13 @@
 # script itself is not executed during implementation).
 #
 # Usage: sudo deploy/scripts/install.sh --commit <sha> --release-tarball <path>
-#        [--config deploy/etc/config.example.json]
+#        [--config deploy/etc/config.example.json] [--enable-tunnel]
+#
+# Default (no --enable-tunnel) is a LOCAL install: API + worker + DB with
+# loopback health and NO Cloudflare requirement, enable, or start. The
+# tunnel phase is an explicit later operation. Pass --enable-tunnel only
+# with real tunnel id/hostname/credentials already provisioned; the full
+# tunnel validator (still strict) must pass before anything is enabled.
 #
 # Safety: never modifies tool installations, homes, alternate binaries,
 # service units of managed tools, or tool data dirs. Tool-affecting steps
@@ -54,6 +60,7 @@ QUIESCE_CHECK="$SCRIPT_DIR/../etc/quiescence-check.py"
 COMMIT=""
 TARBALL=""
 CONFIG_SRC="deploy/etc/config.example.json"
+ENABLE_TUNNEL=0
 PREFIX="/opt/ega-update"
 ETC="/etc/ega-update"
 STATE="/var/lib/ega-update"
@@ -65,6 +72,7 @@ while [ $# -gt 0 ]; do
     --commit) COMMIT="$2"; shift 2 ;;
     --release-tarball) TARBALL="$2"; shift 2 ;;
     --config) CONFIG_SRC="$2"; shift 2 ;;
+    --enable-tunnel) ENABLE_TUNNEL=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -382,8 +390,16 @@ echo "[install] staged MANIFEST with $(wc -l < "$RELEASE_DIR/MANIFEST") backend 
 # 5c. Stage validation (R32/R35): validator runs under the release venv
 # with CWD at the release root and EGA_CONFIG_FILE exported. Any block
 # aborts before the symlink switch (drain kept on existing deploys).
+# Local installs validate everything EXCEPT the tunnel section (the
+# tunnel phase is explicitly opted in via --enable-tunnel; the tunnel
+# validator itself stays strict and runs in full when requested).
 cd "$RELEASE_DIR"
-if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR/deploy/etc/validate-release.py" --release "$RELEASE_DIR" --config "$ETC/config.json"; then
+if [ "$ENABLE_TUNNEL" = "1" ]; then
+  VALIDATE_ONLY=""
+else
+  VALIDATE_ONLY="--only migrations,hashes,manifest,frontend,config,secrets,port"
+fi
+if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR/deploy/etc/validate-release.py" --release "$RELEASE_DIR" --config "$ETC/config.json" $VALIDATE_ONLY; then
   echo "[install] stage validation ok"
 else
   fail_keep_drain "stage validation blocked (see validator reason above)"
@@ -431,7 +447,19 @@ printf '[Service]\nEnvironment=EGA_LISTEN_PORT=%s\n' "$EFFECTIVE_PORT" > /etc/sy
 chmod 0644 /etc/systemd/system/ega-update-api.service.d/10-port.conf
 echo "[install] rendered port drop-in 10-port.conf with EGA_LISTEN_PORT=$EFFECTIVE_PORT"
 
-# 8. Systemd units: daemon-reload + enable + start order (api, worker, cloudflared).
+# 7c. Worker user-bus drop-in: derive the tool owner's UID and render an
+# explicit bus address (system units with User= inherit none, yet every
+# user-scope proof and --user launch needs one). The generic template
+# stays UID-free; the renderer fails closed on unresolvable owners.
+mkdir -p /etc/systemd/system/ega-update-worker.service.d
+"$REPO_ROOT/deploy/scripts/render-worker-bus-env.sh" \
+  /etc/systemd/system/ega-update-worker.service.d/10-user-bus.conf \
+  "$TOOL_OWNER" || fail_keep_drain "worker user-bus drop-in failed"
+
+# 8. Systemd units: daemon-reload + enable + start order (api, worker,
+# and — ONLY with --enable-tunnel after full tunnel validation —
+# cloudflared). Without the flag the tunnel unit is neither installed
+# nor enabled nor started; local acceptance needs no Cloudflare.
 # Job units launch via `systemd-run --user` as ubuntu (see RUNBOOK --user
 # launch model); inspect them with `systemctl --user` as ubuntu (with
 # XDG_RUNTIME_DIR set, e.g. via `sudo -u ubuntu -i`), never the system
@@ -439,7 +467,12 @@ echo "[install] rendered port drop-in 10-port.conf with EGA_LISTEN_PORT=$EFFECTI
 cp "$CURRENT_LINK/systemd/ega-update-api.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (api)"
 cp "$CURRENT_LINK/systemd/ega-update-worker.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (worker)"
 cp "$CURRENT_LINK/systemd/ega-update-runner@.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (runner)"
-cp "$CURRENT_LINK/systemd/cloudflared-ega-update.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (tunnel)"
+if [ "$ENABLE_TUNNEL" = "1" ]; then
+  cp "$CURRENT_LINK/systemd/cloudflared-ega-update.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (tunnel)"
+  echo "[install] tunnel unit installed (explicit --enable-tunnel)"
+else
+  echo "[install] tunnel unit NOT installed (local install; pass --enable-tunnel with real tunnel material to add it)"
+fi
 if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
   mkdir -p "/home/$TOOL_OWNER/.config/systemd/user"
   cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" "/home/$TOOL_OWNER/.config/systemd/user/" || fail_keep_drain "user unit copy failed"
@@ -447,12 +480,18 @@ if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
   su -s /bin/bash "$TOOL_OWNER" -c 'systemctl --user daemon-reload' || true
 fi
 systemctl daemon-reload || fail_keep_drain "daemon-reload failed"
-systemctl enable ega-update-api ega-update-worker cloudflared-ega-update || fail_keep_drain "unit enable failed"
+systemctl enable ega-update-api ega-update-worker || fail_keep_drain "unit enable failed (api/worker)"
 
-# 9. Start console services.
+# 9. Start console services. The tunnel starts ONLY under explicit
+# --enable-tunnel (its full validation already passed at stage 5c).
 systemctl start ega-update-api || fail_keep_drain "api start failed"
 systemctl start ega-update-worker || fail_keep_drain "worker start failed"
-systemctl start cloudflared-ega-update || echo "[install] WARN: tunnel failed to start (placeholders expected pre-config) — API/worker unaffected" >&2
+if [ "$ENABLE_TUNNEL" = "1" ]; then
+  systemctl enable cloudflared-ega-update || fail_keep_drain "tunnel enable failed"
+  systemctl start cloudflared-ega-update || echo "[install] WARN: tunnel failed to start despite passing validation — API/worker unaffected, inspect before retry" >&2
+else
+  echo "[install] tunnel NOT enabled/started (local install)" >&2
+fi
 
 # 10. Bounded readiness (R33 step 10): API health via curl localhost plus
 # worker heartbeat freshness via cli status. Both must pass before undrain.

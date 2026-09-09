@@ -38,17 +38,14 @@ WorkingDirectory=/opt/ega-update/current
 # Environment defaults come first so keys in worker.env still win.
 Environment=EGA_CONFIG_FILE=/etc/ega-update/config.json
 EnvironmentFile=/etc/ega-update/worker.env
-# User-bus address (deployment acceptance finding): system units with
-# User= do NOT inherit XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, yet
-# every user-scope proof and every --user launch (systemd-run probes
-# and runners, systemctl --user queries/kills, phase-scope gates)
-# requires them. Without these, reconcile holds forever on unproven
-# quiescence and probes cannot launch. Values pin the frozen
-# tool_owner (ubuntu, uid 1001); worker.env may still override.
-# backend/app/owner_env.systemd_user_bus() remains the portable
-# runtime fallback (CLI/SSH contexts).
-Environment=XDG_RUNTIME_DIR=/run/user/1001
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+# User-bus address (XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS) is NOT
+# hard-coded here: system units with User= inherit no bus address, yet
+# every user-scope proof and --user launch needs one. The installer
+# renders /etc/systemd/system/ega-update-worker.service.d/10-user-bus.conf
+# from the configured tool owner's UID
+# (deploy/scripts/render-worker-bus-env.sh); worker.env may still
+# override. backend/app/owner_env.systemd_user_bus() remains the
+# portable runtime fallback (CLI/SSH contexts).
 ExecStart=/opt/ega-update/current/venv/bin/python -m backend.app.worker.dispatch
 Restart=always
 RestartSec=5

@@ -223,18 +223,20 @@ def test_shell_wrappers_thin_exec():
 # ---------------------------------------------------------------------------
 
 def test_worker_unit_user_bus_env():
-    """The worker service runs user-scope systemd proof and --user
-    launches, but system units with User= inherit no XDG/DBUS bus
-    address — without explicit Environment directives every
-    user-scope query fails and reconcile holds forever. Assert the
-    deployed contract on parsed [Service] directives (comments and
-    worker.env overrides aside)."""
+    """The deployed worker carries an explicit bus address via the
+    rendered drop-in (not template-embedded): the template documents
+    the drop-in mechanism, install.sh renders it from the configured
+    tool owner, and the render script is executable. (Supersedes the
+    earlier template-embedded assertion; see U06.)"""
     text = _read_text("systemd", "ega-update-worker.service")
-    directives = [ln.strip() for ln in text.splitlines()
-                  if ln.strip().startswith("Environment=")]
-    assert "Environment=XDG_RUNTIME_DIR=/run/user/1001" in directives
-    assert "Environment=DBUS_SESSION_BUS_ADDRESS=" \
-        "unix:path=/run/user/1001/bus" in directives
+    assert "10-user-bus.conf" in text
+    assert "render-worker-bus-env" in text
+    install = _read_text("deploy", "scripts", "install.sh")
+    assert "render-worker-bus-env.sh" in install
+    assert "10-user-bus.conf" in install
+    assert os.access(os.path.join(
+        _REPO_ROOT, "deploy", "scripts",
+        "render-worker-bus-env.sh"), os.X_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -961,3 +963,187 @@ def test_synthetic_release_negative_matrix(tmp_path):
         os.path.join(old, "backend", "app", "db.py"))
     assert mod._schema_version_of(old) == 4
     assert mod.main(["--check-compat", old, tree["release"]]) != 0
+
+
+# -- installer tunnel decoupling (Part A: I01-I08) ---------------------------------
+
+def _install_text():
+    return _read_text("deploy", "scripts", "install.sh")
+
+
+def test_installer_default_stage_skips_tunnel():
+    """I01: default/local stage validation covers the local sections
+    and never the tunnel section (tunnel runs only under the flag)."""
+    text = _install_text()
+    assert "--enable-tunnel" in text
+    assert "--only migrations,hashes,manifest,frontend,config,secrets,port" \
+        in text
+    # The only un-scoped (full) validation path is the tunnel branch.
+    assert "tunnel" not in "--only migrations,hashes,manifest,frontend," \
+        "config,secrets,port"
+
+
+def _enable_tunnel_blocks(text):
+    """Line ranges guarded by `if [ \"$ENABLE_TUNNEL\" = \"1\" ]`."""
+    blocks = []
+    lines = text.splitlines()
+    depth = 0
+    guard_start = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == 'if [ "$ENABLE_TUNNEL" = "1" ]; then':
+            if depth == 0:
+                guard_start = idx
+            depth += 1
+            continue
+        if stripped == "fi" and depth > 0:
+            depth -= 1
+            if depth == 0 and guard_start is not None:
+                blocks.append((guard_start, idx))
+                guard_start = None
+    return blocks
+
+
+def _in_guarded_block(blocks, lineno):
+    return any(start <= lineno <= end for start, end in blocks)
+
+
+def test_installer_tunnel_units_gated():
+    """I02/I06: tunnel unit install/enable/start occur ONLY inside
+    --enable-tunnel blocks; api/worker enable/start stay unconditional."""
+    text = _install_text()
+    blocks = _enable_tunnel_blocks(text)
+    assert blocks, "no --enable-tunnel blocks found"
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if "cloudflared-ega-update" not in line:
+            continue
+        if "systemctl" not in line and "cp " not in line:
+            continue
+        assert _in_guarded_block(blocks, idx), \
+            "unguarded tunnel operation at line %d: %s" % (idx + 1, line)
+    # Combined api+worker+tunnel enable is gone (I02).
+    assert "systemctl enable ega-update-api ega-update-worker " \
+        "cloudflared-ega-update" not in text
+    assert "systemctl enable ega-update-api ega-update-worker" in text
+    assert "systemctl start ega-update-api" in text
+    assert "systemctl start ega-update-worker" in text
+
+
+def test_installer_tunnel_mode_full_validation():
+    """I03/I04/I05: explicit tunnel mode runs the complete validator
+    (no section exclusion), so placeholder hostnames and missing
+    credentials fail closed there. Strictness itself is proven by the
+    synthetic negative matrix (placeholder-host/missing-creds cases)."""
+    text = _install_text()
+    assert 'VALIDATE_ONLY=""' in text
+    # The exclusion list never names the tunnel section.
+    assert "--only" in text
+    for line in text.splitlines():
+        if "--only" in line and "VALIDATE_ONLY=" not in line:
+            assert "tunnel" not in line, line
+
+
+def test_installer_local_upgrade_unchanged():
+    """I07: api/worker install/enable/start behavior is unchanged for
+    the default path (no flag threading through their commands)."""
+    text = _install_text()
+    assert "cp \"$CURRENT_LINK/systemd/ega-update-api.service\"" in text
+    assert "cp \"$CURRENT_LINK/systemd/ega-update-worker.service\"" in text
+    assert "cp \"$CURRENT_LINK/systemd/ega-update-runner@.service\"" in text
+
+
+# -- worker user-bus drop-in (Part C: U01-U09) --------------------------------------
+
+def _render_script():
+    return os.path.join(_REPO_ROOT, "deploy", "scripts",
+                        "render-worker-bus-env.sh")
+
+
+def _run_render(dest, owner):
+    import subprocess as _sp
+    return _sp.run([_render_script(), dest, owner],
+                   stdout=_sp.PIPE, stderr=_sp.PIPE, timeout=60)
+
+
+def test_user_bus_derives_tool_owner_uid(tmp_path):
+    """U01/U02/U07: the UID comes from the configured tool owner and
+    the rendered drop-in exactly matches `id -u` reality."""
+    import subprocess as _sp
+
+    dest = str(tmp_path / "10-user-bus.conf")
+    proc = _run_render(dest, "ubuntu")
+    assert proc.returncode == 0, proc.stderr.decode()[:300]
+    expected_uid = _sp.run(["id", "-u", "ubuntu"], stdout=_sp.PIPE,
+                           timeout=30).stdout.decode().strip()
+    assert expected_uid.isdigit()
+    with open(dest, "r", encoding="utf-8") as fh:
+        content = fh.read()
+    assert content == (
+        "[Service]\n"
+        "Environment=XDG_RUNTIME_DIR=/run/user/%s\n"
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus\n"
+        % (expected_uid, expected_uid))
+
+
+def test_user_bus_alternate_uid(tmp_path):
+    """U03: a different real UID renders different correct paths —
+    no hard-coded 1001 anywhere. Uses the ega-update service account
+    when present (skips cleanly on hosts without it)."""
+    import subprocess as _sp
+
+    probe = _sp.run(["id", "-u", "ega-update"], stdout=_sp.PIPE,
+                    stderr=_sp.PIPE, timeout=30)
+    if probe.returncode != 0:
+        pytest.skip("ega-update account absent on this host")
+    expected_uid = probe.stdout.decode().strip()
+    assert expected_uid.isdigit()
+    dest = str(tmp_path / "10-user-bus.conf")
+    proc = _run_render(dest, "ega-update")
+    assert proc.returncode == 0, proc.stderr.decode()[:300]
+    with open(dest, "r", encoding="utf-8") as fh:
+        content = fh.read()
+    assert content == (
+        "[Service]\n"
+        "Environment=XDG_RUNTIME_DIR=/run/user/%s\n"
+        "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus\n"
+        % (expected_uid, expected_uid))
+    # A genuinely different account must not render ubuntu's paths.
+    if expected_uid != "1001":
+        assert "/run/user/1001" not in content
+
+
+def test_user_bus_missing_owner_fails_closed(tmp_path):
+    """U04/U05: unresolvable owner (or unusable UID) blocks with no
+    file written."""
+    dest = str(tmp_path / "10-user-bus.conf")
+    proc = _run_render(dest, "no-such-user-ega-xyz")
+    assert proc.returncode != 0
+    assert not os.path.exists(dest)
+
+
+def test_worker_template_has_no_hardcoded_uid():
+    """U06: the generic checked-in template carries no VM-specific
+    /run/user/<uid> (rendered per-install into the drop-in)."""
+    text = _read_text("systemd", "ega-update-worker.service")
+    assert "/run/user/1001" not in text
+    assert "/run/user/" not in text
+
+
+def test_owner_env_fallback_functional():
+    """U08: the Python fallback still resolves the live bus for
+    CLI/SSH contexts without unit environment."""
+    from backend.app.owner_env import systemd_user_bus
+
+    bus = systemd_user_bus("ubuntu")
+    assert bus.get("XDG_RUNTIME_DIR", "").startswith("/run/user/")
+    assert bus.get("DBUS_SESSION_BUS_ADDRESS", "").startswith(
+        "unix:path=/run/user/")
+
+
+def test_worker_security_properties_intact():
+    """U09: bus env changes nothing about the worker security posture
+    directives in the template."""
+    text = _read_text("systemd", "ega-update-worker.service")
+    assert "NoNewPrivileges=true" in text
+    assert "User=ubuntu" in text
