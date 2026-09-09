@@ -549,16 +549,17 @@ def run_retention(conn, settings):
                         still = conn.execute(
                             "SELECT COUNT(*) AS n FROM jobs WHERE plan_id=?",
                             (plan_id,)).fetchone()
-                        n = int(dict(still).get("n", 1) or 1) \
-                            if still is not None else 1
+                    # Falsy-zero guard: a 0 count must stay 0 (an
+                    # `or 1` here would make orphan plans immortal).
+                    n = int(dict(still).get("n", 0) or 0) \
+                        if still is not None else 0
                     except Exception:
                         n = 1
                     if n == 0:
                         try:
                             conn.execute(
                                 "DELETE FROM plans WHERE id=?", (plan_id,))
-                            result["deleted_plans"] += 1
-                            _tombstone("plan", plan_id, "metadata-90d-orphan")
+                            result["deleted_plans"] += 1                            _tombstone("plan", plan_id, "metadata-90d-orphan")
                         except Exception as exc:
                             _err("plan %s: %s" % (plan_id, exc))
                 try:

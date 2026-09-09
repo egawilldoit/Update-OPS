@@ -148,6 +148,9 @@ def test_t3_exact_mismatch_fails(monkeypatch):
     }
     monkeypatch.setattr(adapter, "_inventory", lambda: dict(fake_info))
     monkeypatch.setattr(adapter, "_inventory_gate", lambda _i: (True, ""))
+    # Staging probe mocked (like every other probe here): the test
+    # targets version-mismatch handling, not npm registry access.
+    monkeypatch.setattr(adapter, "_staging_estimate", lambda: 1000)
 
     class _FakeInspect(object):
         fingerprint = ""
