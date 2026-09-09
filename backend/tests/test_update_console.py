@@ -122,6 +122,10 @@ def test_concurrent_reservation_single_slot(tmp_path):
     plan_ids = [str(uuid.uuid4()) for _ in range(8)]
     for pid in plan_ids:
         _insert_plan(setup, pid)
+    # Ninth plan stays fresh: the final held-slot probe must contend
+    # on the LEASE (busy), not on a consumed plan (stale_plan).
+    fresh_plan = str(uuid.uuid4())
+    _insert_plan(setup, fresh_plan)
     setup.close()
 
     n = len(plan_ids)
@@ -148,9 +152,10 @@ def test_concurrent_reservation_single_slot(tmp_path):
     for o in out:
         if o[0] == "err":
             assert o[3] == "busy", o
-    # Slot is held: a further reservation must also see busy.
+    # Slot is held: a further reservation on a FRESH plan must also
+    # see busy (lease contention, not plan staleness).
     extra = [None]  # type: ignore
-    _reserve_in_tx(db_path, "hermes", plan_ids[0],
+    _reserve_in_tx(db_path, "hermes", fresh_plan,
                    "owner@example.invalid", "extra-key", False, extra, 0)
     assert extra[0][0] == "err" and extra[0][3] == "busy"
 
