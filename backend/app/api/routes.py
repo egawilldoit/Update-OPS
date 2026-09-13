@@ -1339,6 +1339,46 @@ async def post_job(request: Request):
             422, "invalid_request", "activity_ack must be boolean", "")
     conn = _db()
     try:
+        # D4: replay-first in the HTTP path. An identical retry (same
+        # subject + Idempotency-Key + request hash) is answered BEFORE
+        # any new-admission prerequisite: no expiry sweep, no plan load,
+        # no owner probe, no worker heartbeat, no drain/recovery gate.
+        # Only a genuinely new admission runs those prerequisites.
+        try:
+            from ..admission import admit, lookup_replay
+        except Exception:
+            try:
+                from backend.app.admission import (  # type: ignore[no-redef]
+                    admit, lookup_replay)
+            except Exception:
+                return deps.error_envelope(
+                    503, "unavailable", "admission unavailable", "")
+        try:
+            _replay_id, _replay_err = lookup_replay(
+                conn, subject or "", idem_key, plan_id, ack)
+        except Exception:
+            _replay_id, _replay_err = "", "unavailable"
+        if _replay_err == "":
+            _replay_row = conn.execute(
+                "SELECT * FROM jobs WHERE id=?", (_replay_id,)).fetchone()
+            if _replay_row is None:
+                return deps.error_envelope(
+                    503, "unavailable", "job reservation lost", "")
+            _replay_view = _job_view(_replay_row)
+            _replay_view["backup_summary"] = _backup_summary(
+                conn, _replay_id)
+            _replay_view["replayed"] = True
+            return _ok(_replay_view)
+        if _replay_err == "conflict":
+            return deps.error_envelope(
+                409, "conflict",
+                "Idempotency-Key already used with different payload",
+                "")
+        if _replay_err not in ("no_replay", "invalid_request"):
+            # The lookup could not be proven: fail closed (503) instead
+            # of treating it as no-replay and risking a duplicate.
+            return deps.error_envelope(
+                503, "unavailable", "replay lookup unavailable", "")
         # Safe sweep of never-claimed reservations (accepted + past claim
         # deadline + empty nonce only; claimed rows untouched).
         try:
@@ -1387,14 +1427,6 @@ async def post_job(request: Request):
         # One shared admission service (N14/N15): replay-first, gates,
         # atomic reserve + plan-consume + mutation lease. API and CLI
         # call the identical function with owner-gathered evidence.
-        try:
-            from ..admission import admit
-        except Exception:
-            try:
-                from backend.app.admission import admit  # type: ignore[no-redef]
-            except Exception:
-                return deps.error_envelope(
-                    503, "unavailable", "admission unavailable", "")
         try:
             _hb = jobs_lib.read_dispatcher_heartbeat(
                 settings.state_dir, max_age_s=20)
