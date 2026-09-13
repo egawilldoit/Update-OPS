@@ -14,6 +14,18 @@ from typing import List
 
 PLACEHOLDER_PREFIXES = ("CHANGEME", "REPLACE-ME", "EXAMPLE", "TODO")
 
+# D2 classification: every check validate_startup() currently performs is
+# FATAL. The service either cannot authenticate/authorize (placeholder
+# team_domain/audience/owner_emails/public_origin), cannot mint CSRF tokens
+# (unresolved csrf_secret), cannot redact/durably record (unreadable
+# secrets_file), cannot trust installation facts (unparsable inventory),
+# cannot launch an owner process (missing executable / unresolvable
+# release), or cannot read its own config (deploy role's EGA_CONFIG_FILE).
+# None is advisory, so all land in `violations` and raise ReadinessError.
+# The `warnings` channel is preserved for genuinely non-fatal advisories;
+# it is currently always empty. There is no "report-only" mode: a caller
+# that silently ignores fatal violations would serve unsafe traffic.
+
 
 class ReadinessError(Exception):
     """Startup must fail; carries the list of violations."""
@@ -63,8 +75,14 @@ def _euid():
 
 def validate_startup(role="api", settings=None):
     # type: (str, object) -> List[str]
-    """Validate readiness for role. Returns warnings; raises ReadinessError
-    on violations (startup must fail)."""
+    """Validate readiness for role.
+
+    Every violation this function detects is FATAL (see module-level
+    classification note) and raises ReadinessError carrying the full
+    `violations` list, so API/worker startup fails closed. Returns the
+    non-fatal `warnings` list (currently always empty) on success.
+    Messages name fields/paths only; secret CONTENTS are never included.
+    """
     try:
         from .config import settings as _defaults
     except Exception:
@@ -119,4 +137,6 @@ def validate_startup(role="api", settings=None):
         cfg = os.environ.get("EGA_CONFIG_FILE", "") or \
             "/etc/ega-update/config.json"
         check_readable(cfg, "EGA_CONFIG_FILE", violations)
+    if violations:
+        raise ReadinessError(violations)
     return warnings

@@ -699,6 +699,23 @@ def _maybe_retain(conn):
         pass
 
 
+def _validate_or_exit(role):
+    # type: (str) -> None
+    """D2 startup gate: run readiness for role and fail closed.
+
+    Extracted from main() so the gate is directly testable without the
+    dispatcher loop or DB connect. Behavior unchanged: any readiness
+    failure (ReadinessError or any other exception) becomes a SystemExit
+    whose message names fields/paths only, never secret contents. A clean
+    check returns None and startup continues.
+    """
+    try:
+        from ..readiness import validate_startup
+        validate_startup(role, settings)
+    except Exception as exc:
+        raise SystemExit("worker readiness failed: %s" % exc)
+
+
 def main():
     # type: () -> None
     global _lock_fh
@@ -717,11 +734,7 @@ def main():
                 continue
     except Exception:
         pass
-    try:
-        from ..readiness import ReadinessError, validate_startup
-        validate_startup("worker", settings)
-    except Exception as exc:
-        raise SystemExit("worker readiness failed: %s" % exc)
+    _validate_or_exit("worker")
     conn = connect(settings.db_path)
     try:
         validate_schema(conn)
