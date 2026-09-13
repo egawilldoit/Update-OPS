@@ -25,9 +25,12 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import uuid
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
@@ -824,4 +827,360 @@ def test_probe_status_endpoint_reads_durable_state(tmp_path, monkeypatch):
     assert body2.get("pending") is False
     assert body2.get("status") == "ok"
     assert body2.get("observation_applied") is True
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# W3.1: RESULT VISIBLE != OBSERVATION APPLIED
+# ---------------------------------------------------------------------------
+
+def _wait_for_queued_request(conn, tool_id="hermes", timeout_s=5.0):
+    # type: (object, str, float) -> str
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        row = conn.execute(
+            "SELECT id FROM probe_requests WHERE tool_id=? AND op='refresh'"
+            " AND state='queued' ORDER BY created_at LIMIT 1",
+            (tool_id,)).fetchone()
+        if row is not None:
+            return str(row["id"])
+        time.sleep(0.02)
+    raise AssertionError("helper never enqueued a probe request")
+
+
+def _applied_marker(conn, request_id):
+    # type: (object, str) -> bool
+    """The durable applied marker: probe_requests.result_id == the
+    finished_at token of the stored result."""
+    row = conn.execute(
+        "SELECT pr.result_id AS marker, res.finished_at AS finished_at"
+        " FROM probe_requests pr JOIN probe_results res"
+        " ON res.request_id=pr.id WHERE pr.id=?",
+        (request_id,)).fetchone()
+    if row is None:
+        return False
+    finished = str(row["finished_at"] or "")
+    return bool(finished) and str(row["marker"] or "") == finished
+
+
+def test_visible_unapplied_result_helper_returns_pending(
+        tmp_path, monkeypatch):
+    """A stored result whose coordinator apply has not committed must not
+    be reported as ok: the bounded helper returns pending + durable id."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    monkeypatch.setattr(probes_lib, "OBSERVATION_APPLY_WAIT_S", 0.3,
+                        raising=False)
+    conn = _fresh_db(db_path)
+    _seed_good_observation(conn)
+    out = {}
+
+    def _waiter():
+        out["r"] = probes_lib.request_owner_probe_handle(
+            "hermes", "refresh", timeout_s=10.0)
+
+    waiter = threading.Thread(target=_waiter)
+    waiter.start()
+    try:
+        rid = _wait_for_queued_request(conn)
+        assert probes_lib.claim_probe(conn, "test-coordinator")
+        # Result visible; observation application never ran (crash window).
+        assert probes_lib.finish_probe(conn, rid, "ok", _payload("2.0.0"))
+        assert _applied_marker(conn, rid) is False
+    finally:
+        waiter.join(10)
+    assert not waiter.is_alive()
+    status, payload, handle = out["r"]
+    assert status == "pending", (status, payload)
+    assert handle == rid
+    # The old card is untouched: application is still pending.
+    assert _tool_row(conn)["observed_version"] == "1.18.30"
+    conn.close()
+
+
+def test_route_apply_failure_never_caches_or_reports_fresh(
+        tmp_path, monkeypatch):
+    """Route-level: a result stored but not applied returns the cached card
+    labeled pending with the durable handle, and never seeds the
+    in-process freshness cache. A later reconcile applies it durably."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    _auth_ok(monkeypatch)
+    monkeypatch.setattr(probes_lib, "OBSERVATION_APPLY_WAIT_S", 0.3,
+                        raising=False)
+    conn = _fresh_db(db_path)
+    _seed_good_observation(conn)
+    _patch_supervised_ok(monkeypatch, payload=_payload("2.0.0"))
+    observation = _observation_module()
+    real_apply = observation.apply_probe_result
+    fail = {"on": True}
+
+    def _flaky_apply(c, request_id):
+        if fail["on"]:
+            return False
+        return real_apply(c, request_id)
+
+    monkeypatch.setattr(observation, "apply_probe_result", _flaky_apply)
+    coord = {}
+
+    def _coordinator():
+        c = db_lib.connect(db_path)
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if dispatch_lib.run_probe_queue(c) == 1:
+                    coord["processed"] = True
+                    return
+                time.sleep(0.01)
+            coord["error"] = "probe never processed"
+        finally:
+            c.close()
+
+    coordinator = threading.Thread(target=_coordinator)
+    coordinator.start()
+    try:
+        resp = _run(routes_lib.post_tool_check("hermes", _check_req()))
+    finally:
+        coordinator.join(10)
+    assert "error" not in coord, coord
+    assert resp.status_code == 200
+    body = _resp_json(resp)
+    assert body.get("probe_pending") is True, body
+    rid = body.get("probe_request_id")
+    assert rid
+    assert body.get("installed_version") == "1.18.30"
+    assert body.get("health") == "stale"
+    assert routes_lib._DISCOVERY_CACHE == {}, "unapplied result was cached"
+    assert _applied_marker(conn, rid) is False
+    # The coordinator recovers later: reconcile applies exactly once.
+    fail["on"] = False
+    assert observation.reconcile_observations(conn) == 1
+    assert _applied_marker(conn, rid) is True
+    poll = _resp_json(routes_lib.get_probe(rid, _FakeRequest()))
+    assert poll.get("observation_applied") is True
+    assert poll.get("status") == "ok"
+    card = routes_lib._read_tool_card(conn, "hermes")
+    assert card["installed_version"] == "2.0.0"
+    assert card["health"] == "healthy"
+    conn.close()
+
+
+def test_apply_write_contention_returns_pending_not_false_completion(
+        tmp_path, monkeypatch):
+    """A visible result whose apply is delayed by an unrelated writer
+    returns pending (not false completion); once contention clears the
+    apply commits and the durable marker is readable."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    _auth_ok(monkeypatch)
+    monkeypatch.setattr(probes_lib, "OBSERVATION_APPLY_WAIT_S", 0.3,
+                        raising=False)
+    conn = _fresh_db(db_path)
+    _seed_good_observation(conn)
+    observation = _observation_module()
+    out = {}
+
+    def _waiter():
+        out["r"] = probes_lib.request_owner_probe_handle(
+            "hermes", "refresh", timeout_s=10.0)
+
+    waiter = threading.Thread(target=_waiter)
+    waiter.start()
+    blocker = None
+    coord_conn = None
+    try:
+        rid = _wait_for_queued_request(conn)
+        assert probes_lib.claim_probe(conn, "test-coordinator")
+        assert probes_lib.finish_probe(conn, rid, "ok", _payload("2.0.0"))
+        # An unrelated writer holds the single SQLite write lock.
+        blocker = db_lib.connect(db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        coord_conn = db_lib.connect(db_path)
+        coord_conn.execute("PRAGMA busy_timeout=200")
+        # The coordinator apply is delayed by contention and fails
+        # closed: no applied marker is written.
+        assert observation.apply_probe_result(coord_conn, rid) is False
+        waiter.join(10)
+        assert not waiter.is_alive()
+        status, payload, handle = out["r"]
+        assert status == "pending", (status, payload)
+        assert handle == rid
+        assert _applied_marker(conn, rid) is False
+        # Contention clears: the recorded result applies later.
+        blocker.execute("ROLLBACK")
+        blocker.close()
+        blocker = None
+        assert observation.apply_probe_result(coord_conn, rid) is True
+        assert _applied_marker(conn, rid) is True
+        body = _resp_json(routes_lib.get_probe(rid, _FakeRequest()))
+        assert body.get("observation_applied") is True
+        assert body.get("status") == "ok"
+        assert _tool_row(conn)["observed_version"] == "2.0.0"
+    finally:
+        if blocker is not None:
+            try:
+                blocker.execute("ROLLBACK")
+            except Exception:
+                pass
+            try:
+                blocker.close()
+            except Exception:
+                pass
+        if coord_conn is not None:
+            coord_conn.close()
+        if waiter.is_alive():
+            waiter.join(10)
+    conn.close()
+
+
+def test_fast_applied_path_returns_new_card_and_caches(
+        tmp_path, monkeypatch):
+    """Normal fast path: result stored AND applied within the bounded
+    wait -> the route returns the new observation as fresh (and caches
+    the freshness snapshot)."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    _auth_ok(monkeypatch)
+    monkeypatch.setattr(probes_lib, "OBSERVATION_APPLY_WAIT_S", 5.0,
+                        raising=False)
+    conn = _fresh_db(db_path)
+    _seed_good_observation(conn)
+    _patch_supervised_ok(monkeypatch, payload=_payload("2.0.0"))
+    coord = {}
+
+    def _coordinator():
+        c = db_lib.connect(db_path)
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if dispatch_lib.run_probe_queue(c) == 1:
+                    coord["processed"] = True
+                    return
+                time.sleep(0.01)
+            coord["error"] = "probe never processed"
+        finally:
+            c.close()
+
+    coordinator = threading.Thread(target=_coordinator)
+    coordinator.start()
+    try:
+        resp = _run(routes_lib.post_tool_check("hermes", _check_req()))
+    finally:
+        coordinator.join(10)
+    assert "error" not in coord, coord
+    assert resp.status_code == 200
+    body = _resp_json(resp)
+    assert body.get("probe_pending") is False
+    assert body.get("installed_version") == "2.0.0"
+    assert body.get("health") == "healthy"
+    assert routes_lib._DISCOVERY_CACHE, "applied result must be cached"
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# W3.1: probe worker liveness is part of worker health
+# ---------------------------------------------------------------------------
+
+def test_probe_worker_startup_db_failure_is_not_healthy(
+        tmp_path, monkeypatch):
+    """A probe executor whose DB connect fails at startup never reports
+    ready, and the supervisor gate fails closed with SystemExit."""
+    _state, _db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    bad = str(tmp_path / "not-a-db")
+    os.makedirs(bad, exist_ok=True)  # a directory: sqlite cannot open it
+    worker = dispatch_lib.ProbeWorker(bad, interval_s=0.05)
+    worker.start(timeout_s=1.0)
+    assert worker.is_ready() is False
+    assert worker.startup_error()
+    with pytest.raises(SystemExit):
+        dispatch_lib._require_probe_worker(worker)
+
+
+def test_probe_worker_death_after_start_raises_supervisor_gate(
+        tmp_path, monkeypatch):
+    """A required probe executor that dies after startup must terminate
+    the dispatcher (SystemExit), never leave a green heartbeat forever."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    _fresh_db(db_path).close()
+    worker = dispatch_lib.ProbeWorker(db_path, interval_s=0.05)
+    worker.start()
+    assert worker.is_ready()
+    assert dispatch_lib._require_probe_worker(worker) is None
+    worker.stop(timeout_s=2.0)
+    assert not worker.is_alive()
+    assert not worker.is_ready()
+    with pytest.raises(SystemExit):
+        dispatch_lib._require_probe_worker(worker)
+
+
+def test_healthy_probe_worker_keeps_dispatcher_gate_open(
+        tmp_path, monkeypatch):
+    """A live, connected executor passes the gate across loop cadence
+    while the dispatcher heartbeat keeps advancing."""
+    state_dir, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    _fresh_db(db_path).close()
+    worker = dispatch_lib.ProbeWorker(db_path, interval_s=0.05)
+    worker.start()
+    try:
+        for _ in range(3):
+            assert worker.is_ready()
+            assert dispatch_lib._require_probe_worker(worker) is None
+            dispatch_lib._write_dispatcher_heartbeat()
+            assert jobs_lib.read_dispatcher_heartbeat(
+                state_dir, max_age_s=20)
+            time.sleep(0.1)
+    finally:
+        worker.stop(timeout_s=2.0)
+
+
+def test_probe_worker_failure_cannot_release_unresolved_probe_lease(
+        tmp_path, monkeypatch):
+    """A dead/never-ready executor must not resolve exclusion: an
+    unresolved probe lease remains held and mutation admission stays
+    refused."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    conn = _fresh_db(db_path)
+    rid = probes_lib.enqueue_probe(conn, "api", "hermes", "refresh")
+    assert probes_lib.claim_probe(conn, "dispatcher-dead")
+    lease = leases_lib.acquire_probe_lease(
+        conn, "hermes", "dispatcher-dead", request_id=rid)
+    assert lease
+    bad = str(tmp_path / "not-a-db")
+    os.makedirs(bad, exist_ok=True)
+    worker = dispatch_lib.ProbeWorker(bad, interval_s=0.05)
+    worker.start(timeout_s=1.0)
+    with pytest.raises(SystemExit):
+        dispatch_lib._require_probe_worker(worker)
+    assert _unreleased_probe_leases(conn)
+    plan = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    _jid, created, err = admit_lib(
+        conn, "owner@example.invalid", "k-w3-liveness", plan["id"], False,
+        "fp-test-1", True, False)
+    assert err == "busy" and not created
+    conn.close()
+
+
+def test_restart_reconcile_safe_with_unfinished_probe(
+        tmp_path, monkeypatch):
+    """Supervised restart with an unfinished durable probe: boot
+    reconciliation keeps the unresolved lease held until positive unit
+    proof (existing W3 semantics), and a healthy new executor passes the
+    gate."""
+    _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
+    conn = _fresh_db(db_path)
+    rid = probes_lib.enqueue_probe(conn, "api", "hermes", "refresh")
+    assert probes_lib.claim_probe(conn, "dispatcher-dead")
+    lease = leases_lib.acquire_probe_lease(
+        conn, "hermes", "dispatcher-dead", request_id=rid)
+    assert lease
+    unit = _probe_unit(rid)
+    _patch_units(monkeypatch, {unit: "unknown"})
+    dispatch_lib.reconcile_boot(conn)
+    assert _unreleased_probe_leases(conn)
+    worker = dispatch_lib.ProbeWorker(db_path, interval_s=0.05)
+    worker.start()
+    try:
+        assert dispatch_lib._require_probe_worker(worker) is None
+        assert _unreleased_probe_leases(conn)
+        _patch_units(monkeypatch, {unit: "confirmed_stopped"})
+        dispatch_lib.reconcile_boot(conn)
+        assert _unreleased_probe_leases(conn) == []
+    finally:
+        worker.stop(timeout_s=2.0)
     conn.close()

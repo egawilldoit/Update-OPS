@@ -42,6 +42,15 @@ INSTALLATION_READ_OPS = ("inspect", "discover", "activity", "plan",
                          "verify", "refresh")
 MUTATION_OPS = ("reserve", "mutate")
 MAINTENANCE_OPS = ("drain",)
+# Ops whose result carries a tool observation the coordinator applies
+# durably (observation.apply_probe_result). For these, a result row being
+# visible is NOT completion: request_owner_probe_handle waits boundedly
+# for the durable applied marker and reports "pending" otherwise.
+OBSERVATION_APPLIED_OPS = ("refresh",)
+# Explicit small extra bound (seconds) for the applied-marker wait after a
+# result becomes visible. Never PROBE_OP_TIMEOUT_S: application is a tiny
+# idempotent transaction; a slow coordinator is polled via the durable id.
+OBSERVATION_APPLY_WAIT_S = 2.0
 # Legacy alias: every installation read contends (F12 collapsed the old
 # narrow subset into INSTALLATION_READ_OPS).
 CONTENDING_OPS = INSTALLATION_READ_OPS
@@ -164,6 +173,50 @@ def await_probe(conn, request_id, timeout_s=25.0):
     return "timeout", {}
 
 
+def observation_applied(conn, request_id):
+    # type: (sqlite3.Connection, str) -> bool
+    """Durable applied marker for one stored result (pure reader).
+
+    True only when the coordinator has durably processed the visible
+    result: probe_requests.result_id holds the finished_at token of
+    probe_results (observation applied, or the latest attempt recorded).
+    A visible result with this marker false is still pending.
+    """
+    if not request_id:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT pr.result_id, res.finished_at FROM probe_requests pr"
+            " JOIN probe_results res ON res.request_id=pr.id"
+            " WHERE pr.id=?", (request_id,)).fetchone()
+    except Exception:
+        return False
+    if row is None:
+        return False
+    try:
+        finished_at = str(row["finished_at"] or "")
+        return bool(finished_at) and str(row["result_id"] or "") == \
+            finished_at
+    except Exception:
+        return False
+
+
+def _await_observation_applied(conn, request_id, timeout_s):
+    # type: (sqlite3.Connection, str, float) -> bool
+    """Bounded wait for the coordinator's durable applied marker."""
+    try:
+        bound = max(0.05, float(timeout_s))
+    except (TypeError, ValueError):
+        bound = OBSERVATION_APPLY_WAIT_S
+    deadline = time.monotonic() + bound
+    while True:
+        if observation_applied(conn, request_id):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def request_owner_probe(tool_id, op, timeout_s=25.0, subject="api"):
     # type: (str, str, float, str) -> Tuple[str, Dict[str, Any]]
     """API-side helper: enqueue + bounded wait. Returns (status, payload).
@@ -176,14 +229,22 @@ def request_owner_probe(tool_id, op, timeout_s=25.0, subject="api"):
 
 
 def request_owner_probe_handle(tool_id, op, timeout_s=25.0, subject="api",
-                               coalesce=True):
-    # type: (str, str, float, str, bool) -> Tuple[str, Dict[str, Any], str]
+                               coalesce=True, apply_wait_s=None):
+    # type: (str, str, float, str, bool, float) -> Tuple[str, Dict[str, Any], str]
     """API-side helper: durable enqueue (coalescing) + bounded wait.
 
     Opens/closes its own DB connection (short transactions only). Must
     run in a worker thread, never the event loop. Returns
     (status, payload, request_id); request_id is the durable handle the
     caller can poll (GET /probes/{request_id}) after a timeout.
+
+    RESULT VISIBLE != OBSERVATION APPLIED (W3.1): for an observation op
+    (refresh), "ok" is returned only after the coordinator's durable
+    applied marker exists (observation_applied). If the result becomes
+    visible first, this waits the small explicit apply_wait_s bound
+    (default OBSERVATION_APPLY_WAIT_S, never PROBE_OP_TIMEOUT_S) and then
+    returns "pending" with the durable request_id instead of a false
+    completion. Non-observation ops keep the legacy semantics.
     """
     if op not in OPS:
         return "error", {"reason": "unknown op"}, ""
@@ -205,6 +266,13 @@ def request_owner_probe_handle(tool_id, op, timeout_s=25.0, subject="api",
         except Exception:
             return "error", {"reason": "enqueue failed"}, ""
         status, payload = await_probe(conn, request_id, timeout_s=timeout_s)
+        if status == "ok" and op in OBSERVATION_APPLIED_OPS:
+            if apply_wait_s is None:
+                apply_wait_s = OBSERVATION_APPLY_WAIT_S
+            if not _await_observation_applied(conn, request_id, apply_wait_s):
+                return "pending", {
+                    "reason": "result stored; observation application"
+                              " pending"}, request_id
         return status, payload, request_id
     finally:
         try:
