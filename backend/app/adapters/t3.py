@@ -870,30 +870,67 @@ class T3Adapter(Adapter):
                 need = 0
         else:
             need = 0
-        # Backup modeling: certified online snapshot OR explicit
-        # stop/quiesce->backup->update->restore-prior-state in steps +
-        # backup_policy. Manual-pre-stop-only -> manual_restart_limitation.
+        # Quiescence is the backup authority. The runner executes exactly
+        # preflight -> backup -> updating -> verifying: there is no
+        # stop/quiesce phase, no prior-state restore, and the owner holds
+        # no scoped stop/start authority (system vs --user). A unit that
+        # is not provably inactive (activity idle + explicit non-live
+        # ActiveState) therefore yields an explicitly blocked plan that
+        # advertises no lifecycle step, never a fake automatic flow.
         scope = str(info.get("unit_scope", "user") or "user")
         try:
             activity_now = self.activity()
-            writers_quiesced = (activity_now.state == "idle")
-        except Exception:
-            writers_quiesced = False
-        if writers_quiesced:
-            backup_mode = "quiesced-copy"
-            steps = ["preflight", "backup", "updating", "verifying"]
-            manual_limitation = False
-            consistency = "quiesced-copy (writers quiesced at plan; rechecked pre-mutation, invalidates on change)"
-        else:
-            # Explicit stop/quiesce modeled; when automatic stop is unavailable
-            # (no restart authority or foreground/custom), mark manual limitation.
-            backup_mode = "stop-quiesce-backup-update-restore"
-            steps = ["preflight", "stop-quiesce", "backup", "updating",
-                     "restore-prior-state", "verifying"]
-            manual_limitation = True
-            consistency = ("explicit stop/quiesce->backup->update->restore-prior-state; "
-                           "manual-pre-stop-only (manual_restart_limitation=true); "
-                           "runner surfaces, never claims full flow")
+            activity_state = str(
+                getattr(activity_now, "state", "unknown") or "unknown")
+            activity_evidence = str(
+                getattr(activity_now, "evidence", "") or "")
+        except Exception as exc:
+            activity_state = "unknown"
+            activity_evidence = "activity probe failed: %s" % str(exc)[:200]
+        unit_active = str(info.get("unit_active") or "")
+        writers_quiesced = (activity_state == "idle"
+                            and unit_active in ("inactive", "failed"))
+        if not writers_quiesced:
+            blocked_reason = sanitize_evidence(
+                "automatic T3 update requires a quiesced unit "
+                "(activity=%s active=%s); stop/quiesce and prior-state "
+                "restore cannot be automated for %s:%s (no scoped "
+                "stop/start authority; the runner executes only preflight/"
+                "backup/updating/verifying). Stop %s manually and take a "
+                "fresh plan. evidence: %s" % (
+                    activity_state, unit_active or "?",
+                    scope, info.get("unit"), info.get("unit"),
+                    activity_evidence[:200]))
+            blocked = PlanResult(
+                tool=self.tool_id, target=discovery.target,
+                target_mode="exact", channel="nightly",
+                fingerprint=inspection.fingerprint,
+                services=["%s:%s" % (scope, info["unit"])],
+                backup_scope={}, required_space_bytes=0, steps=[],
+                timeouts=dict(ADAPTER_TIMEOUT_DEFAULTS),
+                restart_impact=sanitize_evidence(
+                    "planning blocked: %s" % blocked_reason),
+                already_current=already,
+            )
+            attach_plan_v2(
+                blocked, install_identity=inspection.install_identity,
+                artifact={"target": discovery.target, "channel": "nightly"},
+                config_hash="", plan_hash="",
+                launch={}, state_homes=list(inspection.state_dirs or []),
+                backup_policy={"mode": "consistent-backup-unavailable",
+                               "consistency": blocked_reason},
+                required_probes=list(required_checks),
+                budgets={"unknown:t3": -1}, space_fs={},
+                deadlines={}, restart_detail=blocked_reason,
+                activity_ts="", release_path="",
+                required_checks=list(required_checks), scope_unit=None,
+                manual_restart_limitation=True)
+            return blocked
+        backup_mode = "quiesced-copy"
+        steps = ["preflight", "backup", "updating", "verifying"]
+        manual_limitation = False
+        consistency = ("quiesced-copy (unit positively inactive at plan; "
+                       "rechecked pre-mutation, invalidates on change)")
         try:
             inv = get_tool_inventory("t3")
             inv_policy = {}
@@ -961,8 +998,8 @@ class T3Adapter(Adapter):
                 "service state snapshot + unit definition (deep-scrubbed; recovery-limited: secrets redacted, re-provision on restore)"),
             "omitted": sanitize_evidence("runtime caches, downloaded toolchains"),
             "consistency": sanitize_evidence(
-                "quiesced-copy ONLY when writers quiesced; else consistent-backup-unavailable "
-                "(explicit stop/quiesce modeled in plan when needed)"),
+                "quiesced-copy ONLY when the unit is provably inactive (activity idle); "
+                "else consistent-backup-unavailable (no automatic stop/restore)"),
         }
         gate_ok, gate_detail = self._inventory_gate(dict(info))
         if not gate_ok:
@@ -973,7 +1010,9 @@ class T3Adapter(Adapter):
                     "backup_unsupported: %s" % _scrub(gate_detail)[:400]))
         try:
             _activity = self.activity()
-            _writers_quiesced = (_activity.state == "idle" and str(info.get("unit_active") or "") != "active")
+            _writers_quiesced = (
+                _activity.state == "idle"
+                and str(info.get("unit_active") or "") in ("inactive", "failed"))
         except Exception:
             _writers_quiesced = False
         if not _writers_quiesced:
@@ -981,11 +1020,13 @@ class T3Adapter(Adapter):
                 tool=self.tool_id, supported=False, path="", scope=scope,
                 consistency="consistent-backup-unavailable", size_bytes=0,
                 unsupported_reason=sanitize_evidence(
-                    "backup_unsupported: consistent-backup-unavailable: writers not quiesced "
-                    "(unit %s active=%s activity=%s); plan models stop/quiesce->backup->update->restore-prior-state; "
-                    "manual-pre-stop-only sets manual_restart_limitation" % (
+                    "backup_unsupported: consistent-backup-unavailable: unit not "
+                    "provably inactive (unit %s active=%s activity=%s); automatic T3 "
+                    "updates require a quiesced unit (no automatic stop/restore); "
+                    "stop %s manually and take a fresh plan" % (
                         info.get("unit"), info.get("unit_active") or "?",
-                        getattr(_activity, "state", "?") if "_activity" in locals() else "?")))
+                        getattr(_activity, "state", "?") if "_activity" in locals() else "?",
+                        info.get("unit"))))
         try:
             from ..config import settings as _settings
 

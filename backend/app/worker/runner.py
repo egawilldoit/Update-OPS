@@ -139,6 +139,48 @@ def _exact_target_mismatch(target_mode, target, after_version):
         return False
 
 
+# Adapter plan-step vocabulary the runner executes, mapped to the
+# supervised phase names (plans state vocabulary -> phase_run.PHASES).
+STEP_PHASE = {
+    "preflight": "preflight",
+    "backup": "backup",
+    "updating": "execute",
+    "verifying": "verify",
+}
+
+
+def _phases_for_steps(steps):
+    # type: (object) -> Tuple[List[str], List[str]]
+    """Runner phases an immutable plan advertises, plus unexecutable steps.
+
+    A step outside the runner vocabulary (e.g. "stop-quiesce" or
+    "restore-prior-state") is returned in the second element so preflight
+    can refuse mutation instead of advertising a lifecycle it cannot run.
+    "not_applicable" declares an intentionally skipped step.
+    """
+    phases = []  # type: List[str]
+    unexecutable = []  # type: List[str]
+    try:
+        items = list(steps or [])  # type: ignore[arg-type]
+    except Exception:
+        return [], ["<unreadable steps>"]
+    for step in items:
+        try:
+            name = str(step or "")
+        except Exception:
+            name = ""
+        if not name:
+            continue
+        if name == "not_applicable":
+            continue
+        phase = STEP_PHASE.get(name)
+        if phase is None:
+            unexecutable.append(name)
+        elif phase not in phases:
+            phases.append(phase)
+    return phases, unexecutable
+
+
 # -- redacted JSONL log ------------------------------------------------------
 
 def _known_secrets():
@@ -947,6 +989,12 @@ class Runner(object):
             code = "backup_unsupported" if "backup" in detail.lower() \
                 else "stale_plan"
             return False, code, detail[:500]
+        _phases, _unexecutable = _phases_for_steps(steps)
+        if _unexecutable:
+            return False, "install_method_unsupported", \
+                "plan advertises lifecycle step(s) this runner cannot " \
+                "execute: %s; refusing mutation" % \
+                ", ".join(_unexecutable)[:300]
         if self.tool_id == "hermes" and "BLOCKED" in str(
                 (self.plan_row or {}).get("restart_impact", "") or ""):
             return False, "install_method_unsupported", \
