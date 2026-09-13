@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from .api.routes import router as v1_router
 from .config import settings
 from .db import connect, validate_schema
-from .readiness import ReadinessError, validate_startup
+from .readiness import validate_startup
 
 
 @asynccontextmanager
@@ -36,10 +36,10 @@ async def lifespan(app: FastAPI):
             conn.close()
         except Exception:
             pass
-    try:
-        validate_startup("api", settings)
-    except ReadinessError:
-        raise
+    # R34: fatal readiness violations raise out of lifespan (fail closed),
+    # so an API with placeholder identity or an unresolved CSRF secret
+    # never serves traffic. Warnings (if any) are advisory and non-fatal.
+    validate_startup("api", settings)
     yield
 
 
