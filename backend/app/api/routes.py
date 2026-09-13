@@ -226,6 +226,22 @@ def _safe_detail(text, limit=200):
         return "unavailable"
 
 
+def _manual_prerequisite_blocked(planned):
+    # type: (object) -> bool
+    """True when an adapter DELIBERATELY returned a non-executable plan
+    because a manual operator prerequisite is required (Wave 2 / D7
+    policy B: T3 must be stopped before it can be backed up). The
+    classifier reads the explicit adapter declaration — a `stale`/
+    `run check again` response here would be false. Genuinely stale or
+    incomplete observations (missing fingerprint/target/steps) keep
+    returning stale_plan below."""
+    try:
+        data = dict(planned or {})
+    except Exception:
+        return False
+    return data.get("manual_restart_limitation") is True
+
+
 def _load_adapter(tool_id):
     # type: (str) -> Any
     """Lazily resolve the adapter for a tool id (no probes at import).
@@ -1114,6 +1130,16 @@ async def post_tool_plan(tool_id: str, request: Request):
     except Exception:
         steps = []
     if not steps:
+        # Wave 2.1: a deliberately blocked plan with an explicit manual
+        # prerequisite is NOT stale — re-running the check cannot satisfy
+        # the prerequisite. Surface the classified condition instead of
+        # the misleading stale_plan/"run check again".
+        if _manual_prerequisite_blocked(_planned):
+            return deps.error_envelope(
+                409, "manual_prerequisite_required",
+                "%s must be stopped manually before an update plan can be "
+                "created" % str(tool_id or "").upper(),
+                _safe_detail(_planned.get("restart_impact", ""), limit=300))
         return deps.error_envelope(
             409, "stale_plan",
             "plan steps unavailable; run check again",

@@ -54,7 +54,7 @@ before execution. Step timeouts come from adapter `plan().timeouts`.
 
 Error codes (API `code` field + adapter `error_code`):
 `worker_unavailable, busy, stale_plan, fingerprint_changed, config_changed,
-activity_blocked,
+activity_blocked, manual_prerequisite_required,
 ack_required, disk_blocked, git_dirty, install_method_unsupported, backup_unsupported,
 backup_failed, install_failed, health_failed, timeout, log_limit_truncated,
 storage_failure, recovery_required, invalid_request, unauthorized, forbidden,
