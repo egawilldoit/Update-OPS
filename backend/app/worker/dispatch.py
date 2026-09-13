@@ -428,9 +428,19 @@ def run_probe_queue(conn):
             except Exception:
                 pass
         elif lease_id:
-            _event(conn, req_id, "probe_exclusion_held",
-                   "probe stop unproven; lease %s held for "
-                   "reconciliation" % lease_id)
+            # D5 evidence: events.job_id REFERENCES jobs(id), so a probe
+            # request id can never be recorded there (the insert fails
+            # closed and would be silently dropped). Persist the held
+            # fact in the durable probe result instead — machine-
+            # readable booleans/ids only; status/reason unchanged.
+            try:
+                if not isinstance(payload, dict):
+                    payload = {"reason": str(payload)[:300]}
+                payload["exclusion_held"] = True
+                payload["lease_id"] = str(lease_id)
+                payload["reconciliation"] = "required"
+            except Exception:
+                pass
         try:
             clean = _sanitize_payload(payload)
         except Exception:

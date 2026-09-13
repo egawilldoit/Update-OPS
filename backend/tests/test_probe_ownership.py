@@ -11,6 +11,7 @@ No test in this module queries or mutates real systemd state.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import uuid
@@ -196,6 +197,18 @@ def test_d5_unproven_stop_keeps_lease_and_blocks_mutation(tmp_path,
     result = conn.execute("SELECT * FROM probe_results WHERE request_id=?",
                           (request_id,)).fetchone()
     assert result is not None and result["status"] == "error"
+    # D5 durable evidence: the held fact must land in the probe result
+    # (events.job_id REFERENCES jobs(id), so a probe request id can never
+    # be recorded there). Status/reason semantics stay unchanged.
+    evidence = json.loads(result["result_json"])
+    assert evidence["exclusion_held"] is True
+    assert evidence["lease_id"] == str(held[0]["id"])
+    assert evidence["reconciliation"] == "required"
+    assert evidence["reason"] == "probe deadline exceeded"
+    event_rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE job_id=?",
+        (request_id,)).fetchone()
+    assert event_rows["n"] == 0
     plan = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
     _jid, created, err = _admit(conn, plan["id"], "k-d5-unproven")
     assert err == "busy" and not created
