@@ -82,6 +82,10 @@ class Settings:
     body_limit_bytes: int = 256 * 1024
     # Tool owner / runner
     tool_owner: str = "ubuntu"
+    # Joint group shared by the API and the tool owner for the shared
+    # config/state paths (D1: effective access must not rely on the
+    # running user manager's stale supplementary-group vector).
+    shared_group: str = "ega-update"
     node_path: str = "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/node"
     npm_path: str = "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npm"
     npx_path: str = "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npx"
@@ -197,6 +201,8 @@ def load_settings():
     s.body_limit_bytes = pick_int(
         "EGA_BODY_LIMIT_BYTES", "body_limit_bytes", s.body_limit_bytes)
     s.tool_owner = pick("EGA_TOOL_OWNER", "tool_owner") or s.tool_owner
+    s.shared_group = pick(
+        "EGA_SHARED_GROUP", "shared_group", s.shared_group) or s.shared_group
     s.node_path = pick("EGA_NODE_PATH", "node_path") or s.node_path
     s.npm_path = pick("EGA_NPM_PATH", "npm_path") or s.npm_path
     s.npx_path = pick("EGA_NPX_PATH", "npx_path") or s.npx_path

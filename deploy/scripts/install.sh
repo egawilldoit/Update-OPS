@@ -331,6 +331,34 @@ else
   echo "[install] enabled linger for $TOOL_OWNER (user manager at boot for --user job units)"
 fi
 
+# 4c. Explicit effective owner-execution access (D1). The account-database
+#     membership added above is NOT an effective guarantee: the
+#     already-running user@<uid>.service keeps the supplementary-group
+#     vector it had at start, so transient `systemd-run --user` job/probe
+#     units inherit a vector WITHOUT the joint group and cannot traverse
+#     the group-owned shared paths (state/log 0770, /etc 0750). Grant the
+#     tool owner explicit named-user POSIX ACLs on exactly those paths —
+#     never a wider chmod, never a group/other widening — so effective
+#     access does not depend on the running manager. Idempotent on fresh
+#     and existing installs; proven from the real transient identity below.
+SHARED_GROUP="$(PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" \
+  python3 -m backend.app.config_cli get shared_group 2>/dev/null || true)"
+SHARED_GROUP="${SHARED_GROUP:-${EGA_SHARED_GROUP:-ega-update}}"
+echo "[install] provisioning explicit owner-execution access (owner=$TOOL_OWNER group=$SHARED_GROUP)"
+if PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env provision \
+    --owner "$TOOL_OWNER" --group "$SHARED_GROUP" \
+    --state-dir "$EFFECTIVE_STATE" --log-dir "$EFFECTIVE_STATE/logs" \
+    --backup-dir "$EFFECTIVE_BACKUPS" --config-dir "$ETC" \
+    --config-file "$ETC/config.json" --secrets-file "$ETC/secrets.env" \
+    --inventory-file "$ETC/inventory.json" \
+    >/tmp/ega-install-owner-access.json 2>/tmp/ega-install-owner-access.err; then
+  echo "[install] owner-execution access provisioned (ACLs; no permission widening)"
+else
+  cat /tmp/ega-install-owner-access.json >&2 2>/dev/null || true
+  cat /tmp/ega-install-owner-access.err >&2 2>/dev/null || true
+  fail_keep_drain "owner-execution effective access could not be provisioned (drain kept)"
+fi
+
 # Existing-deploy maintenance gate (R33 steps 1-3, F07/F09): drain FIRST,
 # prove quiescence via the version-independent deploy controller (bounded
 # 120s, fail closed — never requires any installed release to implement
@@ -487,6 +515,44 @@ if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
 fi
 systemctl daemon-reload || fail_keep_drain "daemon-reload failed"
 systemctl enable ega-update-api ega-update-worker || fail_keep_drain "unit enable failed (api/worker)"
+
+# 8b. Prove the effective transient owner-execution contract (D1). The
+#     probe runs INSIDE a real `systemd-run --user` transient unit as the
+#     tool owner — the exact identity job/probe units use — so it measures
+#     the running user manager's group vector, not a freshly
+#     initgroups()'d login shell (which would falsely pass). The unit
+#     self-reports effective access; any failure keeps the drain and stops
+#     the deploy before services start (fail closed, no manager restart,
+#     no managed-tool touch).
+if [ -z "${SHARED_GROUP:-}" ]; then SHARED_GROUP="ega-update"; fi
+OWNER_UID="$(id -u "$TOOL_OWNER" 2>/dev/null || echo '')"
+if [ -z "$OWNER_UID" ]; then
+  fail_keep_drain "cannot resolve uid for tool owner $TOOL_OWNER"
+fi
+OWNER_RUNTIME="/run/user/$OWNER_UID"
+BUS_READY=0
+for _i in $(seq 1 10); do
+  if [ -S "$OWNER_RUNTIME/bus" ]; then BUS_READY=1; break; fi
+  echo "[install] waiting for user manager bus ($_i/10)..."
+  sleep 1
+done
+if [ "$BUS_READY" != "1" ]; then
+  fail_keep_drain "user manager bus $OWNER_RUNTIME/bus unavailable (linger/user@$OWNER_UID.service not running); cannot prove effective owner-execution credentials"
+fi
+CRED_DIR="$(mktemp -d /var/tmp/ega-credcheck-XXXXXXXX)" || fail_keep_drain "cannot create credential check dir"
+chmod 0700 "$CRED_DIR"
+chown "$TOOL_OWNER:$TOOL_OWNER" "$CRED_DIR" 2>/dev/null || true
+CRED_REPORT="$CRED_DIR/report.json"
+CRED_UNIT="ega-update-credcheck-$$"
+su -s /bin/bash "$TOOL_OWNER" -c "XDG_RUNTIME_DIR='$OWNER_RUNTIME' timeout 45 /usr/bin/systemd-run --user --wait --collect --quiet --unit='$CRED_UNIT' --property=RuntimeMaxSec=30 --working-directory='$RELEASE_DIR' '$RELEASE_DIR/venv/bin/python' -m backend.app.owner_env probe --owner '$TOOL_OWNER' --group '$SHARED_GROUP' --state-dir '$EFFECTIVE_STATE' --log-dir '$EFFECTIVE_STATE/logs' --backup-dir '$EFFECTIVE_BACKUPS' --config-dir '$ETC' --config-file '$ETC/config.json' --secrets-file '$ETC/secrets.env' --inventory-file '$ETC/inventory.json' --report-out '$CRED_REPORT'" >/dev/null 2>&1 || true
+if [ -f "$CRED_REPORT" ] && PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env verify --report "$CRED_REPORT" >/dev/null 2>&1; then
+  echo "[install] effective owner-execution credentials verified from the transient user unit"
+  rm -rf "$CRED_DIR"
+else
+  PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env verify --report "$CRED_REPORT" >&2 2>/dev/null || true
+  rm -rf "$CRED_DIR"
+  fail_keep_drain "transient owner-execution credentials ineffective (see report above; drain kept)"
+fi
 
 # 9. Start console services. The tunnel starts ONLY under explicit
 # --enable-tunnel (its full validation already passed at stage 5c).
