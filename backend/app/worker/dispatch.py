@@ -25,6 +25,7 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, Tuple
 
@@ -417,17 +418,7 @@ def run_probe_queue(conn):
         except Exception as exc:
             status, payload = "error", {"reason": str(exc)[:300]}
             stop_proven = False
-        # D5: release the exclusion ONLY on positive stop proof. An
-        # unproven stop keeps the lease held (mutation admission stays
-        # blocked) until reconciliation proves the bound probe unit
-        # stopped — never by TTL/time and never in a blanket finally.
-        if lease_id and stop_proven:
-            try:
-                from ..leases import release_lease as _release
-                _release(conn, lease_id)
-            except Exception:
-                pass
-        elif lease_id:
+        if lease_id and not stop_proven:
             # D5 evidence: events.job_id REFERENCES jobs(id), so a probe
             # request id can never be recorded there (the insert fails
             # closed and would be silently dropped). Persist the held
@@ -446,23 +437,119 @@ def run_probe_queue(conn):
         except Exception:
             # N12: payload that cannot be sanitized is never persisted
             # raw; the probe reports an evidence failure instead.
+            clean, status = {"reason": "evidence_sanitization_failed"}, \
+                "error"
+        # W3 target lifecycle: RESULT DURABLY STORED -> OBSERVATION
+        # DURABLY APPLIED -> EXECUTION CONFIRMED STOPPED -> EXCLUSION
+        # RELEASED. The result is stored before the lease is released so
+        # a mutation admitted after release cannot clobber an
+        # observation whose result was never persisted; application is
+        # idempotent and reconciliation retries from durable state.
+        stored = False
+        try:
+            stored = bool(finish_probe(conn, req_id, status, clean))
+        except Exception:
+            stored = False
+        if stored:
             try:
-                finish_probe(conn, req_id, "error",
-                             {"reason": "evidence_sanitization_failed"})
+                from .. import observation as _observation
+                _observation.apply_probe_result(conn, req_id)
             except Exception:
                 pass
-            done += 1
-            continue
-        try:
-            finish_probe(conn, req_id, status, clean)
-        except Exception:
-            pass
+        # D5: release the exclusion ONLY on positive stop proof AND only
+        # after the result is durable. An unproven stop (or an unstored
+        # result) keeps the lease held (mutation admission stays blocked)
+        # until reconciliation proves the bound probe unit stopped —
+        # never by TTL/time and never in a blanket finally.
+        if lease_id and stop_proven and stored:
+            try:
+                from ..leases import release_lease as _release
+                _release(conn, lease_id)
+            except Exception:
+                pass
         done += 1
     try:
         expire_probes(conn)
     except Exception:
         pass
+    try:
+        from .. import observation as _observation
+        _observation.reconcile_observations(conn)
+    except Exception:
+        pass
     return done
+
+
+class ProbeWorker(object):
+    """Bounded probe executor on its own SQLite connection (W3).
+
+    The dispatcher main loop never executes a probe: one probe chain can
+    run up to PROBE_OP_TIMEOUT_S here while the main loop keeps writing
+    the heartbeat, dispatching jobs, and reconciling. SQLite is
+    single-writer; short transactions only, never a tx across the
+    supervised subprocess call.
+
+    Concurrency is exactly one: the loop claims/executes/finishes one
+    queue pass at a time on this thread.
+    """
+
+    def __init__(self, db_path="", interval_s=POLL_INTERVAL_S):
+        # type: (str, float) -> None
+        self._db_path = str(db_path or settings.db_path)
+        try:
+            self._interval_s = max(0.05, float(interval_s))
+        except (TypeError, ValueError):
+            self._interval_s = float(POLL_INTERVAL_S)
+        self._stop = threading.Event()
+        self._thread = None  # type: Any
+
+    def start(self):
+        # type: () -> "ProbeWorker"
+        t = self._thread
+        if t is not None and t.is_alive():
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="ega-probe-worker", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        # type: () -> None
+        try:
+            conn = connect(self._db_path)
+        except Exception:
+            return
+        try:
+            while not self._stop.is_set():
+                try:
+                    run_probe_queue(conn)
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                self._stop.wait(self._interval_s)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def stop(self, timeout_s=5.0):
+        # type: (float) -> None
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            try:
+                t.join(timeout=max(0.1, float(timeout_s)))
+            except Exception:
+                pass
+
+    def is_alive(self):
+        # type: () -> bool
+        t = self._thread
+        return bool(t is not None and t.is_alive())
 
 
 # -- reconcile (R04/R05/R08) ------------------------------------------------
@@ -742,15 +829,122 @@ def reconcile_claimed_jobs(conn):
     return acted
 
 
+def reconcile_probe_requests(conn, units_mod=None, only_past_deadline=False):
+    # type: (sqlite3.Connection, object, bool) -> Dict[str, Any]
+    """Restart reconciliation of durable probe execution state (W3).
+
+    Durable facts decide; time never does:
+    - request has a durable result       -> finalize (never rerun);
+    - unit confirmed stopped, no result  -> resume when the claim
+      deadline has not passed, else mark expired (classified terminal);
+    - unit live/starting/stopping/unknown -> hold: the request stays
+      claimed and the bound probe lease keeps blocking mutation
+      admission (recovery-required equivalent).
+    A stored-but-unapplied refresh result is applied (idempotently).
+    units_mod defaults to backend.app.units; tests inject a fake.
+
+    only_past_deadline=True is the loop path: it leaves live in-flight
+    probes untouched (no unit query while a probe is inside its bounded
+    execution window) and only resolves or holds orphaned claims whose
+    claim deadline already passed.
+    """
+    report = {"checked": 0, "resumed": 0, "expired": 0, "finalized": 0,
+              "held": 0, "applied": 0}  # type: Dict[str, Any]
+    try:
+        rows = conn.execute(
+            "SELECT * FROM probe_requests WHERE state='running'").fetchall()
+    except Exception:
+        return report
+    query = units_mod or _units
+    stopped = str(getattr(query, "CONFIRMED_STOPPED",
+                          _units.CONFIRMED_STOPPED)
+                  or _units.CONFIRMED_STOPPED)
+    now = utcnow_iso()
+    for row in rows:
+        try:
+            rid = str(row["id"] or "")
+            deadline = str(row["claim_deadline"] or "")
+        except Exception:
+            continue
+        if not rid:
+            continue
+        if only_past_deadline and not (deadline and deadline < now):
+            continue
+        report["checked"] += 1
+        try:
+            has_result = conn.execute(
+                "SELECT 1 FROM probe_results WHERE request_id=?",
+                (rid,)).fetchone() is not None
+        except Exception:
+            has_result = True  # unreadable: hold (fail closed)
+        if has_result:
+            try:
+                conn.execute(
+                    "UPDATE probe_requests SET state='done' WHERE id=?"
+                    " AND state='running'", (rid,))
+                conn.commit()
+                report["finalized"] += 1
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            continue
+        unit = _probe_unit_name(rid)
+        unit_state = "unknown"
+        if unit:
+            try:
+                info = query.query_unit(unit, timeout_s=5)
+                unit_state = str((info or {}).get("state", "unknown"))
+            except Exception:
+                unit_state = "unknown"
+        if unit_state != stopped:
+            report["held"] += 1
+            continue
+        try:
+            if deadline and deadline > now:
+                conn.execute(
+                    "UPDATE probe_requests SET state='queued', owner=''"
+                    " WHERE id=? AND state='running'", (rid,))
+                report["resumed"] += 1
+            else:
+                conn.execute(
+                    "UPDATE probe_requests SET state='expired'"
+                    " WHERE id=? AND state='running'", (rid,))
+                report["expired"] += 1
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    try:
+        from .. import observation as _observation
+        report["applied"] = int(
+            _observation.reconcile_observations(conn) or 0)
+    except Exception:
+        pass
+    return report
+
+
 def reconcile_boot(conn):
     # type: (sqlite3.Connection) -> None
-    """On start: per-row reconcile + probe-lease reconciliation.
+    """On start: probe-request + probe-lease reconcile, then job rows.
 
     Never auto-resumes work. D5: a dispatcher restart does not stop the
     transient probe service surviving under the user manager, so every
     unreleased probe lease (expired or not) is reconciled with positive
-    stop proof — a live survivor keeps blocking mutation admission.
+    stop proof — a live survivor keeps blocking mutation admission. W3
+    adds durable probe-request reconciliation (resume/terminal) and
+    observation application before any exclusion release.
     """
+    # W3 lifecycle order: finalize/apply durable result state BEFORE any
+    # exclusion release, so a mutation admitted right after a release can
+    # never race an unapplied observation.
+    try:
+        reconcile_probe_requests(conn)
+    except Exception:
+        pass
     try:
         from ..leases import reconcile_probe_leases
         reconcile_probe_leases(conn, include_unexpired=True)
@@ -838,10 +1032,21 @@ def main():
     except Exception as exc:
         raise SystemExit("schema validation failed: %s" % exc)
     reconcile_boot(conn)
+    # W3: probes execute on a bounded worker thread with its own
+    # connection (the thread owns the reference). The main loop keeps
+    # heartbeat, job dispatch, and reconciliation alive while a
+    # 120s-class probe runs.
+    ProbeWorker(settings.db_path).start()
     while True:
         try:
             expire_stale_accepted(conn)
-            run_probe_queue(conn)
+            # W3 backstop: apply/finalize durable probe state first
+            # (proof-based; live probes inside their window are
+            # untouched), then reconcile probe leases.
+            try:
+                reconcile_probe_requests(conn, only_past_deadline=True)
+            except Exception:
+                pass
             try:
                 from ..leases import reconcile_expired_probes
                 reconcile_expired_probes(conn)

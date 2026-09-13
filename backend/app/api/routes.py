@@ -47,25 +47,14 @@ PLAN_STEPS_DEFAULT = ["preflight", "backup", "updating", "verifying"]
 DISCOVERY_CACHE_S = 15 * 60
 LOG_DEFAULT_LIMIT = 200
 LOG_MAX_LIMIT = 1000
-# 15-minute discovery coalesce: {tool_id: (snapshot_card, monotonic_ts)}.
+# 15-minute observation freshness: {tool_id: (snapshot_card, monotonic_ts)}.
 # Snapshot is the last successfully persisted tool card; monotonic_ts comes
 # from time.monotonic() so wall-clock jumps never extend the window.
+# Duplicate ACTIVE probes are coalesced durably in SQLite
+# (owner_probes.enqueue_probe), never in process memory, so an API restart
+# cannot create a redundant probe.
 _DISCOVERY_CACHE = {}  # type: Dict[str, Tuple[Dict[str, Any], float]]
-# Per-tool locks coalesce concurrent duplicate checks with a short critical
-# section (guard only cache/inflight bookkeeping, never adapter probes).
-_DISCOVERY_LOCKS = {}  # type: Dict[str, threading.Lock]
 _DISCOVERY_LOCKS_GUARD = threading.Lock()
-_DISCOVERY_INFLIGHT = set()  # type: set
-
-
-def _per_tool_lock(tool_id):
-    # type: (str) -> threading.Lock
-    with _DISCOVERY_LOCKS_GUARD:
-        lock = _DISCOVERY_LOCKS.get(tool_id)
-        if lock is None:
-            lock = threading.Lock()
-            _DISCOVERY_LOCKS[tool_id] = lock
-        return lock
 
 
 def _drained():
@@ -83,118 +72,6 @@ def _drained():
         return os.path.exists(os.path.join(str(base), "drain"))
     except Exception:
         return False
-
-
-def _health_from_verify(verify_result):
-    # type: (Any) -> Tuple[str, str]
-    """Map adapter verify() to (health, health_detail).
-
-    pass -> healthy with detail; fail -> unhealthy (mandatory fail) or
-    degraded (optional-only fail); unknown/no-evidence -> unknown.
-    Never raises; detail is truncated safe text.
-    """
-    try:
-        passed = bool(getattr(verify_result, "passed", False))
-    except Exception:
-        passed = False
-    try:
-        version = str(getattr(verify_result, "version", "") or "")[:200]
-    except Exception:
-        version = ""
-    try:
-        raw_checks = list(getattr(verify_result, "checks", []) or [])
-    except Exception:
-        raw_checks = []
-    parts = []
-    man_fail = False
-    opt_fail = False
-    man_unknown = False
-    total_man = 0
-    pass_man = 0
-    for item in raw_checks:
-        try:
-            if isinstance(item, dict):
-                name = str(item.get("name", "") or "")[:100]
-                result = str(item.get("result", "unknown") or "unknown")
-                mandatory = bool(item.get("mandatory", True))
-            else:
-                name = str(getattr(item, "name", "") or "")[:100]
-                result = str(getattr(item, "result", "unknown")
-                             or "unknown")
-                mandatory = bool(getattr(item, "mandatory", True))
-        except Exception:
-            continue
-        if result not in ("pass", "fail", "unknown", "not_applicable"):
-            result = "unknown"
-        parts.append("%s=%s" % (name or "check", result))
-        if mandatory and result != "not_applicable":
-            total_man += 1
-            if result == "pass":
-                pass_man += 1
-        if result == "fail" and mandatory:
-            man_fail = True
-        elif result == "fail":
-            opt_fail = True
-        elif result == "unknown" and mandatory:
-            man_unknown = True
-    summary = "; ".join(parts)[:800]
-    if version:
-        prefix = "verify %s version=%s" % (
-            "pass" if passed else "fail", version)
-    else:
-        prefix = "verify %s" % ("pass" if passed else "fail")
-    if total_man:
-        prefix = "%s (%d/%d mandatory pass)" % (prefix, pass_man, total_man)
-    detail = ("%s: %s" % (prefix, summary)).strip(": ")[:1000]
-    if passed:
-        return "healthy", detail
-    if man_fail:
-        return "unhealthy", detail
-    if opt_fail:
-        return "degraded", detail
-    if man_unknown:
-        return "unknown", detail
-    # No fail evidence but not passed (e.g. empty checks): unknown.
-    return "unknown", detail
-
-
-def _health_from_payload_verification(payload):
-    # type: (Dict[str, Any]) -> Tuple[str, str]
-    """Dict-shaped twin of _health_from_verify for owner-probe payloads."""
-
-    class _Box(object):
-        def __init__(self, data):
-            # type: (Dict[str, Any]) -> None
-            self._data = data if isinstance(data, dict) else {}
-
-        def __getattr__(self, name):
-            # type: (str) -> Any
-            if name.startswith("_"):
-                raise AttributeError(name)
-            return self._data.get(name)
-
-    boxes = []
-    try:
-        raw_checks = (payload or {}).get("checks", []) or []
-    except Exception:
-        raw_checks = []
-    for item in raw_checks:
-        boxes.append(_Box(item if isinstance(item, dict) else []))
-
-    class _V(object):
-        pass
-    verification = _V()
-    try:
-        verification.passed = bool((payload or {}).get("passed", False))
-        verification.version = str((payload or {}).get("version", "") or "")
-        verification.error_detail = str(
-            (payload or {}).get("error_detail", "") or "")
-    except Exception:
-        verification.passed = False
-        verification.version = ""
-        verification.error_detail = ""
-    verification.checks = boxes
-    return _health_from_verify(verification)
 
 
 # Explicit per-job cap marker emitted by worker/runner.py JobLog.
@@ -257,19 +134,6 @@ def _load_adapter(tool_id):
     return adapter_registry.get_adapter(tool_id)
 
 
-def _probe_field(payload, section, key, default=""):
-    # type: (Dict[str, Any], str, str, object) -> Any
-    """Read a field from an owner-probe payload section (dicts only)."""
-    try:
-        section_d = (payload or {}).get(section, {})
-        if not isinstance(section_d, dict):
-            return default
-        value = section_d.get(key, default)
-        return default if value is None else value
-    except Exception:
-        return default
-
-
 async def _owner_probe(tool_id, op, timeout_s=25.0):
     # type: (str, str, float) -> Tuple[str, Dict[str, Any]]
     """Owner probe via the typed queue (R01/R16).
@@ -290,6 +154,48 @@ async def _owner_probe(tool_id, op, timeout_s=25.0):
             request_owner_probe, tool_id, op, timeout_s, "api")
     except Exception as exc:
         return "error", {"reason": "probe wait crashed: %s" % _safe_detail(exc, 200)}
+
+
+async def _owner_probe_handle(tool_id, op, timeout_s=25.0):
+    # type: (str, str, float) -> Tuple[str, Dict[str, Any], str]
+    """Durable owner-probe submit + bounded wait (W3).
+
+    Enqueues (coalescing with an identical active request in SQLite) and
+    waits boundedly off the event loop. Returns (status, payload,
+    request_id); the request_id is the durable handle to poll when the
+    wait times out. The route never persists the result or the
+    observation — the dispatcher/coordinator owns both.
+    """
+    try:
+        from ..owner_probes import request_owner_probe_handle
+    except Exception:
+        try:
+            from backend.app.owner_probes import (  # type: ignore[no-redef]
+                request_owner_probe_handle)
+        except Exception:
+            return "error", {"reason": "probe boundary unavailable"}, ""
+    try:
+        return await asyncio.to_thread(
+            request_owner_probe_handle, tool_id, op, timeout_s)
+    except Exception as exc:
+        return "error", {
+            "reason": "probe wait crashed: %s" % _safe_detail(exc, 200)}, ""
+
+
+def _with_probe_handle(card, request_id, pending):
+    # type: (Dict[str, Any], str, bool) -> Dict[str, Any]
+    """Attach the durable probe handle to a tool-card response.
+
+    Backward compatible: existing card fields are unchanged; clients may
+    ignore the extra keys or poll GET /probes/{request_id}.
+    """
+    try:
+        if request_id:
+            card["probe_request_id"] = str(request_id)
+        card["probe_pending"] = bool(pending)
+    except Exception:
+        pass
+    return card
 
 
 def _ok(payload):
@@ -633,46 +539,9 @@ async def post_tool_check(tool_id: str, request: Request):
             card["health"] = "stale"
         return card
 
-    def _preserve_with_error(tool_id_inner, message):
-        # type: (str, str) -> Dict[str, Any]
-        # R19: on failure preserve the last observation AND its timestamp;
-        # record only last_attempt_at + last_attempt_error (an old healthy
-        # result must never look freshly healthy). Never invent health.
-        now_inner = utcnow_iso()
-        conn_inner = _db()
-        try:
-            try:
-                conn_inner.execute("BEGIN IMMEDIATE")
-                conn_inner.execute(
-                    "INSERT OR IGNORE INTO tools(id) VALUES(?)",
-                    (tool_id_inner,))
-                conn_inner.execute(
-                    "UPDATE tools SET discovery_error=?,"
-                    " last_attempt_at=?, last_attempt_error=? WHERE id=?",
-                    (str(message)[:500], now_inner, str(message)[:500],
-                     tool_id_inner))
-                conn_inner.commit()
-            except Exception:
-                try:
-                    conn_inner.rollback()
-                except Exception:
-                    pass
-        finally:
-            try:
-                conn_inner.close()
-            except Exception:
-                pass
-        conn_out = _db()
-        try:
-            return _read_tool_card(conn_out, tool_id_inner)
-        finally:
-            try:
-                conn_out.close()
-            except Exception:
-                pass
-
-    # Validate ?force (cache bypass only; still respects the active-job
-    # gate below). Only absent/"" , "0", "1" are accepted.
+    # Validate ?force (observation-freshness bypass only; still respects
+    # the active-job gate and active-probe coalescing below). Only
+    # absent/"" , "0", "1" are accepted.
     try:
         _force_raw = request.query_params.get("force", "")
     except Exception:
@@ -727,257 +596,146 @@ async def post_tool_check(tool_id: str, request: Request):
         return _ok(_labeled_cached(
             dict(cached), "stale — cached observation; recovery required"))
 
-    # 15-minute discovery coalesce (H-10) with per-tool lock, short
-    # critical section. Cache holds (snapshot_card, monotonic_ts);
-    # fresh (<900s) skips adapter probes unless ?force=1. Concurrent
-    # duplicates coalesce: contenders see the in-flight mark (or fail the
-    # non-blocking lock) and return the cached DB card without probing.
-    # The per-tool lock guards only cache/inflight bookkeeping, never the
-    # adapter probes below.
-    _lock = _per_tool_lock(tool_id)
-    _got_lock = _lock.acquire(blocking=False)
-    if not _got_lock:
-        conn_coal = _db()
-        try:
-            return _ok(_read_tool_card(conn_coal, tool_id))
-        finally:
-            try:
-                conn_coal.close()
-            except Exception:
-                pass
-    _added_inflight = False
-    try:
-        # Short critical section: cache freshness + in-flight check.
-        _cache_hit = False
-        _coalesced = False
-        if not _force:
-            try:
-                with _DISCOVERY_LOCKS_GUARD:
-                    _entry = _DISCOVERY_CACHE.get(tool_id)
-                    if _entry is not None:
-                        _snap, _ts = _entry
-                        if (time.monotonic() - float(_ts)) < float(
-                                DISCOVERY_CACHE_S):
-                            _cache_hit = True
-                    if not _cache_hit:
-                        if tool_id in _DISCOVERY_INFLIGHT:
-                            _coalesced = True
-                        else:
-                            _DISCOVERY_INFLIGHT.add(tool_id)
-                            _added_inflight = True
-            except Exception:
-                pass
-            if _cache_hit:
-                try:
-                    _lock.release()
-                except Exception:
-                    pass
-                conn_hit = _db()
-                try:
-                    return _ok(_read_tool_card(conn_hit, tool_id))
-                finally:
-                    try:
-                        conn_hit.close()
-                    except Exception:
-                        pass
-            if _coalesced:
-                try:
-                    _lock.release()
-                except Exception:
-                    pass
-                conn_coal2 = _db()
-                try:
-                    return _ok(_read_tool_card(conn_coal2, tool_id))
-                finally:
-                    try:
-                        conn_coal2.close()
-                    except Exception:
-                        pass
-        else:
-            # ?force=1 bypasses the cache but still registers in-flight so
-            # concurrent forced duplicates coalesce.
-            try:
-                with _DISCOVERY_LOCKS_GUARD:
-                    if tool_id in _DISCOVERY_INFLIGHT:
-                        _coalesced = True
-                    else:
-                        _DISCOVERY_INFLIGHT.add(tool_id)
-                        _added_inflight = True
-            except Exception:
-                pass
-            if _coalesced:
-                try:
-                    _lock.release()
-                except Exception:
-                    pass
-                conn_coal3 = _db()
-                try:
-                    return _ok(_read_tool_card(conn_coal3, tool_id))
-                finally:
-                    try:
-                        conn_coal3.close()
-                    except Exception:
-                        pass
-        # Release before the long adapter probes: short section ends here.
-        try:
-            _lock.release()
-        except Exception:
-            pass
-        # No active job: refresh via the owner probe queue (R01). The API
-        # account cannot execute installation probes; the dispatcher
-        # (ubuntu) runs inspect/discover/activity/verify and returns typed
-        # results. No transaction is held across the wait (bounded 25s in
-        # a worker thread; the event loop stays responsive per R16).
-        now_iso = utcnow_iso()
-        _status, _payload = await _owner_probe(tool_id, "refresh", 25.0)
-        if _status == "deferred":
-            # Dispatcher deferred (mutation started meanwhile): cached.
-            return _ok(_labeled_cached(
-                dict(cached),
-                "stale — probe deferred; update started"))
-        if _status == "timeout":
-            return _ok(_preserve_with_error(
-                tool_id, "owner probe timeout after 25s; retry"))
-        if _status != "ok":
-            return _ok(_preserve_with_error(
-                tool_id, str(_payload.get("reason", "probe failed"))[:500]))
-        try:
-            install_identity = str(
-                _probe_field(_payload, "inspection",
-                             "install_identity", "") or "")[:500]
-            observed_version = str(
-                _probe_field(_payload, "inspection", "version", "")
-                or "")[:200]
-            tool_fingerprint = str(
-                _probe_field(_payload, "inspection", "fingerprint", "")
-                or "")[:200]
-            available_target = str(
-                _probe_field(_payload, "discovery", "target", "")
-                or "")[:200]
-            channel = str(
-                _probe_field(_payload, "inspection", "channel", "") or
-                _probe_field(_payload, "discovery", "channel", "")
-                or "")[:200]
-            available = bool(
-                _probe_field(_payload, "discovery", "available", False))
-            unknown_reason = str(
-                _probe_field(_payload, "discovery", "unknown_reason", "")
-                or "")[:1000]
-            discovery_error = "" if available else unknown_reason
-            health, health_detail = _health_from_payload_verification(
-                _payload.get("verification", {}))
-        except Exception as exc:
-            return _ok(_preserve_with_error(tool_id, exc))
-        # Short write transaction only; the subprocess-backed probes above
-        # are already finished so no transaction was held across them.
-        # Re-check the single-slot gate so a job that started during the
-        # probes wins and our observation does not clobber a mutation.
-        conn2 = _db()
-        try:
-            try:
-                conn2.execute("BEGIN IMMEDIATE")
-                try:
-                    raced = jobs_lib.active_job(conn2)
-                except Exception:
-                    raced = None
-                try:
-                    race_recovering = jobs_lib.recovery_blocked(conn2)
-                except Exception:
-                    race_recovering = False
-                if raced is not None or race_recovering:
-                    try:
-                        conn2.rollback()
-                    except Exception:
-                        pass
-                    conn_cached = _db()
-                    try:
-                        card = _read_tool_card(conn_cached, tool_id)
-                    finally:
-                        try:
-                            conn_cached.close()
-                        except Exception:
-                            pass
-                    if raced is not None:
-                        avid = ""
-                        atool = ""
-                        try:
-                            avid = str(dict(raced).get("id", "") or "")
-                            atool = str(dict(raced).get("tool_id", "") or "")
-                        except Exception:
-                            avid = ""
-                            atool = ""
-                        note = ("updating — cached observation during active job"
-                                if atool == tool_id else
-                                "stale — cached observation while another"
-                                " update is active")
-                        if avid:
-                            note = "%s %s" % (note, avid[:8])
-                        return _ok(_labeled_cached(card, note))
-                    return _ok(_labeled_cached(
-                        card, "stale — cached observation; recovery required"))
-                conn2.execute(
-                    "INSERT OR IGNORE INTO tools(id) VALUES(?)", (tool_id,))
-                conn2.execute(
-                    "UPDATE tools SET install_identity=?, observed_version=?,"
-                    " available_target=?, channel=?, fingerprint=?,"
-                    " observation_time=?, discovery_error=?, health=?,"
-                    " health_detail=?, updated_at=?, last_success_at=?,"
-                    " last_attempt_at=?, last_attempt_error=? WHERE id=?",
-                    (install_identity, observed_version, available_target,
-                     channel, tool_fingerprint, now_iso, discovery_error,
-                     health, health_detail, now_iso, now_iso, now_iso,
-                     "", tool_id))
-                conn2.commit()
-            except Exception:
-                try:
-                    conn2.rollback()
-                except Exception:
-                    pass
-                # Persist failure still returns the last cached observation
-                # rather than inventing one.
-                conn_cached = _db()
-                try:
-                    return _ok(_read_tool_card(conn_cached, tool_id))
-                finally:
-                    try:
-                        conn_cached.close()
-                    except Exception:
-                        pass
-        finally:
-            try:
-                conn2.close()
-            except Exception:
-                pass
-        conn3 = _db()
-        try:
-            fresh_card = _read_tool_card(conn3, tool_id)
-        finally:
-            try:
-                conn3.close()
-            except Exception:
-                pass
-        # Refresh the 15-minute coalesce snapshot on success only; failures
-        # preserve the last observation and stay retryable.
+    # 15-minute observation freshness (H-10): a fresh successful card in
+    # this process skips the probe entirely unless ?force=1. Duplicate
+    # active probes across concurrent requests / API restarts are
+    # prevented durably by owner_probes.enqueue_probe (SQLite coalesce),
+    # not by process memory.
+    if not _force:
+        _fresh = False
         try:
             with _DISCOVERY_LOCKS_GUARD:
-                _DISCOVERY_CACHE[tool_id] = (dict(fresh_card),
-                                             time.monotonic())
+                _entry = _DISCOVERY_CACHE.get(tool_id)
+                if _entry is not None:
+                    _snap, _ts = _entry
+                    _fresh = (time.monotonic() - float(_ts)) < float(
+                        DISCOVERY_CACHE_S)
         except Exception:
-            pass
-        return _ok(fresh_card)
-    finally:
-        # Only the holder that registered in-flight clears it; coalesced
-        # contenders and cache hits leave the holder's mark intact.
-        if _added_inflight:
+            _fresh = False
+        if _fresh:
+            conn_hit = _db()
             try:
-                with _DISCOVERY_LOCKS_GUARD:
-                    _DISCOVERY_INFLIGHT.discard(tool_id)
-            except Exception:
-                pass
+                return _ok(_read_tool_card(conn_hit, tool_id))
+            finally:
+                try:
+                    conn_hit.close()
+                except Exception:
+                    pass
+
+    # Owner probe queue (R01) with a durable handle (W3). The API account
+    # cannot execute installation probes; the dispatcher (ubuntu) runs
+    # inspect/discover/activity/verify, stores the result AND applies the
+    # observation. No transaction is held across the wait (bounded 25s in
+    # a worker thread; the event loop stays responsive per R16). A wait
+    # timeout returns the cached card labeled pending plus the durable
+    # request id; it never mutates probe lifecycle.
+    _status, _payload, _request_id = await _owner_probe_handle(
+        tool_id, "refresh", 25.0)
+    if _status == "deferred":
+        return _ok(_with_probe_handle(
+            _labeled_cached(dict(cached),
+                            "stale — probe deferred; update started"),
+            _request_id, False))
+    if _status == "timeout":
+        return _ok(_with_probe_handle(
+            _labeled_cached(
+                dict(cached),
+                "stale — check pending; the result will be recorded"
+                " durably by the worker"),
+            _request_id, True))
+    if _status != "ok":
+        _reason = str(_payload.get("reason", "probe failed"))[:300]
+        return _ok(_with_probe_handle(
+            _labeled_cached(dict(cached), "stale — %s" % _reason),
+            _request_id, False))
+    # The coordinator stored the result and applied the observation (the
+    # waiting route is a reader only). Read the durable card back.
+    conn_fresh = _db()
+    try:
+        fresh_card = _read_tool_card(conn_fresh, tool_id)
+    finally:
         try:
-            _lock.release()
+            conn_fresh.close()
         except Exception:
             pass
+    # Refresh the 15-minute freshness snapshot on success only; failures
+    # preserve the last observation and stay retryable.
+    try:
+        with _DISCOVERY_LOCKS_GUARD:
+            _DISCOVERY_CACHE[tool_id] = (dict(fresh_card),
+                                         time.monotonic())
+    except Exception:
+        pass
+    return _ok(_with_probe_handle(fresh_card, _request_id, False))
+
+
+# ---------------------------------------------------------------------------
+# 3b. GET /probes/{request_id} — durable probe/observation state (W3)
+# ---------------------------------------------------------------------------
+@router.get("/probes/{request_id}")
+def get_probe(request_id: str, request: Request):
+    """Read-only durable probe state for a submitted request.
+
+    Lets a client that stopped waiting (or a restarted API) poll the
+    durable lifecycle instead of forcing one long connection. Never
+    writes: probe execution, result storage, observation application and
+    exclusion release all belong to the dispatcher/coordinator.
+    """
+    gated = _authed(request)
+    if isinstance(gated, JSONResponse):
+        return gated
+    if not deps.is_valid_uuid(request_id):
+        return deps.error_envelope(
+            422, "invalid_request", "request id must be a UUID", "")
+    conn = _db()
+    try:
+        try:
+            row = conn.execute(
+                "SELECT pr.*, res.status AS result_status,"
+                " res.result_json AS result_json,"
+                " res.finished_at AS finished_at"
+                " FROM probe_requests pr LEFT JOIN probe_results res"
+                " ON res.request_id=pr.id WHERE pr.id=?",
+                (request_id,)).fetchone()
+        except Exception:
+            row = None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if row is None:
+        return deps.error_envelope(404, "not_found", "unknown probe", "")
+    d = dict(row)
+    state = str(d.get("state") or "unknown")
+    deadline = str(d.get("claim_deadline") or "")
+    finished_at = str(d.get("finished_at") or "")
+    if state == "queued" and deadline and deadline < utcnow_iso():
+        state = "expired"
+    pending = state in ("queued", "running")
+    try:
+        payload = json.loads(d.get("result_json") or "{}") \
+            if d.get("result_json") else {}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+    except Exception:
+        payload = {}
+    return _ok({
+        "request_id": request_id,
+        "tool_id": str(d.get("tool_id") or ""),
+        "op": str(d.get("op") or ""),
+        "state": state,
+        "pending": bool(pending),
+        "status": str(d.get("result_status") or ""),
+        "created_at": str(d.get("created_at") or ""),
+        "claim_deadline": deadline,
+        "finished_at": finished_at,
+        # Durable applied marker: the coordinator has processed this
+        # result (observation applied or classified attempt recorded).
+        "observation_applied": bool(finished_at) and str(
+            d.get("result_id") or "") == finished_at,
+        "result": payload,
+    })
 
 
 # ---------------------------------------------------------------------------
