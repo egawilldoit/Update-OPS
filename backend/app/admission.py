@@ -26,6 +26,80 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Dict, Tuple
 
+# Sentinels for lookup_replay(): an exact replay returns (job_id, "").
+REPLAY_NONE = "no_replay"
+
+
+def lookup_replay(conn, subject, idem_key, plan_id, ack):
+    # type: (sqlite3.Connection, str, str, str, bool) -> Tuple[str, str]
+    """Fast-path replay decision (D4) that callers run BEFORE any
+    new-admission prerequisite (expiry sweep, plan load, owner probe,
+    worker heartbeat, drain, recovery).
+
+    Returns (job_id, error_code):
+      (job_id, "")           exact replay of the recorded job
+      ("", "no_replay")      no recorded job for subject+key; the caller
+                             may continue to new admission (admit()
+                             re-checks authoritatively under its tx)
+      ("", "conflict")       the key is bound to different request data
+                             (plan_id/ack hash mismatch); never a new job
+      ("", "unavailable")    the lookup could not be proven; callers fail
+                             closed (503) and never proceed as no-replay
+      ("", "invalid_request") missing subject/key or unhashable request
+
+    Subject is always part of the lookup, so an Idempotency-Key can
+    never cross owner boundaries. This seam reuses jobs.find_replay and
+    jobs.request_hash; admit() stays authoritative for the concurrent
+    race (two identical submissions in flight converge on ONE job).
+    """
+    from . import jobs as _jobs
+
+    subject = str(subject or "")
+    idem_key = str(idem_key or "")
+    if not subject or not idem_key:
+        return "", "invalid_request"
+    try:
+        digest = _jobs.request_hash(str(plan_id or ""), bool(ack))
+    except Exception:
+        return "", "invalid_request"
+    try:
+        existing = _jobs.find_replay(conn, subject, idem_key)
+    except Exception:
+        return "", "unavailable"
+    if existing is None:
+        # find_replay() swallows read failures by contract (its None is
+        # normally "no row"). Prove the connection still reads so a
+        # failed lookup is never mistaken for "no replay" and never
+        # lets a duplicate slip past the replay guarantee.
+        try:
+            conn.execute("SELECT 1 FROM jobs LIMIT 1").fetchone()
+        except Exception:
+            return "", "unavailable"
+        return "", REPLAY_NONE
+    try:
+        same = (str(existing["request_hash"] or "") == digest)
+        job_id = str(existing["id"])
+    except Exception:
+        return "", "unavailable"
+    if same and job_id:
+        return job_id, ""
+    return "", "conflict"
+
+
+def _converge_loser(conn, subject, idem_key, plan_id, ack, fallback_err):
+    # type: (...) -> Tuple[str, bool, str]
+    """Race-loser convergence: after Step 1, a same-key request may have
+    won the reservation race in between. Return the winner's recorded
+    job instead of a spurious gate error; otherwise keep the original
+    gate error unchanged."""
+    winner_id, replay_err = lookup_replay(conn, subject, idem_key,
+                                          plan_id, ack)
+    if replay_err == "":
+        return winner_id, False, ""
+    if replay_err == "conflict":
+        return "", False, "conflict"
+    return "", False, fallback_err
+
 
 def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
           worker_ready, drained):
@@ -47,29 +121,23 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
     plan_id = str(plan_id or "")
     if not subject or not idem_key or not plan_id:
         return "", False, "invalid_request"
-    try:
-        digest = _jobs.request_hash(plan_id, bool(ack))
-    except Exception:
-        return "", False, "invalid_request"
     # Step 1 — replay precedes every new-admission condition.
-    try:
-        existing = _jobs.find_replay(conn, subject, idem_key)
-    except Exception:
-        return "", False, "unavailable"
-    if existing is not None:
-        try:
-            same = (str(existing["request_hash"] or "") == digest)
-            job_id = str(existing["id"])
-        except Exception:
-            return "", False, "unavailable"
-        if same:
-            return job_id, False, ""
-        return "", False, "conflict"
-    # Step 2 — new-admission gates (no writes yet).
+    existing_id, replay_err = lookup_replay(conn, subject, idem_key,
+                                            plan_id, ack)
+    if replay_err == "":
+        return existing_id, False, ""
+    if replay_err != REPLAY_NONE:
+        return "", False, replay_err
+    # Step 2 — new-admission gates (no writes yet). Every gate that a
+    # concurrent same-key winner could have caused converges on that
+    # winner's job instead of surfacing a spurious error.
     if drained:
-        return "", False, "maintenance"
+        return _converge_loser(conn, subject, idem_key, plan_id, ack,
+                               "maintenance")
     if not worker_ready:
-        return "", False, "worker_unavailable"
+        return _converge_loser(conn, subject, idem_key, plan_id, ack,
+                               "worker_unavailable")
+
     try:
         plan = load_plan(conn, plan_id)
     except PlanNotFound:
@@ -84,7 +152,8 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
     if str(plan.get("subject", "") or "") != subject:
         return "", False, "invalid_request"
     if plan.get("used_at", ""):
-        return "", False, "stale_plan"
+        return _converge_loser(conn, subject, idem_key, plan_id, ack,
+                               "stale_plan")
     try:
         from datetime import datetime, timezone
         exp_raw = str(plan.get("expires_at", "") or "")
@@ -99,17 +168,20 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
         return "", False, "unavailable"
     try:
         if _jobs.recovery_blocked(conn):
-            return "", False, "recovery_required"
+            return _converge_loser(conn, subject, idem_key, plan_id, ack,
+                                   "recovery_required")
     except Exception:
         return "", False, "unavailable"
     try:
         if _jobs.active_job(conn) is not None:
-            return "", False, "busy"
+            return _converge_loser(conn, subject, idem_key, plan_id, ack,
+                                   "busy")
     except Exception:
         return "", False, "unavailable"
     try:
         if _leases.active_probe_leases(conn):
-            return "", False, "busy"
+            return _converge_loser(conn, subject, idem_key, plan_id, ack,
+                                   "busy")
     except Exception:
         return "", False, "unavailable"
     if fresh_fp and fresh_fp != str(plan.get("fingerprint", "") or ""):
@@ -146,6 +218,7 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
     try:
         from .schemas import utcnow_iso
         now = utcnow_iso()
+        digest = _jobs.request_hash(plan_id, bool(ack))
     except Exception:
         return "", False, "unavailable"
     try:
@@ -158,7 +231,17 @@ def admit(conn, subject, idem_key, plan_id, ack, fresh_fp,
             conn.execute("ROLLBACK")
             return "", False, "stale_plan"
         if str(cur["used_at"] or ""):
+            # The plan was consumed while we were in flight. If an
+            # identical request (same subject+key+payload) won the race,
+            # converge on its job; never surface stale_plan for a retry
+            # of the winner and never create a second job.
+            winner_id, winner_err = lookup_replay(
+                conn, subject, idem_key, plan_id, ack)
             conn.execute("ROLLBACK")
+            if winner_err == "":
+                return winner_id, False, ""
+            if winner_err == "conflict":
+                return "", False, "conflict"
             return "", False, "stale_plan"
         busy = conn.execute(
             "SELECT id FROM jobs WHERE state IN"
