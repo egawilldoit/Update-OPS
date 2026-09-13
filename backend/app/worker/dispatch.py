@@ -53,6 +53,10 @@ LAUNCH_PROVE_TIMEOUT_S = 10
 # holds it (blocking mutation admission) until the bound probe unit is
 # positively confirmed stopped by the explicit unit model.
 PROBE_OP_TIMEOUT_S = 120
+# Bounded startup-ready handshake for the required probe executor: the
+# dispatcher must never report itself operational while its probe worker
+# never connected (ProbeWorker._run returns silently on connect failure).
+PROBE_WORKER_START_TIMEOUT_S = 5.0
 HEARTBEAT_FILENAME = "dispatcher.heartbeat"
 RETENTION_STAMP = "retention.lastdate"
 _lock_fh = None  # type: Any
@@ -502,24 +506,55 @@ class ProbeWorker(object):
             self._interval_s = float(POLL_INTERVAL_S)
         self._stop = threading.Event()
         self._thread = None  # type: Any
+        self._ready = threading.Event()
+        self._startup_error = ""
 
-    def start(self):
-        # type: () -> "ProbeWorker"
+    def start(self, timeout_s=None):
+        # type: (float) -> "ProbeWorker"
+        """Start the executor thread and prove it became ready.
+
+        Bounded startup handshake (W3.1): the thread sets _ready only
+        after its DB connection succeeded, so start() returning is never
+        mistaken for a live executor. Callers MUST check is_ready() (or
+        use _require_probe_worker) before treating the dispatcher as
+        operational. On failure (or timeout) startup_error() explains.
+        """
         t = self._thread
-        if t is not None and t.is_alive():
+        if t is not None and t.is_alive() and self._ready.is_set():
             return self
         self._stop.clear()
+        self._ready.clear()
+        self._startup_error = ""
         self._thread = threading.Thread(
             target=self._run, name="ega-probe-worker", daemon=True)
         self._thread.start()
+        try:
+            bound = float(timeout_s) if timeout_s is not None \
+                else float(PROBE_WORKER_START_TIMEOUT_S)
+        except (TypeError, ValueError):
+            bound = float(PROBE_WORKER_START_TIMEOUT_S)
+        deadline = time.monotonic() + max(0.05, bound)
+        while time.monotonic() < deadline:
+            if self._ready.is_set():
+                return self
+            if not self._thread.is_alive():
+                break
+            time.sleep(0.01)
+        if not self._startup_error:
+            self._startup_error = "probe worker failed to become ready"
         return self
 
     def _run(self):
         # type: () -> None
         try:
             conn = connect(self._db_path)
-        except Exception:
+        except Exception as exc:
+            # Startup handshake: report the failure instead of returning
+            # silently (the dispatcher main loop gates on is_ready()).
+            self._startup_error = "probe worker database unavailable: %s" \
+                % type(exc).__name__
             return
+        self._ready.set()
         try:
             while not self._stop.is_set():
                 try:
@@ -539,6 +574,7 @@ class ProbeWorker(object):
     def stop(self, timeout_s=5.0):
         # type: (float) -> None
         self._stop.set()
+        self._ready.clear()
         t = self._thread
         if t is not None:
             try:
@@ -550,6 +586,35 @@ class ProbeWorker(object):
         # type: () -> bool
         t = self._thread
         return bool(t is not None and t.is_alive())
+
+    def is_ready(self):
+        # type: () -> bool
+        """True only while the executor is alive AND its DB connection
+        was established (post-startup handshake). Fail closed."""
+        return bool(self._ready.is_set() and self.is_alive())
+
+    def startup_error(self):
+        # type: () -> str
+        return self._startup_error
+
+
+def _require_probe_worker(worker):
+    # type: (Any) -> None
+    """Fail closed on a missing/never-ready/dead required probe executor.
+
+    The dispatcher must never keep heartbeating as operational while its
+    required probe executor has permanently died (W3.1). Raising
+    SystemExit terminates the process so systemd restarts the complete
+    service and boot reconciliation owns unresolved durable probes.
+    SystemExit is a BaseException, so the loop's `except Exception` never
+    swallows it.
+    """
+    try:
+        ready = bool(worker is not None and worker.is_ready())
+    except Exception:
+        ready = False
+    if not ready:
+        raise SystemExit("probe worker not ready; dispatcher exiting")
 
 
 # -- reconcile (R04/R05/R08) ------------------------------------------------
@@ -1035,10 +1100,18 @@ def main():
     # W3: probes execute on a bounded worker thread with its own
     # connection (the thread owns the reference). The main loop keeps
     # heartbeat, job dispatch, and reconciliation alive while a
-    # 120s-class probe runs.
-    ProbeWorker(settings.db_path).start()
+    # 120s-class probe runs. W3.1: the worker is RETAINED and supervised
+    # — the dispatcher never reports operational health without a live,
+    # connected probe executor (SystemExit on death => systemd restart).
+    probe_worker = ProbeWorker(settings.db_path)
+    probe_worker.start()
+    _require_probe_worker(probe_worker)
     while True:
         try:
+            # Fail closed before any heartbeat/dispatch work: a dead
+            # required executor terminates the process (SystemExit is a
+            # BaseException, never caught by `except Exception` below).
+            _require_probe_worker(probe_worker)
             expire_stale_accepted(conn)
             # W3 backstop: apply/finalize durable probe state first
             # (proof-based; live probes inside their window are

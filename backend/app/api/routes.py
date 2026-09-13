@@ -182,6 +182,40 @@ async def _owner_probe_handle(tool_id, op, timeout_s=25.0):
             "reason": "probe wait crashed: %s" % _safe_detail(exc, 200)}, ""
 
 
+def _durable_observation_applied(request_id):
+    # type: (str) -> bool
+    """Read the durable applied marker for one stored result (reader only).
+
+    RESULT VISIBLE != OBSERVATION APPLIED (W3.1): the route must not
+    present or cache a check as fresh until the coordinator has durably
+    processed the result. This reads the marker; it never applies
+    anything (application belongs to the coordinator).
+    """
+    if not request_id:
+        return False
+    try:
+        from ..owner_probes import observation_applied
+    except Exception:
+        try:
+            from backend.app.owner_probes import (  # type: ignore[no-redef]
+                observation_applied)
+        except Exception:
+            return False
+    try:
+        conn = _db()
+    except Exception:
+        return False
+    try:
+        return bool(observation_applied(conn, request_id))
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _with_probe_handle(card, request_id, pending):
     # type: (Dict[str, Any], str, bool) -> Dict[str, Any]
     """Attach the durable probe handle to a tool-card response.
@@ -643,11 +677,31 @@ async def post_tool_check(tool_id: str, request: Request):
                 "stale — check pending; the result will be recorded"
                 " durably by the worker"),
             _request_id, True))
+    if _status == "pending":
+        # RESULT VISIBLE != OBSERVATION APPLIED (W3.1): the result is
+        # durably stored but the coordinator has not applied the
+        # observation yet. Not a completed fresh check; hand back the
+        # durable handle for polling and never seed the freshness cache.
+        return _ok(_with_probe_handle(
+            _labeled_cached(
+                dict(cached),
+                "stale — result stored; observation application pending"),
+            _request_id, True))
     if _status != "ok":
         _reason = str(_payload.get("reason", "probe failed"))[:300]
         return _ok(_with_probe_handle(
             _labeled_cached(dict(cached), "stale — %s" % _reason),
             _request_id, False))
+    # Defense in depth: only a durably applied observation may be
+    # presented or cached as fresh. The helper already waited boundedly
+    # for the marker; this route-side read is authoritative (reader
+    # only, never applies anything).
+    if not _durable_observation_applied(_request_id):
+        return _ok(_with_probe_handle(
+            _labeled_cached(
+                dict(cached),
+                "stale — result stored; observation application pending"),
+            _request_id, True))
     # The coordinator stored the result and applied the observation (the
     # waiting route is a reader only). Read the durable card back.
     conn_fresh = _db()
