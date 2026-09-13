@@ -681,6 +681,109 @@ def _write_launch_files(payload, payload_path, result_path,
     return ""
 
 
+STREAM_RECORD_MALFORMED_MARKER = "[stream record malformed]"
+
+# A single NDJSON record is normally well under a few KiB. Anything
+# larger than this is corruption/abuse: fail loud instead of buffering
+# without bound.
+MAX_STREAM_RECORD_BYTES = 1024 * 1024
+
+
+class StreamFramingError(Exception):
+    """A stream record exceeded MAX_STREAM_RECORD_BYTES (fail loud).
+
+    `records` carries the valid records parsed before the offending
+    record so a caller can still deliver them exactly once.
+    """
+
+    def __init__(self, message, records=()):
+        # type: (str, object) -> None
+        Exception.__init__(self, message)
+        self.records = list(records or ())
+
+
+class StreamFramer(object):
+    """Lossless framing for the sanitized NDJSON phase stream.
+
+    The phase worker writes one JSON object plus a newline per record
+    (``_StreamWriter._write``). Bytes are buffered until a complete
+    ``\\n`` delimiter is seen, so a record split across reads is never
+    dropped: the incomplete tail survives across ``feed`` calls and is
+    decoded only when complete. Because a complete record ends exactly
+    at a delimiter, decoding it can never split a valid UTF-8 sequence;
+    a multibyte character split across reads stays raw in the buffer
+    until the rest arrives. ``drain`` emits the final newline-less
+    record at end of stream instead of discarding it.
+
+    ``feed`` returns ordered ``(stream, line)`` emit-ready pairs. A
+    complete-but-invalid-JSON record is surfaced with a stable marker
+    (never silently discarded and never leaked raw). An individual
+    record over ``max_record`` raises ``StreamFramingError`` so memory
+    stays bounded and the loss is loud.
+    """
+
+    def __init__(self, max_record=MAX_STREAM_RECORD_BYTES):
+        # type: (int) -> None
+        self._buf = b""
+        self._max_record = int(max_record or MAX_STREAM_RECORD_BYTES)
+
+    def feed(self, chunk):
+        # type: (object) -> List[tuple]
+        out = []  # type: List[tuple]
+        if chunk:
+            self._buf += bytes(chunk)
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl == -1:
+                break
+            raw = self._buf[:nl]
+            self._buf = self._buf[nl + 1:]
+            if len(raw) > self._max_record:
+                self._buf = b""
+                raise StreamFramingError(
+                    "stream record exceeds %d bytes"
+                    % self._max_record, out)
+            out.extend(self._parse(raw))
+        if len(self._buf) > self._max_record:
+            # No delimiter and already over the cap: never grow further.
+            self._buf = b""
+            raise StreamFramingError(
+                "stream record exceeds %d bytes" % self._max_record, out)
+        return out
+
+    def drain(self):
+        # type: () -> List[tuple]
+        """End-of-stream: emit the final (newline-less) record."""
+        raw = self._buf
+        self._buf = b""
+        if not raw:
+            return []
+        if len(raw) > self._max_record:
+            raise StreamFramingError(
+                "stream record exceeds %d bytes" % self._max_record)
+        return self._parse(raw)
+
+    def _parse(self, raw):
+        # type: (bytes) -> List[tuple]
+        if not raw.strip():
+            return []
+        text = raw.decode("utf-8", errors="replace")
+        if text.endswith("\r"):
+            text = text[:-1]
+        try:
+            record = json.loads(text)
+            if not isinstance(record, dict):
+                raise ValueError("record is not an object")
+            line = str(record.get("line", ""))
+            stream = str(record.get("stream", "stdout"))
+        except Exception:
+            return [("event", "%s bytes=%d"
+                     % (STREAM_RECORD_MALFORMED_MARKER, len(raw)))]
+        if stream not in ("stdout", "stderr", "event"):
+            stream = "stdout"
+        return [(stream, line)]
+
+
 def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
                         deadline, emit, cancel_event):
     # type: (object, str, str, str, str, float, object, object) -> tuple
@@ -698,9 +801,11 @@ def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
     offset = [0]
     timed_out = False
     cancelled = False
+    framer = StreamFramer()
+    framing_failed = [False]
 
-    def _tail():
-        # type: () -> None
+    def _tail(final=False):
+        # type: (bool) -> None
         try:
             with open(stream_path, "rb") as fh:
                 fh.seek(offset[0])
@@ -710,21 +815,21 @@ def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
             return
         except Exception:
             return
+        records = []  # type: List[tuple]
         try:
-            text = chunk.decode("utf-8", errors="replace")
+            records.extend(framer.feed(chunk))
+            if final:
+                records.extend(framer.drain())
+        except StreamFramingError as exc:
+            records.extend(getattr(exc, "records", ()) or ())
+            if not framing_failed[0]:
+                framing_failed[0] = True
+                records.append(
+                    ("event", "%s oversized"
+                     % STREAM_RECORD_MALFORMED_MARKER))
         except Exception:
             return
-        for raw in text.split("\n"):
-            if not raw.strip():
-                continue
-            try:
-                record = json.loads(raw)
-                line = str(record.get("line", ""))
-                stream = str(record.get("stream", "stdout"))
-            except Exception:
-                continue
-            if stream not in ("stdout", "stderr", "event"):
-                stream = "stdout"
+        for stream, line in records:
             try:
                 emit(stream, line)
             except Exception:
@@ -753,9 +858,9 @@ def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
         time.sleep(0.25)
     if timed_out or cancelled:
         if _kill_scope_wait_empty(unit, grace):
-            _tail()
+            _tail(True)
         else:
-            _tail()
+            _tail(True)
             return False, {}, \
                 "%s not quiescent after kill" % unit_kind, True
         try:
@@ -765,7 +870,7 @@ def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
                 proc.kill()
             except Exception:
                 pass
-        _tail()
+        _tail(True)
         if cancelled:
             return False, {}, "phase cancelled", True
         return False, {}, "phase deadline exceeded", True
@@ -773,7 +878,7 @@ def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
         rc = proc.wait(timeout=30)
     except Exception:
         rc = -1
-    _tail()
+    _tail(True)
     try:
         _, err = proc.communicate(timeout=5)
     except Exception:
@@ -793,9 +898,9 @@ def _supervise_launched(proc, unit, unit_kind, result_path, stream_path,
         _unit_state = "unknown"
     if _unit_state != "confirmed_stopped":
         if _kill_scope_wait_empty(unit, grace):
-            _tail()
+            _tail(True)
         else:
-            _tail()
+            _tail(True)
             return False, {}, \
                 "%s not quiescent after completion" % unit_kind, True
     if int(rc or 0) not in (0,):
