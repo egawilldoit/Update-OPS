@@ -72,14 +72,14 @@ SECRETS_TABLE = {
     "config.json": (True, 0o640, "root", "ega-update"),
     "api.env": (True, 0o640, "root", "ega-update"),
     "worker.env": (True, 0o640, "root", "ega-update"),
-    "csrf.secret": (True, 0o600, "root", "ega-update"),
-    "tunnel.env": (False, 0o600, "root", "ega-update"),
+    "csrf.secret": (True, 0o600, "ega-update", "ega-update"),
+    "tunnel.env": (False, 0o600, "ega-update", "ega-update"),
     "secrets.env": (True, 0o640, "root", "ega-update"),
     # Tunnel credentials are tunnel-phase material, not local-install
     # material: presence/mode are enforced by the tunnel section
     # whenever the tunnel phase is explicitly requested. Local installs
     # (which skip the tunnel section) must not fail for its absence.
-    "cloudflared/credentials.json": (False, 0o600, "root", "ega-update"),
+    "cloudflared/credentials.json": (False, 0o600, "ega-update", "ega-update"),
     "cloudflared/config.yml": (True, 0o640, "root", "ega-update"),
 }
 

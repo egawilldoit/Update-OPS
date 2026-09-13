@@ -233,8 +233,14 @@ chmod 0640 "$ETC/api.env" "$ETC/worker.env"
 chown root:ega-update "$ETC/api.env" "$ETC/worker.env"
 # Secret files (created by owner, never by installer with real values):
 for f in "$ETC/csrf.secret" "$ETC/tunnel.env"; do
-  [ -e "$f" ] || { touch "$f"; chmod 0600 "$f"; chown root:"$API_USER" "$f"; }
+  [ -e "$f" ] || { touch "$f"; chmod 0600 "$f"; chown "$API_USER":"$API_USER" "$f"; }
 done
+# Enforce service-readable owner-only CSRF secret on existing installs too.
+chmod 0600 "$ETC/csrf.secret"
+chown "$API_USER":"$API_USER" "$ETC/csrf.secret"
+# tunnel.env is consumed by cloudflared under the same service identity.
+chmod 0600 "$ETC/tunnel.env"
+chown "$API_USER":"$API_USER" "$ETC/tunnel.env"
 # Known-secret redaction source (S01): provisioned EMPTY when absent so a
 # fresh install satisfies the structural secret-source contract without
 # undocumented manual file creation. Empty means "no additional known

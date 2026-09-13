@@ -1801,3 +1801,47 @@ def test_s01_unreadable_source_raises(tmp_path):
         pass
     else:
         raise AssertionError("unreadable source did not raise")
+
+
+def test_runtime_csrf_secret_owner_matches_api_identity():
+    """0600 csrf.secret must be owned by the API service identity."""
+    import importlib.util as _ilu
+
+    path = os.path.join(
+        _REPO_ROOT, "deploy", "etc", "validate-release.py")
+    spec = _ilu.spec_from_file_location(
+        "validate_release_csrf_owner", path)
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.SECRETS_TABLE["csrf.secret"] == \
+        (True, 0o600, "ega-update", "ega-update")
+
+    install_src = _read_text(os.path.join(
+        _REPO_ROOT, "deploy", "scripts", "install.sh"))
+    assert 'chown "$API_USER":"$API_USER" "$ETC/csrf.secret"' in install_src
+
+    api_src = _read_text(os.path.join(
+        _REPO_ROOT, "systemd", "ega-update-api.service"))
+    assert "User=ega-update" in api_src
+
+
+def test_runtime_tunnel_credentials_owner_matches_service_identity():
+    """0600 tunnel credentials must be readable by cloudflared service."""
+    import importlib.util as _ilu
+
+    path = os.path.join(
+        _REPO_ROOT, "deploy", "etc", "validate-release.py")
+    spec = _ilu.spec_from_file_location(
+        "validate_release_tunnel_owner", path)
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.SECRETS_TABLE["tunnel.env"] == \
+        (False, 0o600, "ega-update", "ega-update")
+    assert module.SECRETS_TABLE["cloudflared/credentials.json"] == \
+        (False, 0o600, "ega-update", "ega-update")
+
+    unit_src = _read_text(os.path.join(
+        _REPO_ROOT, "systemd", "cloudflared-ega-update.service"))
+    assert "User=ega-update" in unit_src
