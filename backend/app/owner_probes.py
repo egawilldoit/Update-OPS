@@ -6,6 +6,11 @@ probe_requests; the dispatcher (ubuntu, full owner env) executes them via
 adapters and writes typed results to probe_results. The API waits bounded
 in a worker thread (never the event loop) and falls back to cached+stale.
 
+W3: HTTP request lifetime != probe lifetime. await_probe is a PURE READER
+(a wait timeout never mutates durable lifecycle); enqueue_probe coalesces
+identical active requests durably in SQLite; the dispatcher owns result
+storage, observation application (observation.py) and exclusion release.
+
 Ops: inspect | discover | activity | plan | verify | refresh
 (refresh = inspect+discover+activity+verify bundle for Check again).
 
@@ -64,9 +69,16 @@ def _tables_present(conn):
         return False
 
 
-def enqueue_probe(conn, subject, tool_id, op, arg_json="{}"):
-    # type: (sqlite3.Connection, str, str, str, str) -> str
-    """Insert a probe request. Raises ValueError on bad op."""
+def enqueue_probe(conn, subject, tool_id, op, arg_json="{}", coalesce=True):
+    # type: (sqlite3.Connection, str, str, str, str, bool) -> str
+    """Insert a probe request (durable coalescing), or return the id of an
+    identical request that is already queued/running.
+
+    W3: the active-request lookup and the insert happen in ONE
+    BEGIN IMMEDIATE transaction, so concurrent API instances (and an API
+    restart) can never launch a redundant identical probe. Raises
+    ValueError on bad op.
+    """
     if op not in OPS:
         raise ValueError("unknown probe op: %s" % op)
     if not _tables_present(conn):
@@ -74,6 +86,15 @@ def enqueue_probe(conn, subject, tool_id, op, arg_json="{}"):
     request_id = str(uuid.uuid4())
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if coalesce:
+            existing = conn.execute(
+                "SELECT id FROM probe_requests WHERE tool_id=? AND op=?"
+                " AND state IN ('queued','running') AND claim_deadline>?"
+                " ORDER BY created_at LIMIT 1",
+                (tool_id or "", op, _utcnow())).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return str(existing["id"])
         conn.execute(
             "INSERT INTO probe_requests(id,subject,tool_id,op,arg_json,"
             "created_at,claim_deadline,state) VALUES(?,?,?,?,?,?,?,?)",
@@ -105,6 +126,11 @@ def await_probe(conn, request_id, timeout_s=25.0):
     status: ok | deferred | error | timeout. Never raises on missing rows
     (timeout instead). Caller closes its own connection promptly; each poll
     is a short read.
+
+    W3: this is a PURE READER. A wait timeout never mutates the durable
+    request lifecycle — the dispatcher owns claim/execute/finish; the
+    coordinator owns observation application. A timed-out waiter therefore
+    cannot discard a probe that later completes successfully.
     """
     deadline = time.monotonic() + max(1.0, float(timeout_s))
     while time.monotonic() < deadline:
@@ -135,40 +161,51 @@ def await_probe(conn, request_id, timeout_s=25.0):
         if state in ("expired", "deferred"):
             return "deferred", {}
         time.sleep(0.25)
-    try:
-        conn.execute("UPDATE probe_requests SET state='expired'"
-                     " WHERE id=? AND state IN ('queued','running')",
-                     (request_id,))
-        conn.commit()
-    except Exception:
-        pass
     return "timeout", {}
 
 
 def request_owner_probe(tool_id, op, timeout_s=25.0, subject="api"):
     # type: (str, str, float, str) -> Tuple[str, Dict[str, Any]]
-    """API-side helper: enqueue + bounded wait. Opens/closes its own DB
-    connection (short reads only). Must run in a worker thread, never the
-    event loop. Returns (status, payload)."""
+    """API-side helper: enqueue + bounded wait. Returns (status, payload).
+
+    Legacy 2-tuple wrapper; use request_owner_probe_handle when the
+    durable request id is needed (POST /tools/{id}/check, W3)."""
+    status, payload, _request_id = request_owner_probe_handle(
+        tool_id, op, timeout_s=timeout_s, subject=subject)
+    return status, payload
+
+
+def request_owner_probe_handle(tool_id, op, timeout_s=25.0, subject="api",
+                               coalesce=True):
+    # type: (str, str, float, str, bool) -> Tuple[str, Dict[str, Any], str]
+    """API-side helper: durable enqueue (coalescing) + bounded wait.
+
+    Opens/closes its own DB connection (short transactions only). Must
+    run in a worker thread, never the event loop. Returns
+    (status, payload, request_id); request_id is the durable handle the
+    caller can poll (GET /probes/{request_id}) after a timeout.
+    """
     if op not in OPS:
-        return "error", {"reason": "unknown op"}
+        return "error", {"reason": "unknown op"}, ""
     try:
         from .config import settings
         from .db import connect
     except Exception:
-        return "error", {"reason": "config unavailable"}
+        return "error", {"reason": "config unavailable"}, ""
     try:
         conn = connect(settings.db_path)
     except Exception:
-        return "error", {"reason": "database unavailable"}
+        return "error", {"reason": "database unavailable"}, ""
     try:
         try:
-            request_id = enqueue_probe(conn, subject, tool_id, op)
+            request_id = enqueue_probe(conn, subject, tool_id, op,
+                                       coalesce=coalesce)
         except ValueError as exc:
-            return "error", {"reason": str(exc)[:300]}
+            return "error", {"reason": str(exc)[:300]}, ""
         except Exception:
-            return "error", {"reason": "enqueue failed"}
-        return await_probe(conn, request_id, timeout_s=timeout_s)
+            return "error", {"reason": "enqueue failed"}, ""
+        status, payload = await_probe(conn, request_id, timeout_s=timeout_s)
+        return status, payload, request_id
     finally:
         try:
             conn.close()
@@ -214,10 +251,16 @@ def claim_probe(conn, owner):
 
 
 def finish_probe(conn, request_id, status, payload):
-    # type: (sqlite3.Connection, str, str, Dict[str, Any]) -> None
-    """Dispatcher-side: store the typed result (payload pre-sanitized)."""
+    # type: (sqlite3.Connection, str, str, Dict[str, Any]) -> bool
+    """Dispatcher-side: store the typed result (payload pre-sanitized).
+
+    Returns True only when the result is durably stored and the request
+    marked done (one transaction). Observation application is a separate
+    coordinator step (observation.apply_probe_result) so a crash between
+    the two is recoverable from durable state.
+    """
     if not _tables_present(conn):
-        return
+        return False
     try:
         raw = json.dumps(payload or {}, sort_keys=True, default=str)
     except Exception:
@@ -232,22 +275,30 @@ def finish_probe(conn, request_id, status, payload):
             "UPDATE probe_requests SET state='done' WHERE id=?",
             (request_id,))
         conn.commit()
+        return True
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
+        return False
 
 
 def expire_probes(conn):
     # type: (sqlite3.Connection) -> int
-    """Mark past-deadline queued/running probes expired. Returns count."""
+    """Mark past-deadline QUEUED probes expired. Returns count.
+
+    W3: a claimed/running probe is owned by the dispatcher until it
+    finishes or restart reconciliation resolves it; wall-clock expiry is
+    never allowed to discard a running execution (the execution lease,
+    proof-based, bounds exclusion — not this sweep).
+    """
     if not _tables_present(conn):
         return 0
     try:
         cur = conn.execute(
-            "UPDATE probe_requests SET state='expired' WHERE state IN"
-            " ('queued','running') AND claim_deadline<?", (_utcnow(),))
+            "UPDATE probe_requests SET state='expired' WHERE state='queued'"
+            " AND claim_deadline<?", (_utcnow(),))
         conn.commit()
         return int(cur.rowcount or 0)
     except Exception:

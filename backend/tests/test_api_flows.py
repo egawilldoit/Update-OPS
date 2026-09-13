@@ -133,28 +133,68 @@ def _probe_fake(monkeypatch, fake):
 
     Counts the same probe calls as the legacy adapter fake; raising
     adapter methods surface as ("error", ...) like a failed probe.
+
+    W3: the fake models the DISPATCHER. For refresh probes it enqueues a
+    durable request, stores the typed result, and applies the observation
+    through the same coordinator functions production uses; the route
+    only reads the card back (it never writes observation state).
     """
+    def _build_payload(tool_id, op):
+        if op == "refresh":
+            return "ok", {
+                "inspection": _ns_to_dict(fake.inspect()),
+                "discovery": _ns_to_dict(fake.discover()),
+                "activity": _ns_to_dict(fake.activity()),
+                "verification": _ns_to_dict(fake.verify()),
+            }
+        if op == "plan":
+            return "ok", {
+                "planned": _ns_to_dict(fake.plan()),
+                "activity": _ns_to_dict(fake.activity()),
+                "inspection": _ns_to_dict(fake.inspect()),
+            }
+        if op == "inspect":
+            return "ok", _ns_to_dict(fake.inspect())
+        return "error", {"reason": "unsupported op in test"}
+
+    def _persist_refresh(tool_id, status, payload):
+        # type: (str, str, dict) -> str
+        try:
+            from backend.app import db as dbm
+            from backend.app import observation as obs_lib
+            from backend.app import owner_probes as probes_lib
+            conn = dbm.connect(settings_lib.db_path)
+            try:
+                rid = probes_lib.enqueue_probe(conn, "api", tool_id,
+                                               "refresh")
+                probes_lib.finish_probe(conn, rid, status, payload)
+                obs_lib.apply_probe_result(conn, rid)
+                return rid
+            finally:
+                conn.close()
+        except Exception:
+            return ""
+
     async def _fake_owner_probe(tool_id, op, timeout_s=25.0):
         try:
-            if op == "refresh":
-                return "ok", {
-                    "inspection": _ns_to_dict(fake.inspect()),
-                    "discovery": _ns_to_dict(fake.discover()),
-                    "activity": _ns_to_dict(fake.activity()),
-                    "verification": _ns_to_dict(fake.verify()),
-                }
-            if op == "plan":
-                return "ok", {
-                    "planned": _ns_to_dict(fake.plan()),
-                    "activity": _ns_to_dict(fake.activity()),
-                    "inspection": _ns_to_dict(fake.inspect()),
-                }
-            if op == "inspect":
-                return "ok", _ns_to_dict(fake.inspect())
-            return "error", {"reason": "unsupported op in test"}
+            return _build_payload(tool_id, op)
         except Exception as exc:
             return "error", {"reason": "probe failed: %s" % exc}
+
+    async def _fake_owner_probe_handle(tool_id, op, timeout_s=25.0):
+        try:
+            status, payload = _build_payload(tool_id, op)
+        except Exception as exc:
+            status, payload = "error", {
+                "reason": "probe failed: %s" % exc}
+        request_id = ""
+        if op == "refresh":
+            request_id = _persist_refresh(tool_id, status, payload)
+        return status, payload, request_id
+
     monkeypatch.setattr(routes_lib, "_owner_probe", _fake_owner_probe)
+    monkeypatch.setattr(routes_lib, "_owner_probe_handle",
+                        _fake_owner_probe_handle)
     return fake
 
 
