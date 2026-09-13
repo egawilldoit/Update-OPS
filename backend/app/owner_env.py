@@ -12,10 +12,20 @@ plans.release_path); preview and apply must agree or the plan is invalid.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import stat
+import struct
 from typing import Any, Dict, List, Tuple
 
 DEFAULT_RELEASE_LINK = "/opt/ega-update/current"
+
+# Documented default joint group shared by the API (ega-update) and the
+# tool owner (ubuntu). Real deployments may override it via config
+# (settings.shared_group / EGA_SHARED_GROUP); never hardcode beyond this
+# documented default.
+DEFAULT_OWNER_SHARED_GROUP = "ega-update"
 
 # Allow-listed environment keys for owner-side processes. Everything else
 # is dropped. Secrets travel only via explicit config paths, never env.
@@ -304,6 +314,12 @@ def build_owner_contract(settings=None, inventory=None, release_path="",
         "manager_scope": "user",
         "config_identity": str(config_id or ""),
         "sudo_profile": _sudo_profile_id(inventory),
+        # D1: the joint group the tool owner depends on for access to the
+        # shared config/state paths. Recorded explicitly in the contract
+        # so effective access is a declared invariant, not an assumption
+        # about account-database membership (which the running user
+        # manager may not reflect).
+        "shared_group": resolve_shared_group(s, inventory),
     }
     return contract
 
@@ -593,3 +609,588 @@ def canonical_fingerprint(settings=None, inventory=None, release_path=""):
                                  release_path or ""))
     except Exception:
         return ""
+
+
+# -- D1: effective owner-execution credentials ------------------------------
+# The long-running ``user@<uid>.service`` keeps the supplementary-group
+# vector it had when it started. Transient ``systemd-run --user`` units
+# inherit that vector, so a tool owner added to the joint group AFTER the
+# manager started cannot traverse the group-owned shared paths even
+# though the account database lists the membership. Account membership
+# (``usermod -aG``) is therefore NOT an effective guarantee.
+#
+# Do NOT "fix" this with ``--property=SupplementaryGroups=<group>``: on
+# the deployed systemd the unprivileged user manager has CapEff=0 (no
+# CAP_SETGID), so the forked unit's setgroups() fails EPERM and the unit
+# exits EXIT_GROUP (216) -- or the setting is silently ignored. Access is
+# made explicit at the filesystem layer instead: a named-user POSIX ACL
+# grants the tool owner exactly the access the joint group was supposed
+# to provide, without widening any group/other permission bit. The
+# result is verified from the real transient execution identity.
+_ACL_XATTR = "system.posix_acl_access"
+_ACL_VERSION = 2
+_ACL_USER_OBJ = 0x01
+_ACL_USER = 0x02
+_ACL_GROUP_OBJ = 0x04
+_ACL_GROUP = 0x08
+_ACL_MASK = 0x10
+_ACL_OTHER = 0x20
+_ACL_UNDEFINED = 0xFFFFFFFF
+_GROUP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+
+
+def resolve_shared_group(settings=None, inventory=None, override=""):
+    # type: (object, object, str) -> str
+    """Resolve the joint group the tool owner depends on (D1).
+
+    Precedence: explicit override, ``EGA_SHARED_GROUP``, the canonical
+    settings value, an inventory value, then the documented default.
+    An invalid/injection-shaped name never travels; it falls back to the
+    default rather than becoming launch/file arguments.
+    """
+    candidates = [override]
+    try:
+        candidates.append(os.environ.get("EGA_SHARED_GROUP", ""))
+    except Exception:
+        pass
+    try:
+        candidates.append(str(getattr(settings, "shared_group", "") or ""))
+    except Exception:
+        pass
+    try:
+        if isinstance(inventory, dict):
+            candidates.append(str(inventory.get("shared_group", "") or ""))
+    except Exception:
+        pass
+    for value in candidates:
+        try:
+            value = str(value or "").strip()
+        except Exception:
+            continue
+        if value and _GROUP_NAME_RE.match(value):
+            return value
+    return DEFAULT_OWNER_SHARED_GROUP
+
+
+def _acl_parse(raw):
+    # type: (bytes) -> Tuple[int, List[List[int]]]
+    if len(raw) < 4:
+        raise ValueError("acl too short")
+    version, = struct.unpack_from("<I", raw, 0)
+    entries = []  # type: List[List[int]]
+    offset = 4
+    while offset + 8 <= len(raw):
+        tag, perm, eid = struct.unpack_from("<HHI", raw, offset)
+        entries.append([int(tag), int(perm), int(eid)])
+        offset += 8
+    return int(version), entries
+
+
+def _acl_serialize(version, entries):
+    # type: (int, List[List[int]]) -> bytes
+    out = struct.pack("<I", int(version))
+    for tag, perm, eid in entries:
+        out += struct.pack("<HHI", int(tag), int(perm), int(eid))
+    return out
+
+
+def _acl_from_mode(mode):
+    # type: (int) -> List[List[int]]
+    mode = int(mode) & 0o777
+    return [
+        [_ACL_USER_OBJ, (mode >> 6) & 0o7, _ACL_UNDEFINED],
+        [_ACL_GROUP_OBJ, (mode >> 3) & 0o7, _ACL_UNDEFINED],
+        [_ACL_OTHER, mode & 0o7, _ACL_UNDEFINED],
+    ]
+
+
+def _read_acl_entries(path):
+    # type: (str) -> List[List[int]]
+    raw = os.getxattr(path, _ACL_XATTR)
+    _version, entries = _acl_parse(raw)
+    return entries
+
+
+def named_user_acl_perms(path, uid, groups=()):
+    # type: (str, int, object) -> int
+    """Effective permission bits a kernel access check would grant uid.
+
+    Mirrors the POSIX order (owner -> named user -> group -> other) and
+    the ACL mask. Returns 0 when the path is unreadable or grants
+    nothing to the principal. Contents are never read.
+    """
+    try:
+        uid = int(uid)
+    except Exception:
+        return 0
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0
+    try:
+        entries = _read_acl_entries(path)
+    except OSError:
+        entries = _acl_from_mode(stat.S_IMODE(st.st_mode))
+    except Exception:
+        entries = _acl_from_mode(stat.S_IMODE(st.st_mode))
+
+    def _find(tag, eid=None):
+        # type: (int, object) -> object
+        for t, p, e in entries:
+            if t == tag and (eid is None or e == eid):
+                return p
+        return None
+
+    if st.st_uid == uid:
+        return int(_find(_ACL_USER_OBJ) or 0)
+    named = _find(_ACL_USER, uid)
+    if named is not None:
+        mask = _find(_ACL_MASK)
+        return int(named if mask is None else (named & mask))
+    try:
+        group_set = set(int(g) for g in (groups or ()))
+    except Exception:
+        group_set = set()
+    group_set.add(int(st.st_gid))
+    mask = _find(_ACL_MASK)
+    if st.st_gid in group_set:
+        base = _find(_ACL_GROUP_OBJ) or 0
+        return int(base if mask is None else (base & mask))
+    for t, p, e in entries:
+        if t == _ACL_GROUP and e in group_set:
+            return int(p if mask is None else (p & mask))
+    return int(_find(_ACL_OTHER) or 0)
+
+
+def ensure_named_user_access(path, uid, perms):
+    # type: (str, int, int) -> bool
+    """Upsert a named-user POSIX ACL entry without widening anything.
+
+    Returns True when the principal is granted ``perms``. The ACL mask is
+    never raised above the existing group-class permissions, so a grant
+    that would require widening group access is refused (False) instead
+    of silently weakening the file. The visible group bits (the mask) are
+    preserved. Idempotent.
+    """
+    try:
+        uid = int(uid)
+        perms = int(perms) & 0o7
+    except Exception:
+        return False
+    if perms == 0:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    try:
+        entries = _read_acl_entries(path)
+    except Exception:
+        entries = _acl_from_mode(stat.S_IMODE(st.st_mode))
+    mask = 0
+    for tag, perm, _eid in entries:
+        if tag in (_ACL_USER, _ACL_GROUP, _ACL_GROUP_OBJ):
+            mask |= perm
+    if perms & ~mask:
+        return False
+    entries = [e for e in entries
+               if not (e[0] == _ACL_USER and e[2] == uid)
+               and e[0] != _ACL_MASK]
+    entries.append([_ACL_USER, perms, uid])
+    order = {_ACL_USER_OBJ: 0, _ACL_USER: 1, _ACL_GROUP_OBJ: 2,
+             _ACL_GROUP: 3, _ACL_MASK: 4, _ACL_OTHER: 5}
+    entries.sort(key=lambda e: order.get(e[0], 9))
+    pos = 0
+    for i, entry in enumerate(entries):
+        if entry[0] in (_ACL_GROUP_OBJ, _ACL_GROUP):
+            pos = i + 1
+    entries.insert(pos, [_ACL_MASK, mask, _ACL_UNDEFINED])
+    try:
+        os.setxattr(path, _ACL_XATTR,
+                    _acl_serialize(_ACL_VERSION, entries))
+    except OSError:
+        return False
+    return True
+
+
+def _resolve_owner(owner="", settings=None):
+    # type: (str, object) -> str
+    name = str(owner or "")
+    if not name:
+        try:
+            name = str(getattr(settings, "tool_owner", "") or "")
+        except Exception:
+            name = ""
+    return name or "ubuntu"
+
+
+def _access_paths(settings, paths, state_dir, log_dir, backup_dir,
+                  config_dir, config_file, secrets_file, inventory_file):
+    # type: (object, object, str, str, str, str, str, str, str) -> Dict[str, str]
+    base = {}  # type: Dict[str, str]
+    try:
+        if isinstance(paths, dict):
+            base.update({str(k): str(v) for k, v in paths.items()
+                         if isinstance(v, str)})
+    except Exception:
+        base = {}
+    if settings is not None:
+        try:
+            for key in ("secrets_file", "inventory_file", "tool_owner"):
+                if not base.get(key):
+                    value = getattr(settings, key, "")
+                    if isinstance(value, str) and value:
+                        base[key] = value
+        except Exception:
+            pass
+        try:
+            if not base.get("state_dir"):
+                for key, value in (resolved_paths(settings) or {}).items():
+                    if isinstance(value, str) and value:
+                        base.setdefault(key, value)
+        except Exception:
+            pass
+
+    def _pick(explicit, key, default):
+        # type: (str, str, str) -> str
+        if explicit:
+            return str(explicit)
+        if base.get(key):
+            return str(base[key])
+        return default
+
+    state = _pick(state_dir, "state_dir", "/var/lib/ega-update")
+    log = _pick(log_dir, "log_dir", os.path.join(state, "logs"))
+    backup = _pick(backup_dir, "backup_dir", os.path.join(state, "backups"))
+    cfg = _pick(config_file, "config_path",
+                "/etc/ega-update/config.json")
+    etc = str(config_dir or base.get("config_dir", "")
+              or os.path.dirname(cfg) or "/etc/ega-update")
+    secrets = _pick(secrets_file, "secrets_file",
+                    os.path.join(etc, "secrets.env"))
+    inventory = _pick(inventory_file, "inventory_file",
+                      os.path.join(etc, "inventory.json"))
+    return {"state_dir": state, "log_dir": log, "backup_dir": backup,
+            "config_dir": etc, "config_file": cfg,
+            "secrets_file": secrets, "inventory_file": inventory}
+
+
+def _group_gid(name):
+    # type: (str) -> object
+    try:
+        import grp as _grp
+        return int(_grp.getgrnam(name).gr_gid)
+    except Exception:
+        return None
+
+
+def _grantable_uid(owner):
+    # type: (str) -> object
+    try:
+        import pwd as _pwd
+        return int(_pwd.getpwnam(owner).pw_uid)
+    except Exception:
+        return None
+
+
+def provision_owner_access(settings=None, paths=None, owner="", group="",
+                           state_dir="", log_dir="", backup_dir="",
+                           config_dir="", config_file="", secrets_file="",
+                           inventory_file=""):
+    # type: (...) -> Dict[str, Any]
+    """Provision the tool owner's EFFECTIVE access to the shared paths (D1).
+
+    Grants a named-user POSIX ACL (never a wider chmod) for the tool
+    owner on the state/log/backup directories and the config directory
+    and its runtime files. Idempotent; safe to run on a fresh install and
+    on an install whose user manager predates the group assignment.
+    Returns a structured, redacted report (paths/labels only).
+    """
+    group = resolve_shared_group(settings, None, group)
+    owner = _resolve_owner(owner, settings)
+    uid = _grantable_uid(owner)
+    report = {"ok": False, "owner": owner, "uid": uid, "group": group,
+              "applied": [], "errors": []}  # type: Dict[str, Any]
+    if uid is None:
+        report["errors"].append("owner account unresolvable: %s" % owner)
+        return report
+    p = _access_paths(settings, paths, state_dir, log_dir, backup_dir,
+                      config_dir, config_file, secrets_file,
+                      inventory_file)
+    targets = (
+        ("state_dir", p["state_dir"], 0o7, True, True),
+        ("log_dir", p["log_dir"], 0o7, True, True),
+        ("backup_dir", p["backup_dir"], 0o7, True, True),
+        ("config_dir", p["config_dir"], 0o5, True, True),
+        ("config_file", p["config_file"], 0o4, True, False),
+        ("secrets_file", p["secrets_file"], 0o4, True, False),
+        ("inventory_file", p["inventory_file"], 0o4, False, False),
+    )
+    for label, path, perms, required, is_dir in targets:
+        if not path:
+            if required:
+                report["errors"].append("%s path missing" % label)
+            continue
+        if not os.path.lexists(path):
+            if required:
+                report["errors"].append("%s missing: %s" % (label, path))
+            continue
+        if is_dir and not os.path.isdir(path):
+            report["errors"].append("%s not a directory: %s"
+                                    % (label, path))
+            continue
+        if not is_dir and os.path.isdir(path):
+            report["errors"].append("%s is a directory: %s"
+                                    % (label, path))
+            continue
+        if ensure_named_user_access(path, uid, perms):
+            report["applied"].append({"label": label, "path": path,
+                                      "perms": "0%o" % perms})
+        else:
+            report["errors"].append(
+                "cannot grant %s to %s without widening permissions"
+                % (label, owner))
+    report["ok"] = not report["errors"]
+    return report
+
+
+def _write_probe(directory):
+    # type: (str) -> bool
+    """Actually create+remove one uniquely named file in directory."""
+    if not directory or not os.path.isdir(directory):
+        return False
+    target = os.path.join(
+        directory, ".ega-credcheck-%d-%s" % (os.getpid(),
+                                             os.urandom(4).hex()))
+    fd = None
+    try:
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        fd = None
+        os.unlink(target)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if os.path.lexists(target):
+                os.unlink(target)
+        except OSError:
+            pass
+
+
+def _read_probe(path):
+    # type: (str) -> bool
+    """Open a file for read without consuming any contents."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as fh:
+            fh.read(0)
+        return True
+    except OSError:
+        return False
+
+
+def execution_credentials_probe(settings=None, paths=None, owner="",
+                                group="", state_dir="", log_dir="",
+                                backup_dir="", config_dir="",
+                                config_file="", secrets_file="",
+                                inventory_file="", payload_path="",
+                                result_path="", stream_path=""):
+    # type: (...) -> Dict[str, Any]
+    """Verify the ACTUAL execution identity and access (D1).
+
+    Reports effective uid/gid/supplementary groups plus real read/write
+    access to the config source, probe payload, and result/stream
+    directories. Contains only booleans, ids, labels, and paths -- never
+    file contents, secret values, or environment dumps. ``ok`` is True
+    only when every required access is effective in THIS process.
+    """
+    owner = _resolve_owner(owner, settings)
+    shared_group = resolve_shared_group(settings, None, group)
+    try:
+        import pwd as _pwd
+        user = _pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        user = owner
+    try:
+        groups = sorted(int(g) for g in os.getgroups())
+    except Exception:
+        groups = []
+    shared_gid = _group_gid(shared_group)
+    p = _access_paths(settings, paths, state_dir, log_dir, backup_dir,
+                      config_dir, config_file, secrets_file,
+                      inventory_file)
+    report = {
+        "ok": False,
+        "profile": "owner-exec-effective-access",
+        "uid": os.getuid(),
+        "euid": os.geteuid(),
+        "gid": os.getgid(),
+        "egid": os.getegid(),
+        "groups": groups,
+        "user": user,
+        "shared_group": shared_group,
+        "shared_gid": shared_gid,
+        "in_shared_group": bool(shared_gid is not None
+                                and shared_gid in groups),
+        "checks": {},
+        "reasons": [],
+    }  # type: Dict[str, Any]
+
+    def _access(path, mode):
+        # type: (str, int) -> bool
+        try:
+            return bool(os.access(path, mode, effective_ids=True))
+        except TypeError:
+            try:
+                return bool(os.access(path, mode))
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _add(label, path, required, check):
+        # type: (str, str, bool, object) -> None
+        entry = {"path": path or "", "required": bool(required),
+                 "ok": False}
+        try:
+            entry["ok"] = bool(check())
+        except Exception:
+            entry["ok"] = False
+        report["checks"][label] = entry
+
+    _add("state_dir_traverse", p["state_dir"], True,
+         lambda: _access(p["state_dir"], os.X_OK))
+    _add("state_dir_write", p["state_dir"], True,
+         lambda: _write_probe(p["state_dir"]))
+    _add("log_dir_write", p["log_dir"], True,
+         lambda: _write_probe(p["log_dir"]))
+    _add("backup_dir_write", p["backup_dir"], True,
+         lambda: _write_probe(p["backup_dir"]))
+    _add("config_dir_traverse", p["config_dir"], True,
+         lambda: _access(p["config_dir"], os.X_OK))
+    _add("config_file_read", p["config_file"], True,
+         lambda: _read_probe(p["config_file"]))
+    _add("secrets_file_read", p["secrets_file"], True,
+         lambda: _read_probe(p["secrets_file"]))
+    inventory_present = bool(p["inventory_file"]) and \
+        os.path.exists(p["inventory_file"])
+    _add("inventory_file_read", p["inventory_file"],
+         inventory_present,
+         lambda: _read_probe(p["inventory_file"])
+         if inventory_present else True)
+    if payload_path:
+        _add("payload_read", payload_path, True,
+             lambda: _read_probe(payload_path))
+    result_dir = os.path.dirname(result_path) or p["log_dir"]
+    stream_dir = os.path.dirname(stream_path) or p["log_dir"]
+    _add("result_dir_write", result_dir, True,
+         lambda: _write_probe(result_dir))
+    _add("stream_dir_write", stream_dir, True,
+         lambda: _write_probe(stream_dir))
+    report["reasons"] = [
+        "%s failed (%s)" % (label, entry.get("path", ""))
+        for label, entry in report["checks"].items()
+        if entry.get("required") and not entry.get("ok")]
+    report["ok"] = not report["reasons"]
+    return report
+
+
+def main(argv=None):
+    # type: (object) -> int
+    """Owner-execution credential CLI (stdlib-only; deploy scripts use it).
+
+    Subcommands:
+      provision  Apply the explicit effective-access contract (ACLs).
+      probe      Emit a redacted effective-credential/access report.
+      verify     Exit 0 only when a probe report says ok.
+    """
+    import argparse
+    import sys
+
+    ap = argparse.ArgumentParser(prog="backend.app.owner_env")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    def _common(parser):
+        # type: (object) -> None
+        parser.add_argument("--owner", default="")
+        parser.add_argument("--group", default="")
+        parser.add_argument("--state-dir", default="")
+        parser.add_argument("--log-dir", default="")
+        parser.add_argument("--backup-dir", default="")
+        parser.add_argument("--config-dir", default="")
+        parser.add_argument("--config-file", default="")
+        parser.add_argument("--secrets-file", default="")
+        parser.add_argument("--inventory-file", default="")
+
+    p_provision = sub.add_parser("provision")
+    _common(p_provision)
+    p_probe = sub.add_parser("probe")
+    _common(p_probe)
+    p_probe.add_argument("--payload", default="")
+    p_probe.add_argument("--result", default="")
+    p_probe.add_argument("--stream", default="")
+    p_probe.add_argument("--report-out", default="")
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("--report", required=True)
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0) if isinstance(exc.code, int) else 1
+
+    if args.command == "verify":
+        try:
+            with open(args.report, "r", encoding="utf-8") as fh:
+                report = json.load(fh)
+        except Exception as exc:
+            sys.stderr.write("credential report unreadable: %s\n" % exc)
+            return 1
+        if isinstance(report, dict) and report.get("ok") is True:
+            sys.stdout.write("ok\n")
+            return 0
+        summary = {"reasons": (report or {}).get("reasons", [])
+                   if isinstance(report, dict) else ["malformed"]}
+        sys.stderr.write("credential report not ok: %s\n"
+                         % json.dumps(summary, sort_keys=True))
+        return 1
+
+    kwargs = {
+        "owner": args.owner, "group": args.group,
+        "state_dir": args.state_dir, "log_dir": args.log_dir,
+        "backup_dir": args.backup_dir, "config_dir": args.config_dir,
+        "config_file": args.config_file, "secrets_file": args.secrets_file,
+        "inventory_file": args.inventory_file,
+    }
+    if args.command == "provision":
+        report = provision_owner_access(**kwargs)
+        sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
+        return 0 if report.get("ok") else 1
+
+    report = execution_credentials_probe(
+        **kwargs, payload_path=args.payload, result_path=args.result,
+        stream_path=args.stream)
+    if args.report_out:
+        try:
+            parent = os.path.dirname(os.path.abspath(args.report_out))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            tmp = "%s.tmp-%d" % (args.report_out, os.getpid())
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, sort_keys=True)
+            os.replace(tmp, args.report_out)
+        except OSError as exc:
+            sys.stderr.write("cannot write credential report: %s\n" % exc)
+            return 1
+    sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
+    return 0 if report.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

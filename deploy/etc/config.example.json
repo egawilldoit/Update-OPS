@@ -29,6 +29,7 @@
   "rate_limit_per_min": 60,
   "body_limit_bytes": 262144,
   "tool_owner": "ubuntu",
+  "shared_group": "ega-update",
   "node_path": "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/node",
   "npm_path": "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npm",
   "npx_path": "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npx",
