@@ -773,20 +773,27 @@ def test_h04_probe_wiring_uses_service_launcher(tmp_path, monkeypatch):
 
     monkeypatch.setattr(phase_run_lib, "run_supervised_probe",
                         _fake_probe)
-    status, payload = dispatch_lib._execute_probe_op(
+    status, payload, stop_proven = dispatch_lib._execute_probe_op(
         "hermes", "inspect", "req-h04")
     assert status == "ok" and payload.get("activity") == "idle"
+    assert stop_proven is True
     assert seen["argv"][1] == "req-h04"
     assert seen["env"].get("USER") == "ubuntu"
 
     def _fake_timeout(*args, **kwargs):
         return False, {}, "probe deadline exceeded", True
 
+    from backend.app import units as units_lib
+    monkeypatch.setattr(
+        units_lib, "query_unit",
+        lambda unit, timeout_s=5: {"state": "confirmed_stopped",
+                                   "unit": unit, "detail": ""})
     monkeypatch.setattr(phase_run_lib, "run_supervised_probe",
                         _fake_timeout)
-    status, payload = dispatch_lib._execute_probe_op(
+    status, payload, stop_proven = dispatch_lib._execute_probe_op(
         "hermes", "inspect", "req-h04")
     assert status == "error"
+    assert stop_proven is True
 
 
 def test_h04_probe_launch_failure_fails_closed(tmp_path, monkeypatch):

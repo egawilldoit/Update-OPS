@@ -126,6 +126,40 @@ def admit_new(conn, subject="owner@example.invalid", plan_id=None,
     return job_id
 
 
+class FakeUnitStates(object):
+    """Hermetic unit-state provider (D5 probe-ownership tests).
+
+    Explicitly maps unit -> live | confirmed_stopped | unknown without
+    ever touching the real systemd user manager. Instances satisfy the
+    units_mod seam of leases.reconcile_probe_leases and the query_unit
+    seam of backend.app.units callers.
+    """
+
+    def __init__(self, states=None, default="unknown"):
+        # type: (object, str) -> None
+        self.states = dict(states or {})
+        self.default = str(default)
+
+    def set(self, unit, state):
+        # type: (str, str) -> None
+        self.states[str(unit or "")] = str(state)
+
+    def query_unit(self, unit, timeout_s=10):
+        # type: (str, float) -> dict
+        state = self.states.get(str(unit or ""), self.default)
+        try:
+            if callable(state):
+                state = state(unit)
+        except Exception:
+            state = "unknown"
+        return {"state": str(state), "unit": str(unit or ""),
+                "detail": "fake:%s" % state}
+
+    def query_unit_system(self, unit, timeout_s=10):
+        # type: (str, float) -> dict
+        return self.query_unit(unit, timeout_s=timeout_s)
+
+
 def bound_receipt(conn, job_id, nonce, after=None, state="succeeded",
                   **overrides):
     # type: (...) -> dict

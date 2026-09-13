@@ -47,9 +47,10 @@ LAUNCH_PROVE_TIMEOUT_S = 10
 # probe op runs at most PROBE_OP_TIMEOUT_S while its probe lease lives
 # leases.PROBE_LEASE_TTL_S (180s). The 60s margin guarantees a
 # long-running read can never outlive its exclusion lease; the worker
-# backstop (deadline+300s alarm) bounds only crash cleanup, and a lease
-# that somehow expires mid-probe is reclaimed without touching mutation
-# leases (the mutation side re-checks inside its own transaction).
+# backstop (deadline+300s alarm) bounds only crash cleanup. D5: a lease
+# that expires mid-probe is NOT reclaimed by time — reconciliation
+# holds it (blocking mutation admission) until the bound probe unit is
+# positively confirmed stopped by the explicit unit model.
 PROBE_OP_TIMEOUT_S = 120
 HEARTBEAT_FILENAME = "dispatcher.heartbeat"
 RETENTION_STAMP = "retention.lastdate"
@@ -251,15 +252,65 @@ def _sanitize_payload(payload):
     return sanitize_json(payload, load_secret_values(settings))
 
 
+def _probe_unit_name(request_id):
+    # type: (str) -> str
+    """Canonical transient probe unit for one request id, or "" when the
+    id cannot bind one (stop is then unprovable and must hold)."""
+    try:
+        from ..owner_env import transient_probe_name
+        return transient_probe_name(request_id or "")
+    except Exception:
+        return ""
+
+
+def _query_probe_unit_state(unit, timeout_s=5):
+    # type: (str, float) -> str
+    """Explicit unit-model state for the probe service (never inferred
+    from time or from a supervision message)."""
+    try:
+        info = _units.query_unit(unit, timeout_s=timeout_s)
+        return str((info or {}).get("state", "unknown"))
+    except Exception:
+        return "unknown"
+
+
+def _probe_stop_proven(request_id, supervised):
+    # type: (str, object) -> bool
+    """D5: positive stop proof for one supervised probe execution.
+
+    run_supervised_probe returning ok=True carries the H03 exit proof
+    (probe service confirmed stopped), so it is proof. ANY other
+    outcome — deadline, refusal, crash, or an explicit
+    "not quiescent" failure — is re-checked against the explicit unit
+    model: release requires confirmed_stopped. A missing/unqueryable
+    unit leaves stop unproven (fail closed: the lease stays held).
+    """
+    try:
+        ok = bool(supervised[0])
+    except Exception:
+        return False
+    if ok:
+        return True
+    unit = _probe_unit_name(request_id)
+    if not unit:
+        return False
+    return _query_probe_unit_state(unit) == _units.CONFIRMED_STOPPED
+
+
 def _execute_probe_op(tool_id, op, request_id=""):
-    # type: (str, str, str) -> Tuple[str, Dict[str, Any]]
+    # type: (str, str, str) -> Tuple[str, Dict[str, Any], bool]
     """Run one probe op supervised (N10, F03, H04): a worker process
     inside a transient probe SERVICE with the same NNP-off owner
     profile as the job runner — never an inherited scope from the
     NNP-on dispatcher — plus a monotonic deadline AND the canonical
     contract env, the exact environment execution phases receive.
     A hanging read-only probe can never wedge the dispatcher loop.
-    Returns (status, payload)."""
+
+    Returns (status, payload, stop_proven). stop_proven is True only
+    when the probe execution is positively known to have ended (or was
+    never launched at all); the caller may release the probe lease only
+    then.
+    """
     from .phase_run import run_supervised_probe
     from ..owner_env import build_owner_contract, contract_env
 
@@ -272,30 +323,44 @@ def _execute_probe_op(tool_id, op, request_id=""):
     try:
         env = contract_env(build_owner_contract(settings))
     except Exception as exc:
-        return "error", {"reason": "owner contract unbuildable: %s" % exc}
+        # No launch can have happened: stop is vacuously proven.
+        return "error", {"reason": "owner contract unbuildable: %s" % exc}, \
+            True
     try:
-        ok, data, error, timed_out = run_supervised_probe(
+        supervised = run_supervised_probe(
             tool_id, request_id or "probe", {"op": op},
             PROBE_OP_TIMEOUT_S, settings, log_dir,
             lambda _s, _l: None, op=op, env=env)
     except Exception as exc:
-        return "error", {"reason": "supervision failed: %s" % exc}
+        # The unit may exist: stop is UNKNOWN and must hold the lease.
+        return "error", {"reason": "supervision failed: %s" % exc}, False
+    stop_proven = _probe_stop_proven(request_id, supervised)
+    try:
+        ok, data, error, timed_out = supervised
+    except Exception:
+        return "error", {"reason": "supervision result malformed"}, False
     if timed_out:
-        return "error", {"reason": "probe deadline exceeded"}
+        return "error", {"reason": "probe deadline exceeded"}, stop_proven
     if not ok:
-        return "error", {"reason": (error or "probe failed")[:300]}
+        return "error", {"reason": (error or "probe failed")[:300]}, \
+            stop_proven
     if not isinstance(data, dict):
-        return "error", {"reason": "probe result malformed"}
-    return "ok", data
+        return "error", {"reason": "probe result malformed"}, stop_proven
+    return "ok", data, stop_proven
 
 
 def run_probe_queue(conn):
     # type: (sqlite3.Connection) -> int
-    """Execute claimed probe requests with mutation exclusion (R01, F12).
+    """Execute claimed probe requests with mutation exclusion (R01, F12,
+    D5).
 
-    Every installation read holds a bounded probe lease while touching
-    the installation; active mutations defer probes, and the atomic
-    lease acquire closes the residual race. Returns processed count.
+    Every installation read holds a probe lease while touching the
+    installation; active mutations defer probes, and the atomic lease
+    acquire closes the residual race. The lease is bound to the probe
+    request id + canonical probe unit and is released ONLY on proven
+    stop (never in a blanket finally): an unproven/non-quiescent stop
+    keeps the lease held so mutation admission stays blocked until
+    reconciliation proves the unit stopped. Returns processed count.
     """
     from ..jobs import active_job
 
@@ -334,7 +399,8 @@ def run_probe_queue(conn):
         try:
             from ..leases import acquire_probe_lease
             lease_id = acquire_probe_lease(
-                conn, tool_id, "dispatcher-%d" % os.getpid())
+                conn, tool_id, "dispatcher-%d" % os.getpid(),
+                request_id=req_id)
         except Exception:
             lease_id = None
         if not lease_id:
@@ -344,17 +410,37 @@ def run_probe_queue(conn):
                 pass
             done += 1
             continue
+        stop_proven = False
         try:
-            status, payload = _execute_probe_op(tool_id, op, req_id)
+            status, payload, stop_proven = _execute_probe_op(
+                tool_id, op, req_id)
         except Exception as exc:
             status, payload = "error", {"reason": str(exc)[:300]}
-        finally:
-            if lease_id:
-                try:
-                    from ..leases import release_lease as _release
-                    _release(conn, lease_id)
-                except Exception:
-                    pass
+            stop_proven = False
+        # D5: release the exclusion ONLY on positive stop proof. An
+        # unproven stop keeps the lease held (mutation admission stays
+        # blocked) until reconciliation proves the bound probe unit
+        # stopped — never by TTL/time and never in a blanket finally.
+        if lease_id and stop_proven:
+            try:
+                from ..leases import release_lease as _release
+                _release(conn, lease_id)
+            except Exception:
+                pass
+        elif lease_id:
+            # D5 evidence: events.job_id REFERENCES jobs(id), so a probe
+            # request id can never be recorded there (the insert fails
+            # closed and would be silently dropped). Persist the held
+            # fact in the durable probe result instead — machine-
+            # readable booleans/ids only; status/reason unchanged.
+            try:
+                if not isinstance(payload, dict):
+                    payload = {"reason": str(payload)[:300]}
+                payload["exclusion_held"] = True
+                payload["lease_id"] = str(lease_id)
+                payload["reconciliation"] = "required"
+            except Exception:
+                pass
         try:
             clean = _sanitize_payload(payload)
         except Exception:
@@ -658,7 +744,18 @@ def reconcile_claimed_jobs(conn):
 
 def reconcile_boot(conn):
     # type: (sqlite3.Connection) -> None
-    """On start: same per-row reconcile. Never auto-resumes work."""
+    """On start: per-row reconcile + probe-lease reconciliation.
+
+    Never auto-resumes work. D5: a dispatcher restart does not stop the
+    transient probe service surviving under the user manager, so every
+    unreleased probe lease (expired or not) is reconciled with positive
+    stop proof — a live survivor keeps blocking mutation admission.
+    """
+    try:
+        from ..leases import reconcile_probe_leases
+        reconcile_probe_leases(conn, include_unexpired=True)
+    except Exception:
+        pass
     for row in _reconcile_candidates(conn):
         try:
             _reconcile_row(conn, row)
@@ -746,8 +843,8 @@ def main():
             expire_stale_accepted(conn)
             run_probe_queue(conn)
             try:
-                from ..leases import reclaim_expired_probes
-                reclaim_expired_probes(conn)
+                from ..leases import reconcile_expired_probes
+                reconcile_expired_probes(conn)
             except Exception:
                 pass
             dispatch_once(conn)
