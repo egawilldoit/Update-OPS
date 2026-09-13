@@ -446,13 +446,23 @@ def test_n08_probe_blocks_reservation_and_vice_versa(tmp_path):
 
 
 def test_n08_stale_probe_reclaim_never_touches_mutation(tmp_path):
+    from backend.app.owner_env import transient_probe_name
+
     conn = _fresh_db(tmp_path)
-    lease = leases_lib.acquire_probe_lease(conn, "hermes", "tester")
+    rid = str(uuid.uuid4())
+    lease = leases_lib.acquire_probe_lease(conn, "hermes", "tester",
+                                           request_id=rid)
     assert lease
     conn.execute("UPDATE execution_leases SET expires_at=?"
                  " WHERE id=?", ("2000-01-01T00:00:00+00:00", lease))
     conn.commit()
-    assert leases_lib.reclaim_expired_probes(conn) == 1
+    # D5: TTL expiry never releases; only positive stop proof does.
+    fake = support_lib.FakeUnitStates(
+        {transient_probe_name(rid): "live"})
+    assert leases_lib.reconcile_expired_probes(conn, units_mod=fake) == 0
+    assert leases_lib.active_probe_leases(conn)
+    fake.set(transient_probe_name(rid), "confirmed_stopped")
+    assert leases_lib.reconcile_expired_probes(conn, units_mod=fake) == 1
     # Mutation leases never time-expire, even backdated.
     row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
     jid, created, err = admit_lib(
@@ -463,7 +473,7 @@ def test_n08_stale_probe_reclaim_never_touches_mutation(tmp_path):
                  " WHERE kind='mutation'",
                  ("2000-01-01T00:00:00+00:00",))
     conn.commit()
-    assert leases_lib.reclaim_expired_probes(conn) == 0
+    assert leases_lib.reconcile_expired_probes(conn, units_mod=fake) == 0
     assert leases_lib.active_mutation_lease(conn) is not None
     assert leases_lib.acquire_probe_lease(conn, "codex", "t2") is None
     conn.close()

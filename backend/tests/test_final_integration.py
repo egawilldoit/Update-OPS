@@ -908,19 +908,31 @@ def test_f12_lease_ttl_covers_probe_deadline_with_margin():
 
 
 def test_f12_expired_read_lease_reclaimed_mutation_safe(tmp_path):
-    """Expired abandoned read leases are reclaimable; mutation leases
+    """D5: expired abandoned read leases are NOT reclaimable by time
+    alone; release requires positive unit-stop proof. Mutation leases
     are never touched by expiry."""
     from backend.app import leases as leases_lib
     from backend.app.admission import admit
+    from backend.app.owner_env import transient_probe_name
 
     conn = _fresh_db(tmp_path)
-    lease = leases_lib.acquire_probe_lease(conn, "hermes", "tester")
+    rid = str(uuid.uuid4())
+    unit = transient_probe_name(rid)
+    lease = leases_lib.acquire_probe_lease(conn, "hermes", "tester",
+                                           request_id=rid)
     assert lease
     conn.execute("UPDATE execution_leases SET expires_at=?"
                  " WHERE id=?", ("2000-01-01T00:00:00+00:00", lease))
     conn.commit()
-    assert leases_lib.reclaim_expired_probes(conn) == 1
+    fake = support_lib.FakeUnitStates({unit: "live"})
+    assert leases_lib.reconcile_expired_probes(conn, units_mod=fake) == 0
     row = support_lib.v2_plan_row(conn, uuid.uuid4().hex)
+    jid, created, err = admit(
+        conn, "owner@example.invalid", "k-f12-r", row["id"], False,
+        "fp-test-1", True, False)
+    assert err == "busy" and not created, err
+    fake.set(unit, "confirmed_stopped")
+    assert leases_lib.reconcile_expired_probes(conn, units_mod=fake) == 1
     jid, created, err = admit(
         conn, "owner@example.invalid", "k-f12-r", row["id"], False,
         "fp-test-1", True, False)
