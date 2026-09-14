@@ -15,10 +15,12 @@ scripts under test are executed, never any service.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import subprocess
+import sys
 import textwrap
 
 
@@ -83,7 +85,16 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "backend.app.cli" ]; then
   exit 0
 fi
 case "${1:-}" in
-  *validate-release.py*) record "VALIDATE_RELEASE"; exit 0 ;;
+  *validate-release.py*)
+    for _a in "$@"; do
+      if [ "$_a" = "--check-compat" ] \
+         && [ "${EGA_HARNESS_COMPAT_FAIL:-0}" = "1" ]; then
+        record "VALIDATE_COMPAT_FAIL"
+        printf 'blocked: schema drift 3->4 (harness compat failure)\n'
+        exit 3
+      fi
+    done
+    record "VALIDATE_RELEASE"; exit 0 ;;
   *owner_env*) record "RELEASE_PY_OWNER_ENV"; exit 0 ;;
 esac
 exit 0
@@ -140,6 +151,14 @@ def _install_shims(bin_dir, sandbox):
     _shim(bin_dir, "mkdir", """
         record "MKDIR $*"
         command /usr/bin/mkdir "$@"
+        rc=$?
+        for d in "$@"; do
+          case "$d" in
+            -*) ;;
+            *) [ -d "$d" ] && command /usr/bin/chmod 0755 "$d" 2>/dev/null ;;
+          esac
+        done
+        exit $rc
         """)
     _shim(bin_dir, "cp", """
         record "CP $*"
@@ -224,6 +243,7 @@ def _install_shims(bin_dir, sandbox):
         : > "$dest/backend/app/static/index.html"
         : > "$dest/backend/requirements.txt"
         : > "$dest/backend/app/__init__.py"
+        : > "$dest/deploy/etc/validate-release.py"
         : > "$dest/systemd/ega-update-api.service"
         : > "$dest/systemd/ega-update-worker.service"
         : > "$dest/systemd/ega-update-runner@.service"
@@ -278,6 +298,23 @@ def _install_shims(bin_dir, sandbox):
               chmod 0755 "$dest/bin/python" "$dest/bin/pip"
               record "VENV $dest"
               exit 0 ;;
+            backend.app.deploy_release)
+              shift 2
+              record "DEPLOY_RELEASE $*"
+              if [ "${EGA_HARNESS_SWITCH_POST_REPLACE_FAIL:-0}" = "1" ] \
+                 && [ "${1:-}" = "switch" ] \
+                 && [ ! -f "$EGA_HARNESS_SANDBOX/.switch-post-replace-failed" ]; then
+                "$EGA_HARNESS_REAL_PY" -m backend.app.deploy_release "$@"
+                _rc=$?
+                if [ "$_rc" = "0" ]; then
+                  : > "$EGA_HARNESS_SANDBOX/.switch-post-replace-failed"
+                  record "DEPLOY_RELEASE_SWITCH_POST_REPLACE_FAIL"
+                  exit 5
+                fi
+                exit "$_rc"
+              fi
+              "$EGA_HARNESS_REAL_PY" -m backend.app.deploy_release "$@"
+              exit $? ;;
             *) exit 0 ;;
           esac
         fi
@@ -322,9 +359,21 @@ def _rewrite_script(text, repo_root, sandbox, script_name):
 
 def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
                       db_exists=True, preexisting_drain=False,
-                      ready_fail=False, services_active=False):
+                      ready_fail=False, services_active=False,
+                      fault_point=None, compat_fail=False,
+                      switch_post_replace_fail=False, lock_held=False):
     """Run install.sh/upgrade.sh in a sandbox. Returns (proc, sandbox,
-    events, env)."""
+    events, env, paths).
+
+    Deterministic W5-D9 fault injection:
+      * fault_point        -> EGA_DEPLOY_FAULT_POINT for the shared
+                              deploy_common.sh hook / primitive hook
+      * compat_fail        -> fake release venv says --check-compat fails
+      * switch_post_replace_fail -> harness corrupts the switch AFTER the
+                              real atomic replace (post-switch recovery)
+      * lock_held          -> the harness holds the kernel flock on the
+                              sandbox deployment lock during the run
+    """
     sandbox = str(tmp_path / "sandbox")
     for rel in ("etc/ega-update", "etc/systemd/system",
                 "opt/ega-update/releases", "var/lib/ega-update/logs",
@@ -376,6 +425,8 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
                _FAKE_VENV_PY)
         _write(os.path.join(prev_release, "venv", "bin", "pip"),
                _FAKE_VENV_PIP)
+        # Immutable-release contract for the restore target (0755).
+        os.chmod(prev_release, 0o755)
         link = os.path.join(sandbox, "opt", "ega-update", "current")
         if os.path.islink(link) or os.path.exists(link):
             os.unlink(link)
@@ -407,14 +458,31 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
         "EGA_HARNESS_BACKUPS": backups,
         "EGA_HARNESS_FAKE_PY": fake_py,
         "EGA_HARNESS_FAKE_PIP": fake_pip,
+        "EGA_HARNESS_REAL_PY": sys.executable,
     })
     if ready_fail:
         env["EGA_HARNESS_READY_FAIL"] = "1"
+    if fault_point:
+        env["EGA_DEPLOY_FAULT_POINT"] = fault_point
+    if compat_fail:
+        env["EGA_HARNESS_COMPAT_FAIL"] = "1"
+    if switch_post_replace_fail:
+        env["EGA_HARNESS_SWITCH_POST_REPLACE_FAIL"] = "1"
     if services_active:
         _write(os.path.join(sandbox, ".systemctl-state"), "active\n")
-    proc = subprocess.run(
-        ["/bin/bash", script_path] + args, env=env,
-        capture_output=True, text=True, timeout=180)
+    lock_handle = None
+    if lock_held:
+        lock_path = os.path.join(sandbox, "opt", "ega-update", "deploy.lock")
+        lock_handle = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", script_path] + args, env=env,
+            capture_output=True, text=True, timeout=180)
+    finally:
+        if lock_handle is not None:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+            lock_handle.close()
     with open(events, "r", encoding="utf-8") as fh:
         event_lines = [ln.strip() for ln in fh.read().splitlines() if ln]
     return proc, sandbox, event_lines, env, {"state": state, "db": db_path,

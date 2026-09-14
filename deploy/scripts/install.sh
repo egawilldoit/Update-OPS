@@ -32,10 +32,14 @@
 # host/runtime mutations (accounts, dirs, linger, owner ACLs, release
 # staging) -> ... -> OPERATIONAL ACCEPTANCE. Fresh installs have no old
 # workload to drain, but every runtime prerequisite is still proven by
-# the canonical readiness gate before success. Failures keep the drain
-# and restore the PRIOR symlink only when the validator compat check
-# passes; otherwise the host is left in manual-recovery state (never
-# "start same broken release" as rollback).
+# the canonical readiness gate before success. Failures keep the drain.
+# W5-D9: `current` is switched/restored ONLY through the shared atomic
+# rename(2) primitive (backend/app/deploy_release.py) guarded by a
+# host-local flock; the prior pointer is restored ONLY when the validator
+# compat check passes and the message distinguishes POINTER RESTORE from
+# DATABASE ROLLBACK from SERVICE RESTORATION; otherwise the host is left
+# in manual-recovery state (never "start same broken release" as
+# rollback).
 #
 # Readiness (W4-D8): the bounded pre-undrain acceptance gate is the ONE
 # shared primitive in deploy/scripts/lib/deploy_common.sh ->
@@ -122,10 +126,17 @@ fi
 
 RELEASE_DIR="$PREFIX/releases/$COMMIT"
 CURRENT_LINK="$PREFIX/current"
-PREV_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || echo '')"
+# W5-D9: PREV_RELEASE is captured via the shared atomic primitive's
+# `inspect` (exact raw target, not a readlink -f guess) AFTER the
+# deployment lock and trusted config parse, before any host mutation.
+PREV_RELEASE=""
 DRAIN_CREATED_BY_US=0
 WAS_API=0
 WAS_WORKER=0
+SWITCH_DONE=0
+MIGRATED=0
+MIGRATION_STARTED=0
+LOCK_FILE="$PREFIX/deploy.lock"
 # F08: existing-deployment detection happens AFTER trusted config parse
 # (see below where EFFECTIVE_DB resolves); never from a hardcoded path
 # before configuration is known.
@@ -152,7 +163,45 @@ cfg_value() {
 }
 
 fail_keep_drain() {
+  # W5-D9 restoration policy. NEVER claims a database rollback: the only
+  # automatic action is an atomic POINTER RESTORE, and only when the
+  # existing --check-compat contract PROVES the prior release can run the
+  # migrated DB. Unknown/false compatibility -> new pointer stays,
+  # services are stopped into the safest recovery state, drain kept,
+  # manual recovery required.
   echo "[install] FAILED: $1" >&2
+  if [ "$SWITCH_DONE" = "1" ]; then
+    if ega_compat_proven "$RELEASE_DIR" "$PREV_RELEASE" "$ETC/config.json"; then
+      echo "[install] compatibility proven — attempting atomic POINTER RESTORE to $PREV_RELEASE (no DATABASE ROLLBACK)" >&2
+      if ega_maybe_fail restore "pointer restoration" && \
+         ega_switch_release "$CURRENT_LINK" "$PREV_RELEASE" "$PREFIX/releases" "$RELEASE_DIR"; then
+        echo "[install] POINTER RESTORE COMPLETE: $CURRENT_LINK -> $PREV_RELEASE (no DATABASE ROLLBACK; the DB migrated by $RELEASE_DIR is NOT restored)" >&2
+        systemctl daemon-reload || true
+        if [ "$WAS_WORKER" = "1" ] || [ "$WAS_API" = "1" ]; then
+          echo "[install] SERVICE RESTORATION: restarting units active before maintenance" >&2
+        fi
+        if [ "$WAS_WORKER" = "1" ]; then systemctl start ega-update-worker || true; fi
+        if [ "$WAS_API" = "1" ]; then systemctl start ega-update-api || true; fi
+      else
+        echo "[install] RESTORE FAILED: $CURRENT_LINK may still resolve to $RELEASE_DIR (POINTER NOT RESTORED) — MANUAL RECOVERY REQUIRED (docs/RUNBOOK.md §7)" >&2
+        systemctl stop ega-update-worker ega-update-api || true
+        echo "[install] SERVICE STOP: api/worker stopped; drain kept" >&2
+      fi
+    else
+      echo "[install] compatibility NOT proven (schema drift/unknown) — pointer NOT restored (stays at $RELEASE_DIR); stopping services; MANUAL RECOVERY REQUIRED (docs/RUNBOOK.md §7)" >&2
+      systemctl stop ega-update-worker ega-update-api || true
+    fi
+  elif [ "$MIGRATED" = "1" ]; then
+    if ega_compat_proven "$RELEASE_DIR" "$PREV_RELEASE" "$ETC/config.json"; then
+      echo "[install] failure after migration; compatibility proven — POINTER UNCHANGED ($PREV_RELEASE); DATABASE NOT ROLLED BACK; restarting previously-active services" >&2
+      if [ "$WAS_WORKER" = "1" ]; then systemctl start ega-update-worker || true; fi
+      if [ "$WAS_API" = "1" ]; then systemctl start ega-update-api || true; fi
+    else
+      echo "[install] failure after migration; compatibility NOT proven — services NOT restarted; MANUAL RECOVERY REQUIRED (docs/RUNBOOK.md §7)" >&2
+    fi
+  elif [ "$MIGRATION_STARTED" = "1" ]; then
+    echo "[install] migration failed — database state unproven; services NOT restarted; MANUAL RECOVERY REQUIRED (docs/RUNBOOK.md §7)" >&2
+  fi
   echo "[install] drain KEPT (blocking admission) for manual review." >&2
   echo "[install] inspect, reconcile (docs/RUNBOOK.md), then sudo rm -f <state_dir>/drain only when healthy." >&2
   exit 1
@@ -182,6 +231,29 @@ if [ -f "$EFFECTIVE_DB" ]; then
   EXISTING_DEPLOY=1
 fi
 echo "[install] existing_deploy=$EXISTING_DEPLOY (from configured db path)"
+
+# ===== DEPLOYMENT LOCK (W5-D9) =====
+# One root-controlled kernel flock serializes the critical deployment
+# execution BEFORE any maintenance mutation (two operators, install vs
+# upgrade overlap, duplicate invocation). Fail fast; the kernel releases
+# the lock on process exit (no stale-PID file semantics).
+if [ -d "$PREFIX" ]; then :; else
+  mkdir -p "$PREFIX" || { echo "[install] REFUSING: cannot create $PREFIX for the deployment lock" >&2; exit 1; }
+fi
+ega_acquire_deploy_lock "$LOCK_FILE" install || exit 1
+
+# Capture the exact PREVIOUS release pointer (W5-D9) via the shared
+# atomic primitive — never `readlink -f`. Invalid pointer evidence fails
+# closed here, before any host/runtime mutation. Fresh installs (no
+# `current`) have no previous release.
+if [ -L "$CURRENT_LINK" ] || [ -e "$CURRENT_LINK" ]; then
+  if PREV_RELEASE="$(ega_release_previous_target "$CURRENT_LINK" "$PREFIX/releases")"; then
+    :
+  else
+    fail_keep_drain "previous release pointer evidence invalid for $CURRENT_LINK (fail closed)"
+  fi
+fi
+echo "[install] previous release: ${PREV_RELEASE:-<none>}"
 
 # Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
 # while present). No drain by default on fresh installs; existing deploys
@@ -263,6 +335,7 @@ STAGE_DIR="$(mktemp -d /var/tmp/ega-stage-XXXXXXXX)" || { echo "[install] cannot
 chmod 0700 "$STAGE_DIR"
 STAGED_ARCHIVE="$STAGE_DIR/release.tar.gz"
 cleanup_stage() { rm -rf "$STAGE_DIR"; }
+ega_maybe_fail stage "candidate staging" || { cleanup_stage; fail_keep_drain "candidate staging failed"; }
 cp -p "$TARBALL" "$STAGED_ARCHIVE" || { echo "[install] cannot stage tarball" >&2; cleanup_stage; exit 1; }
 CANDIDATE_SHA256="$(sha256sum "$STAGED_ARCHIVE" | awk '{print $1}')"
 if [ -z "$CANDIDATE_SHA256" ]; then echo "[install] cannot digest staged archive" >&2; cleanup_stage; exit 1; fi
@@ -438,6 +511,7 @@ fi
 command -v python3 >/dev/null 2>&1 || { echo "python3 (>=3.10,<3.14) required" >&2; exit 1; }
 python3 -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info < (3, 14) else 1)' \
   || { echo "python3 >=3.10,<3.14 required (got: $(python3 --version 2>&1))" >&2; exit 1; }
+ega_maybe_fail venv "release venv/build preparation" || fail_keep_drain "venv creation failed"
 python3 -m venv "$RELEASE_DIR/venv" || fail_keep_drain "venv creation failed"
 cd "$RELEASE_DIR"
 EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/pip" install --require-hashes -r "$RELEASE_DIR/backend/requirements.txt" \
@@ -462,6 +536,7 @@ if [ "$ENABLE_TUNNEL" = "1" ]; then
 else
   VALIDATE_ONLY="--only migrations,hashes,manifest,frontend,config,secrets,port"
 fi
+ega_maybe_fail validate "release validation" || fail_keep_drain "stage validation blocked (fault injected)"
 if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR/deploy/etc/validate-release.py" --release "$RELEASE_DIR" --config "$ETC/config.json" $VALIDATE_ONLY; then
   echo "[install] stage validation ok"
 else
@@ -475,6 +550,7 @@ fi
 if [ "$EXISTING_DEPLOY" = "1" ] && [ -f "$EFFECTIVE_DB" ]; then
   TS="$(date -u +%Y%m%dT%H%M%SZ)"
   cd "$RELEASE_DIR"
+  ega_maybe_fail backup "pre-install DB backup" || fail_keep_drain "pre-install DB backup failed (fault injected)"
   EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.db backup "$EFFECTIVE_DB" "$EFFECTIVE_BACKUPS/state-preinstall-$TS.db" \
     || fail_keep_drain "pre-install DB backup failed"
   chmod 0600 "$EFFECTIVE_BACKUPS"/state-preinstall-*.db
@@ -483,9 +559,15 @@ fi
 
 # 6b. Migrate via the release module entrypoint (N04: only the controlled
 # deploy procedure migrates; services validate only). CWD at release root.
+# MIGRATION_STARTED is set BEFORE the attempt so a failure never restarts
+# the old code against a possibly-migrated DB (fail closed, manual
+# recovery); MIGRATED only after success.
 cd "$RELEASE_DIR"
+MIGRATION_STARTED=1
+ega_maybe_fail migrate "migration" || fail_keep_drain "migration failed (fault injected; see RUNBOOK migration-recovery)"
 if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.db migrate; then
   echo "[install] migrate ok"
+  MIGRATED=1
 else
   fail_keep_drain "migration failed (drain kept; see RUNBOOK migration-recovery)"
 fi
@@ -498,8 +580,26 @@ for dbf in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH-journal"; do
   if [ -e "$dbf" ]; then chown "$API_USER:ega-update" "$dbf" || true; chmod 0660 "$dbf" || true; fi
 done
 
-# 7. Atomic symlink switch (R33 step 7) — only after stage+validate+migrate.
-ln -sfn "$RELEASE_DIR" "$CURRENT_LINK" || fail_keep_drain "cannot flip current symlink"
+# 7. Atomic release pointer switch (R33 step 7, W5-D9) — only after
+# stage+validate+migrate. ONE shared rename(2)-based primitive
+# (backend/app/deploy_release.py via deploy_common.sh): a temporary
+# symlink in the same parent directory is committed with os.replace, so
+# no reader ever observes a missing `current` and a failed preparation
+# leaves the previous pointer untouched. The exact previous target is
+# passed as a compare-and-swap guard (captured by `inspect` above).
+ega_maybe_fail pre-switch "before pointer switch" || fail_keep_drain "release switch aborted before the pointer change (fault injected)"
+if ega_switch_release "$CURRENT_LINK" "$RELEASE_DIR" "$PREFIX/releases" "$PREV_RELEASE"; then
+  SWITCH_DONE=1
+else
+  # Distinguish "never replaced" from "replaced then reported failure"
+  # (post-replace verification mismatch): the independent verify call
+  # decides the recovery policy, always erring toward post-switch.
+  if ega_verify_release "$CURRENT_LINK" "$RELEASE_DIR"; then
+    SWITCH_DONE=1
+  fi
+  fail_keep_drain "atomic release switch failed for $RELEASE_DIR (see diagnosis above)"
+fi
+ega_maybe_fail post-switch "after pointer switch" || fail_keep_drain "post-switch failure (fault injected)"
 
 # 7b. Port drop-in (R35): render the effective listen port from config so
 # the unit never diverges from config defaults. config_cli fails closed;
@@ -527,6 +627,7 @@ mkdir -p /etc/systemd/system/ega-update-worker.service.d
 # launch model); inspect them with `systemctl --user` as ubuntu (with
 # XDG_RUNTIME_DIR set, e.g. via `sudo -u ubuntu -i`), never the system
 # manager. Runner templates document the transient unit shape only.
+ega_maybe_fail units "unit installation/reload" || fail_keep_drain "unit installation failed (fault injected)"
 cp "$CURRENT_LINK/systemd/ega-update-api.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (api)"
 cp "$CURRENT_LINK/systemd/ega-update-worker.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (worker)"
 cp "$CURRENT_LINK/systemd/ega-update-runner@.service" /etc/systemd/system/ || fail_keep_drain "unit copy failed (runner)"
@@ -547,7 +648,9 @@ systemctl enable ega-update-api ega-update-worker || fail_keep_drain "unit enabl
 
 # 9. Start console services. The tunnel starts ONLY under explicit
 # --enable-tunnel (its full validation already passed at stage 5c).
+ega_maybe_fail api-start "api start" || fail_keep_drain "api start failed (fault injected)"
 systemctl start ega-update-api || fail_keep_drain "api start failed"
+ega_maybe_fail worker-start "worker start" || fail_keep_drain "worker start failed (fault injected)"
 systemctl start ega-update-worker || fail_keep_drain "worker start failed"
 if [ "$ENABLE_TUNNEL" = "1" ]; then
   systemctl enable cloudflared-ega-update || fail_keep_drain "tunnel enable failed"
@@ -567,21 +670,12 @@ if ega_wait_for_readiness "$RELEASE_DIR" "$ETC/config.json" \
     "$EFFECTIVE_PORT" /tmp/ega-install-ready.json install; then
   echo "[install] readiness ok (all mandatory stages proven)"
 else
-  # Rollback rule (R33): restore PRIOR symlink ONLY when compat passes;
-  # else leave manual-recovery state. Never restart the broken release.
-  if [ -n "$PREV_RELEASE" ] && [ -d "$PREV_RELEASE" ] && [ "$PREV_RELEASE" != "$RELEASE_DIR" ]; then
-    cd "$RELEASE_DIR"
-    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR/deploy/etc/validate-release.py" --check-compat "$PREV_RELEASE" "$RELEASE_DIR" >/dev/null 2>&1; then
-      echo "[install] readiness failed — compat ok, restoring prior release $PREV_RELEASE" >&2
-      ln -sfn "$PREV_RELEASE" "$CURRENT_LINK"
-      systemctl daemon-reload || true
-      systemctl restart ega-update-api ega-update-worker || true
-      fail_keep_drain "readiness failed; prior release restored (drain kept for review)"
-    fi
-    echo "[install] readiness failed — schema drift: MANUAL RECOVERY (prior symlink NOT restored; drain kept)" >&2
-    fail_keep_drain "readiness failed with schema drift; see RUNBOOK migration-recovery"
-  fi
-  fail_keep_drain "readiness failed after 60s (drain kept)"
+  # W5-D9 restoration policy lives in fail_keep_drain: an atomic POINTER
+  # RESTORE only when --check-compat PROVES the prior release can run the
+  # migrated DB, never a database rollback, never a same-broken-release
+  # restart. Unknown/false compatibility -> new pointer stays, services
+  # stopped, drain kept, manual recovery.
+  fail_keep_drain "readiness failed after 60s (mandatory stages unproven; drain kept)"
 fi
 
 # 9b. Localhost-binding + Access JWT validation checks (implemented here;
