@@ -1,5 +1,6 @@
 import React from "react";
 import { isStale, type ToolCard as Card } from "../api/client";
+import type { CheckState } from "../useToolChecks";
 import { StatusBadge } from "./StatusBadge";
 
 const DISPLAY: Record<string, string> = {
@@ -16,6 +17,7 @@ export function ToolCard({
   onCheck,
   onPlan,
   checking,
+  checkState,
   planning,
   disconnected,
 }: {
@@ -25,6 +27,7 @@ export function ToolCard({
   onCheck: () => void;
   onPlan: () => void;
   checking: boolean;
+  checkState?: CheckState;
   planning: boolean;
   disconnected?: boolean;
 }): React.ReactElement {
@@ -90,6 +93,8 @@ export function ToolCard({
           </div>
         ) : null}
       </dl>
+      {checkState?.kind === "pending" ? <p role="status">Probe pending</p> : null}
+      {checkState?.kind === "error" ? <p role="alert">Check failed: {checkState.message}</p> : null}
       <div className="tool-actions">
         <button type="button" onClick={onCheck} disabled={checking} aria-label={`Check ${name} again`}>
           {checking ? "Checking…" : "Check again"}

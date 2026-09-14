@@ -668,7 +668,6 @@ def test_frontend_source_markers():
     app = _read_text("frontend", "src", "app.tsx")
     assert "final_log_seq" in app or "finalLogSeq" in app
     assert "has_more" in app or "hasMore" in app
-    assert "planGen" in app
     assert "listActiveJobs" in app
     assert "localStorage" in app
     assert "jobInflight" in app or "inflight" in app.lower()

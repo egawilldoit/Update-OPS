@@ -1,5 +1,6 @@
 import React from "react";
 import type { ToolCard as Card } from "../api/client";
+import type { CheckState } from "../useToolChecks";
 import { ToolCard } from "../components/ToolCard";
 
 const ORDER = ["hermes", "opencode", "codex", "t3"];
@@ -8,7 +9,7 @@ export function Overview({
   cards,
   updateDisabled,
   disableReason,
-  checkingId,
+  checkStates,
   planningId,
   disconnected,
   onCheck,
@@ -17,7 +18,7 @@ export function Overview({
   cards: Card[];
   updateDisabled: boolean;
   disableReason: string;
-  checkingId: string;
+  checkStates: Record<string, CheckState>;
   planningId: string;
   disconnected: boolean;
   onCheck: (toolId: string) => void;
@@ -35,7 +36,8 @@ export function Overview({
             disableReason={disableReason}
             onCheck={() => onCheck(c.id)}
             onPlan={() => onPlan(c.id)}
-            checking={checkingId === c.id}
+            checking={checkStates[c.id]?.kind === "checking" || checkStates[c.id]?.kind === "pending"}
+            checkState={checkStates[c.id]}
             planning={planningId === c.id}
             disconnected={disconnected}
           />
