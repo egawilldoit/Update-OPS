@@ -440,7 +440,8 @@ def test_get_probe_oversized_returns_valid_typed_error(tmp_path, monkeypatch):
     _auth_ok(monkeypatch)
     conn = _fresh_db(db_path)
     payload = {"pad": "z" * _OVER_PAD}
-    rid = _finish(conn, "ok", payload)
+    # W9: the read surface is subject-bound to the authenticated owner.
+    rid = _finish(conn, "ok", payload, subject="owner@example.invalid")
     resp = routes_lib.get_probe(rid, _FakeRequest())
     assert resp.status_code == 200
     body = _resp_json(resp)
@@ -448,7 +449,8 @@ def test_get_probe_oversized_returns_valid_typed_error(tmp_path, monkeypatch):
     assert body.get("result") == _too_large_doc(_size(payload))
     assert body.get("result") != {}
     # Historical/corrupt rows keep the defensive decode fallback.
-    rid2 = _finish(conn, "ok", {"fine": True})
+    rid2 = _finish(conn, "ok", {"fine": True},
+                   subject="owner@example.invalid")
     conn.execute("UPDATE probe_results SET result_json=? WHERE request_id=?",
                  ("{not-valid-json", rid2))
     conn.commit()

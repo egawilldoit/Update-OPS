@@ -812,7 +812,10 @@ def test_probe_status_endpoint_reads_durable_state(tmp_path, monkeypatch):
     _state, db_path, _logs = _isolate_settings(tmp_path, monkeypatch)
     _auth_ok(monkeypatch)
     conn = _fresh_db(db_path)
-    rid = probes_lib.enqueue_probe(conn, "api", "hermes", "refresh")
+    # W9: the durable handle is subject-bound; the row records the same
+    # normalized subject the authenticated owner presents.
+    rid = probes_lib.enqueue_probe(conn, "owner@example.invalid", "hermes",
+                                   "refresh")
     resp = routes_lib.get_probe(rid, _FakeRequest())
     assert resp.status_code == 200
     body = _resp_json(resp)
@@ -979,7 +982,8 @@ def test_apply_write_contention_returns_pending_not_false_completion(
 
     def _waiter():
         out["r"] = probes_lib.request_owner_probe_handle(
-            "hermes", "refresh", timeout_s=10.0)
+            "hermes", "refresh", timeout_s=10.0,
+            subject="owner@example.invalid")
 
     waiter = threading.Thread(target=_waiter)
     waiter.start()

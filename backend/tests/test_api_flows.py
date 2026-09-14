@@ -157,15 +157,15 @@ def _probe_fake(monkeypatch, fake):
             return "ok", _ns_to_dict(fake.inspect())
         return "error", {"reason": "unsupported op in test"}
 
-    def _persist_refresh(tool_id, status, payload):
-        # type: (str, str, dict) -> str
+    def _persist_refresh(tool_id, status, payload, subject="api"):
+        # type: (str, str, dict, str) -> str
         try:
             from backend.app import db as dbm
             from backend.app import observation as obs_lib
             from backend.app import owner_probes as probes_lib
             conn = dbm.connect(settings_lib.db_path)
             try:
-                rid = probes_lib.enqueue_probe(conn, "api", tool_id,
+                rid = probes_lib.enqueue_probe(conn, subject, tool_id,
                                                "refresh")
                 probes_lib.finish_probe(conn, rid, status, payload)
                 obs_lib.apply_probe_result(conn, rid)
@@ -181,7 +181,8 @@ def _probe_fake(monkeypatch, fake):
         except Exception as exc:
             return "error", {"reason": "probe failed: %s" % exc}
 
-    async def _fake_owner_probe_handle(tool_id, op, timeout_s=25.0):
+    async def _fake_owner_probe_handle(tool_id, op, timeout_s=25.0,
+                                       subject="api"):
         try:
             status, payload = _build_payload(tool_id, op)
         except Exception as exc:
@@ -189,7 +190,7 @@ def _probe_fake(monkeypatch, fake):
                 "reason": "probe failed: %s" % exc}
         request_id = ""
         if op == "refresh":
-            request_id = _persist_refresh(tool_id, status, payload)
+            request_id = _persist_refresh(tool_id, status, payload, subject)
         return status, payload, request_id
 
     monkeypatch.setattr(routes_lib, "_owner_probe", _fake_owner_probe)
