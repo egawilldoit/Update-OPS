@@ -79,7 +79,7 @@ if ! command -v systemctl >/dev/null 2>&1 \
    || [ ! -d /run/systemd/system ]; then
   refuse "systemd host required"
 fi
-if [ -e "$PRODUCTION_MARKER" ]; then
+if [ -e /etc/ega-update/PRODUCTION ] || [ -e "$PRODUCTION_MARKER" ]; then
   refuse "production marker present ($PRODUCTION_MARKER); this harness must never run against production"
 fi
 if [ ! -L "$CURRENT" ] || [ ! -f "$CONFIG" ]; then
@@ -124,7 +124,7 @@ phase_verify() {
       || fail "no named-user ACL for $TOOL_OWNER on $LOG_DIR"
     ok "explicit owner ACLs (no mode widening)"
   else
-    echo "[vmmatrix] WARN: getfacl unavailable; ACL shape not inspected" >&2
+    fail "getfacl unavailable; ACL contract unproven"
   fi
 
   stat -c '%a %U:%G %n' "$DB_PATH" | grep -Eq '^660 ' \
@@ -165,7 +165,8 @@ phase_verify() {
   local state
   state="$("$PY" -m backend.app.cli status --require-ready 2>&1)"
   local rc=$?
-  echo "[vmmatrix] readiness gate exit=$rc report=$(printf '%s' "$state" | head -c 300)"
+  echo "[vmmatrix] readiness gate exit=$rc"
+  [ "$rc" -eq 0 ] || fail "canonical readiness failed"
   if [ -f "$STATE_DIR/drain" ]; then
     echo "[vmmatrix] drain present: admission is stopped (manual state)"
   fi
@@ -185,7 +186,7 @@ phase_verify() {
       XDG_RUNTIME_DIR="/run/user/$uid" \
       DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
       systemctl --user is-system-running >/dev/null 2>&1 \
-      || echo "[vmmatrix] WARN: user manager not reachable for $TOOL_OWNER" >&2
+      || fail "user manager not reachable for $TOOL_OWNER"
     ok "user@UID manager queried for $TOOL_OWNER"
   fi
 }
@@ -213,7 +214,7 @@ phase_pointer() {
   # CAS: a stale expected-current must fail closed and never overwrite.
   if PYTHONPATH="${EGA_OPERATOR_CHECKOUT}" python3 -m backend.app.deploy_release \
        switch --current "$ptr" --target "$a" --releases-root "$RELEASES" \
-       --previous "$b" >/dev/null 2>&1; then
+       --previous "$a" >/dev/null 2>&1; then
     fail "CAS accepted stale evidence"
   fi
   [ "$(readlink -f "$ptr")" = "$b" ] || fail "CAS failure changed the pointer"
@@ -222,7 +223,7 @@ phase_pointer() {
   # reader loop: never missing, never partial
   local missing=0 unexpected=0 i=0
   (
-    while [ "$i" -lt 200 ]; do
+    while [ ! -e "$scratch/reader-stop" ] && kill -0 "$$" 2>/dev/null; do
       t="$(readlink "$ptr" 2>/dev/null)" || { echo missing >> "$scratch/reader"; break; }
       r="$(readlink -f "$ptr" 2>/dev/null)"
       case "$r" in "$a"|"$b") : ;; *) echo "unexpected:$r" >> "$scratch/reader" ;; esac
@@ -233,13 +234,17 @@ phase_pointer() {
   for _ in $(seq 1 20); do
     if [ "$(readlink -f "$ptr")" = "$a" ]; then
       PYTHONPATH="${EGA_OPERATOR_CHECKOUT}" python3 -m backend.app.deploy_release \
-        switch --current "$ptr" --target "$b" --releases-root "$RELEASES" >/dev/null
+        switch --current "$ptr" --target "$b" --releases-root "$RELEASES" >/dev/null || fail "scratch pointer switch failed"
     else
       PYTHONPATH="${EGA_OPERATOR_CHECKOUT}" python3 -m backend.app.deploy_release \
-        switch --current "$ptr" --target "$a" --releases-root "$RELEASES" >/dev/null
+        switch --current "$ptr" --target "$a" --releases-root "$RELEASES" >/dev/null || fail "scratch pointer switch failed"
     fi
   done
-  wait "$reader" 2>/dev/null || true
+  touch "$scratch/reader-stop"
+  wait "$reader" 2>/dev/null || fail "concurrent reader process failed"
+  if compgen -G "$scratch/.current.tmp.*" >/dev/null; then
+    fail "temporary pointers remain"
+  fi
   if [ -s "$scratch/reader" ]; then
     cat "$scratch/reader" >&2
     rm -rf "$scratch"

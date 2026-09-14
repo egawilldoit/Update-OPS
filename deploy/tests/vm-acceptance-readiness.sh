@@ -9,7 +9,7 @@
 # wired into install.sh/upgrade.sh or pytest collection.
 #
 # Usage (on the deployment VM, after a completed install/upgrade):
-#   sudo EGA_VM_ACCEPTANCE=1 deploy/tests/vm-acceptance-readiness.sh
+#   sudo EGA_VM_ACCEPTANCE=1 EGA_VM_DISPOSABLE=1 deploy/tests/vm-acceptance-readiness.sh
 #
 # Guards: runs only when EGA_VM_ACCEPTANCE=1, euid 0, systemd + release
 # venv present. Exits 0 only when every check passes; 2 when it refuses
@@ -20,11 +20,15 @@ if [ "${EGA_VM_ACCEPTANCE:-0}" != "1" ]; then
   echo "vm-acceptance-readiness: NOT RUN (manual harness; set EGA_VM_ACCEPTANCE=1 on a disposable root VM)" >&2
   exit 0
 fi
+if [ "${EGA_VM_DISPOSABLE:-0}" != "1" ] || [ -e /etc/ega-update/PRODUCTION ]; then
+  echo "vm-acceptance-readiness: REFUSING (disposable VM required; production forbidden)" >&2
+  exit 2
+fi
 if [ "$(id -u)" -ne 0 ]; then
   echo "vm-acceptance-readiness: REFUSING (must run as root via sudo)" >&2
   exit 2
 fi
-if ! command -v systemctl >/dev/null 2>&1; then
+if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
   echo "vm-acceptance-readiness: REFUSING (systemd host required)" >&2
   exit 2
 fi
@@ -68,7 +72,7 @@ if command -v getfacl >/dev/null 2>&1; then
     || fail "no named-user ACL for $TOOL_OWNER on $LOG_DIR"
   echo "[vmaccept]   ok: explicit owner ACLs present (no mode widening)"
 else
-  echo "[vmaccept]   WARN: getfacl unavailable; ACL shape not inspected directly"
+  fail "getfacl unavailable; ACL behavior unproven"
 fi
 
 echo "[vmaccept] 3/5 durable probe-executor ready marker (W3.1)"
@@ -81,21 +85,17 @@ fi
 
 echo "[vmaccept] 4/5 canonical transient owner acceptance round trip"
 if EGA_CONFIG_FILE="$CONFIG" "$PY" -m backend.app.owner_env accept \
-     >/tmp/ega-vmaccept-owner.json 2>/tmp/ega-vmaccept-owner.err; then
+     >/dev/null 2>&1; then
   echo "[vmaccept]   ok: user bus, transient unit, identity, payload/config/result, termination"
 else
-  cat /tmp/ega-vmaccept-owner.json >&2 2>/dev/null || true
-  cat /tmp/ega-vmaccept-owner.err >&2 2>/dev/null || true
   fail "owner_env accept"
 fi
 
 echo "[vmaccept] 5/5 full readiness assessment (all mandatory stages)"
 if EGA_CONFIG_FILE="$CONFIG" "$PY" -m backend.app.deployment_readiness assess \
-     >/tmp/ega-vmaccept-assess.json 2>/tmp/ega-vmaccept-assess.err; then
+     >/dev/null 2>&1; then
   echo "[vmaccept]   ok: all mandatory stages proven"
 else
-  cat /tmp/ega-vmaccept-assess.json >&2 2>/dev/null || true
-  cat /tmp/ega-vmaccept-assess.err >&2 2>/dev/null || true
   fail "deployment_readiness assess"
 fi
 
