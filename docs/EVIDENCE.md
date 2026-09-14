@@ -232,3 +232,32 @@ mismatch, incompatible rollback schema).
 
 Shell scripts pass `bash -n`; install/upgrade never executed
 against the host in this phase.
+
+## Wave D8 addendum — deployment/readiness correction (this pass)
+
+Branch `fix/v1-deployment-readiness`, base
+`aadc87ed69b6ca08322f35e89be9c951b14a4e74`. Scope: deployment ordering,
+canonical readiness, durable probe-executor signal, canonical transient
+owner acceptance. No frontend/probe-binding/queue/retention/adapter or
+multi-machine changes. Hermetic results below were RUN here; live-VM
+acceptance remains `NOT EXECUTED — IMPLEMENTATION PHASE` (manual harness,
+gated by `EGA_VM_ACCEPTANCE=1` + root + systemd, never automatic).
+
+| ID | Criterion | Implementation status | Code paths | Regression artifact | Result |
+| --- | --- | --- | --- | --- | --- |
+| D8-01 | Existing deploy: no host/runtime mutation before drain + proven quiescence (maintenance boundary) | implemented-hermetic | `install.sh` (read-only prechecks -> boundary -> mutations), `upgrade.sh` (secrets.env after stop) | `test_deploy_script_ordering.py` executable PATH-shim harness (observed event order) | verified (hermetic) |
+| D8-02 | `cli status --require-ready` proves ALL mandatory stages, not a heartbeat | implemented-hermetic | `deployment_readiness.py`, `cli.py` | `test_deployment_readiness.py` (per-stage + aggregate + CLI exit 3) | verified (hermetic) |
+| D8-03 | ONE canonical transient owner acceptance primitive | implemented-hermetic | `owner_env.transient_acceptance` / `probe` / `verify`, `deploy_common.sh` | `test_deployment_readiness.py`, `test_deploy_script_ordering.py` | verified (hermetic) |
+| D8-04 | Durable probe-executor marker separate from dispatcher heartbeat | implemented-hermetic | `worker/dispatch.py` (`probe_worker.heartbeat`) | `test_deployment_readiness.py` (real ProbeWorker start/stop) | verified (hermetic) |
+| D8-05 | install/upgrade share one readiness contract (single CLI invocation) | implemented-hermetic | `deploy/scripts/lib/deploy_common.sh` | `test_deploy_script_ordering.py`; `test_ui_deploy.py::test_install_upgrade_ordering` | verified (hermetic) |
+| D8-06 | Failure output/artifacts contain no secret contents | implemented-hermetic | `deployment_readiness.py` (booleans/ids/paths only) | `test_deployment_readiness.py` redaction tests | verified (hermetic) |
+| D8-07 | Pre-existing drain preserved; deployment-created drain follows success/failure policy | implemented-hermetic | `install.sh`/`upgrade.sh` drain lifecycle | `test_deploy_script_ordering.py` drain-policy tests | verified (hermetic) |
+| D8-08 | Real Linux ACLs, user manager, `systemd --user` bus, transient unit, service identities | implemented-static | `deploy/tests/vm-acceptance-readiness.sh` (+ pytest wrapper skip guards) | manual harness only | NOT EXECUTED — IMPLEMENTATION PHASE |
+
+CLI/contract: `status --require-ready` detail schema v1
+(`deployment_readiness.READINESS_SCHEMA_VERSION`), stages
+`api_service_identity`, `api_security_boundary`, `worker_process`,
+`probe_executor`, `owner_transient_execution`; `--require-quiescent` and
+plain `status` unchanged (see `docs/CONTRACTS.md`). Config adds optional
+`api_user` (default `ega-update`; installed api unit `User=` is
+authoritative).

@@ -22,14 +22,28 @@
 # service units of managed tools, or tool data dirs. Tool-affecting steps
 # require an explicit console job, never the installer.
 #
-# Maintenance protocol (R33): on an EXISTING deploy (state.db present) this
-# script follows the same 11-step protocol as upgrade.sh — (1) drain,
-# (2) cli-status quiescence, (3) stop + prove stopped, (4) consistent backup,
-# (5) stage + validate, (6) migrate, (7) atomic switch, (8) units,
-# (9) start, (10) readiness, (11) undrain only on success. Failures keep the
-# drain and restore the PRIOR symlink only when the validator compat check
+# Maintenance protocol (R33, W4-D8 ordering): on an EXISTING deploy
+# (configured state.db present) this script follows the same 11-step
+# protocol as upgrade.sh — (1) drain, (2) cli-status quiescence,
+# (3) stop + prove stopped, (4) consistent backup, (5) stage + validate,
+# (6) migrate, (7) atomic switch, (8) units, (9) start, (10) readiness,
+# (11) undrain only on success. The maintenance boundary is explicit:
+# READ-ONLY PRECHECKS -> DRAIN/ADMISSION STOP -> QUIESCENCE PROOF ->
+# host/runtime mutations (accounts, dirs, linger, owner ACLs, release
+# staging) -> ... -> OPERATIONAL ACCEPTANCE. Fresh installs have no old
+# workload to drain, but every runtime prerequisite is still proven by
+# the canonical readiness gate before success. Failures keep the drain
+# and restore the PRIOR symlink only when the validator compat check
 # passes; otherwise the host is left in manual-recovery state (never
 # "start same broken release" as rollback).
+#
+# Readiness (W4-D8): the bounded pre-undrain acceptance gate is the ONE
+# shared primitive in deploy/scripts/lib/deploy_common.sh ->
+# `cli status --require-ready` (backend/app/deployment_readiness.py):
+# api_service_identity, api_security_boundary, worker_process,
+# probe_executor (durable ProbeWorker marker), owner_transient_execution
+# (canonical D1 transient round trip). The shell consumes only its exit
+# code; a 401 alone is never success.
 #
 # Python rule (R32): every python invocation below runs with CWD set to the
 # release dir (cd "$RELEASE_DIR") under the release venv binary
@@ -56,6 +70,9 @@ VALIDATE_ARCHIVE="$SCRIPT_DIR/../etc/validate-archive.py"
 # from stable DB/systemd contracts without requiring any installed
 # release to implement the newest protocol.
 QUIESCE_CHECK="$SCRIPT_DIR/../etc/quiescence-check.py"
+# Shared deployment helpers (W4-D8): ONE pre-undrain acceptance gate.
+# shellcheck source=lib/deploy_common.sh
+source "$SCRIPT_DIR/lib/deploy_common.sh"
 
 COMMIT=""
 TARBALL=""
@@ -142,6 +159,83 @@ fail_keep_drain() {
 }
 
 echo "[install] pinned release: $COMMIT (existing deploy resolved after config parse below)"
+
+# READ-ONLY PRECHECKS (W4-D8): resolve the configured state paths and the
+# existing-deployment verdict BEFORE any host/runtime mutation. Existing
+# deployment = the CONFIGURED DB path exists (F08), determined only after
+# the trusted-checkout config parse (F06/N16). An EXISTING but unparsable
+# config is a hard failure, never silent.
+# EGA_CONFIG_FILE is exported for ALL python invocations below (R32),
+# including quiescence/status/validator/migrate/readiness.
+export EGA_CONFIG_FILE="$ETC/config.json"
+
+# Resolve state paths from config (N16/R32: never hardcoded for backup/drain).
+EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")"
+EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
+EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
+DRAIN="$EFFECTIVE_STATE/drain"
+echo "[install] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB backups=$EFFECTIVE_BACKUPS"
+# F08: existing deployment = the CONFIGURED DB path exists (determined
+# only now, after trusted config parse — never a hardcoded path before
+# configuration is known).
+if [ -f "$EFFECTIVE_DB" ]; then
+  EXISTING_DEPLOY=1
+fi
+echo "[install] existing_deploy=$EXISTING_DEPLOY (from configured db path)"
+
+# Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
+# while present). No drain by default on fresh installs; existing deploys
+# drain FIRST per the maintenance protocol below.
+echo "[install] drain hooks: fresh default absent ($DRAIN absent = admitting)"
+
+
+# ===== MAINTENANCE BOUNDARY (W4-D8) =====
+# Fresh install: no old workload exists to drain; every runtime
+# prerequisite is still proven after service start before success.
+# Existing deployment: ALL host/runtime/application mutations happen
+# only after the drain below and proven quiescence + proven stopped.
+# Read-only prechecks above are the only operations allowed before it.
+# Existing-deploy maintenance gate (R33 steps 1-3, F07/F09): drain FIRST,
+# prove quiescence via the version-independent deploy controller (bounded
+# 120s, fail closed — never requires any installed release to implement
+# new protocol, never stops services on unproven state), then stop
+# services and PROVE stopped. Fresh installs skip to venv/stage.
+if [ "$EXISTING_DEPLOY" = "1" ]; then
+  echo "[install] existing deploy detected — entering maintenance protocol"
+  mkdir -p "$EFFECTIVE_STATE"
+  if [ -f "$DRAIN" ]; then
+    echo "[install] drain already present at $DRAIN (admission already stopped)"
+  else
+    touch "$DRAIN" || { echo "cannot create drain $DRAIN" >&2; exit 1; }
+    DRAIN_CREATED_BY_US=1
+    echo "[install] drain created at $DRAIN (new plans/jobs refused)"
+  fi
+  echo "[install] waiting for quiescence via deploy controller (bounded 120s)..."
+  QUIESCED=0
+  for _i in $(seq 1 24); do
+    if python3 "$QUIESCE_CHECK" --config "$ETC/config.json" >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
+      QUIESCED=1
+      break
+    fi
+    echo "[install] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-install-status.json reasons..."
+    sleep 5
+  done
+  if [ "$QUIESCED" = "1" ]; then
+    echo "[install] quiesced: deploy controller proves no active/unresolved work, no live units, drain present"
+  else
+    fail_keep_drain "quiescence timeout after 120s (fail closed, drain kept)"
+  fi
+  if systemctl is-active --quiet ega-update-api 2>/dev/null; then WAS_API=1; fi
+  if systemctl is-active --quiet ega-update-worker 2>/dev/null; then WAS_WORKER=1; fi
+  systemctl stop ega-update-worker ega-update-api || true
+  if systemctl is-active --quiet ega-update-api 2>/dev/null; then
+    fail_keep_drain "api failed to stop (fail closed, drain kept)"
+  fi
+  if systemctl is-active --quiet ega-update-worker 2>/dev/null; then
+    fail_keep_drain "worker failed to stop (fail closed, drain kept)"
+  fi
+  echo "[install] stopped: api and worker proven inactive"
+fi
 
 # 1. Dedicated non-root API account (no login shell, no tool ownership).
 if id "$API_USER" >/dev/null 2>&1; then
@@ -283,29 +377,6 @@ YML
   echo "[install] wrote placeholder $ETC/cloudflared/config.yml — REPLACE hostname/tunnel before enabling routing"
 fi
 
-# EGA_CONFIG_FILE is exported for ALL python invocations below (R32),
-# including quiescence/status/validator/migrate/readiness.
-export EGA_CONFIG_FILE="$ETC/config.json"
-
-# Resolve state paths from config (N16/R32: never hardcoded for backup/drain).
-EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")"
-EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
-EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
-DRAIN="$EFFECTIVE_STATE/drain"
-echo "[install] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB backups=$EFFECTIVE_BACKUPS"
-# F08: existing deployment = the CONFIGURED DB path exists (determined
-# only now, after trusted config parse — never a hardcoded path before
-# configuration is known).
-if [ -f "$EFFECTIVE_DB" ]; then
-  EXISTING_DEPLOY=1
-fi
-echo "[install] existing_deploy=$EXISTING_DEPLOY (from configured db path)"
-
-# Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
-# while present). No drain by default on fresh installs; existing deploys
-# drain FIRST per the maintenance protocol below.
-echo "[install] drain hooks: fresh default absent ($DRAIN absent = admitting)"
-
 # 4. Persistent state dirs OUTSIDE releases, shared by the two service
 #    accounts only. Both accounts share joint group ega-update with group
 #    read/write (0770 dirs, 0660 DB files). Never widen beyond the two
@@ -357,48 +428,6 @@ else
   cat /tmp/ega-install-owner-access.json >&2 2>/dev/null || true
   cat /tmp/ega-install-owner-access.err >&2 2>/dev/null || true
   fail_keep_drain "owner-execution effective access could not be provisioned (drain kept)"
-fi
-
-# Existing-deploy maintenance gate (R33 steps 1-3, F07/F09): drain FIRST,
-# prove quiescence via the version-independent deploy controller (bounded
-# 120s, fail closed — never requires any installed release to implement
-# new protocol, never stops services on unproven state), then stop
-# services and PROVE stopped. Fresh installs skip to venv/stage.
-if [ "$EXISTING_DEPLOY" = "1" ]; then
-  echo "[install] existing deploy detected — entering maintenance protocol"
-  mkdir -p "$EFFECTIVE_STATE"
-  if [ -f "$DRAIN" ]; then
-    echo "[install] drain already present at $DRAIN (admission already stopped)"
-  else
-    touch "$DRAIN" || { echo "cannot create drain $DRAIN" >&2; exit 1; }
-    DRAIN_CREATED_BY_US=1
-    echo "[install] drain created at $DRAIN (new plans/jobs refused)"
-  fi
-  echo "[install] waiting for quiescence via deploy controller (bounded 120s)..."
-  QUIESCED=0
-  for _i in $(seq 1 24); do
-    if python3 "$QUIESCE_CHECK" --config "$ETC/config.json" >/tmp/ega-install-status.json 2>/tmp/ega-install-status.err; then
-      QUIESCED=1
-      break
-    fi
-    echo "[install] not quiescent yet, waiting 5s ($_i/24) — see /tmp/ega-install-status.json reasons..."
-    sleep 5
-  done
-  if [ "$QUIESCED" = "1" ]; then
-    echo "[install] quiesced: deploy controller proves no active/unresolved work, no live units, drain present"
-  else
-    fail_keep_drain "quiescence timeout after 120s (fail closed, drain kept)"
-  fi
-  if systemctl is-active --quiet ega-update-api 2>/dev/null; then WAS_API=1; fi
-  if systemctl is-active --quiet ega-update-worker 2>/dev/null; then WAS_WORKER=1; fi
-  systemctl stop ega-update-worker ega-update-api || true
-  if systemctl is-active --quiet ega-update-api 2>/dev/null; then
-    fail_keep_drain "api failed to stop (fail closed, drain kept)"
-  fi
-  if systemctl is-active --quiet ega-update-worker 2>/dev/null; then
-    fail_keep_drain "worker failed to stop (fail closed, drain kept)"
-  fi
-  echo "[install] stopped: api and worker proven inactive"
 fi
 
 # 5. Dedicated app venv + pinned requirements install (baseline Python
@@ -516,44 +545,6 @@ fi
 systemctl daemon-reload || fail_keep_drain "daemon-reload failed"
 systemctl enable ega-update-api ega-update-worker || fail_keep_drain "unit enable failed (api/worker)"
 
-# 8b. Prove the effective transient owner-execution contract (D1). The
-#     probe runs INSIDE a real `systemd-run --user` transient unit as the
-#     tool owner — the exact identity job/probe units use — so it measures
-#     the running user manager's group vector, not a freshly
-#     initgroups()'d login shell (which would falsely pass). The unit
-#     self-reports effective access; any failure keeps the drain and stops
-#     the deploy before services start (fail closed, no manager restart,
-#     no managed-tool touch).
-if [ -z "${SHARED_GROUP:-}" ]; then SHARED_GROUP="ega-update"; fi
-OWNER_UID="$(id -u "$TOOL_OWNER" 2>/dev/null || echo '')"
-if [ -z "$OWNER_UID" ]; then
-  fail_keep_drain "cannot resolve uid for tool owner $TOOL_OWNER"
-fi
-OWNER_RUNTIME="/run/user/$OWNER_UID"
-BUS_READY=0
-for _i in $(seq 1 10); do
-  if [ -S "$OWNER_RUNTIME/bus" ]; then BUS_READY=1; break; fi
-  echo "[install] waiting for user manager bus ($_i/10)..."
-  sleep 1
-done
-if [ "$BUS_READY" != "1" ]; then
-  fail_keep_drain "user manager bus $OWNER_RUNTIME/bus unavailable (linger/user@$OWNER_UID.service not running); cannot prove effective owner-execution credentials"
-fi
-CRED_DIR="$(mktemp -d /var/tmp/ega-credcheck-XXXXXXXX)" || fail_keep_drain "cannot create credential check dir"
-chmod 0700 "$CRED_DIR"
-chown "$TOOL_OWNER:$TOOL_OWNER" "$CRED_DIR" 2>/dev/null || true
-CRED_REPORT="$CRED_DIR/report.json"
-CRED_UNIT="ega-update-credcheck-$$"
-su -s /bin/bash "$TOOL_OWNER" -c "XDG_RUNTIME_DIR='$OWNER_RUNTIME' timeout 45 /usr/bin/systemd-run --user --wait --collect --quiet --unit='$CRED_UNIT' --property=RuntimeMaxSec=30 --working-directory='$RELEASE_DIR' '$RELEASE_DIR/venv/bin/python' -m backend.app.owner_env probe --owner '$TOOL_OWNER' --group '$SHARED_GROUP' --state-dir '$EFFECTIVE_STATE' --log-dir '$EFFECTIVE_STATE/logs' --backup-dir '$EFFECTIVE_BACKUPS' --config-dir '$ETC' --config-file '$ETC/config.json' --secrets-file '$ETC/secrets.env' --inventory-file '$ETC/inventory.json' --report-out '$CRED_REPORT'" >/dev/null 2>&1 || true
-if [ -f "$CRED_REPORT" ] && PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env verify --report "$CRED_REPORT" >/dev/null 2>&1; then
-  echo "[install] effective owner-execution credentials verified from the transient user unit"
-  rm -rf "$CRED_DIR"
-else
-  PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env verify --report "$CRED_REPORT" >&2 2>/dev/null || true
-  rm -rf "$CRED_DIR"
-  fail_keep_drain "transient owner-execution credentials ineffective (see report above; drain kept)"
-fi
-
 # 9. Start console services. The tunnel starts ONLY under explicit
 # --enable-tunnel (its full validation already passed at stage 5c).
 systemctl start ega-update-api || fail_keep_drain "api start failed"
@@ -565,24 +556,16 @@ else
   echo "[install] tunnel NOT enabled/started (local install)" >&2
 fi
 
-# 10. Bounded readiness (R33 step 10): API health via curl localhost plus
-# worker heartbeat freshness via cli status. Both must pass before undrain.
+# 10. Bounded readiness (R33 step 10): ONE canonical acceptance gate shared
+# with upgrade.sh (deploy/scripts/lib/deploy_common.sh) proves ALL mandatory
+# stages through `cli status --require-ready` (api_service_identity,
+# api_security_boundary, worker_process, probe_executor,
+# owner_transient_execution). The shell consumes only the gate exit code;
+# failed stages are named in the machine-readable report and stderr.
 echo "[install] waiting for readiness (bounded 60s)..."
-READY=0
-for _i in $(seq 1 12); do
-  HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EFFECTIVE_PORT/api/v1/health" 2>/dev/null || printf '000')"
-  if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "200" ]; then
-    cd "$RELEASE_DIR"
-    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --require-ready >/tmp/ega-install-ready.json 2>/dev/null; then
-      READY=1
-      break
-    fi
-  fi
-  echo "[install] readiness pending (http=$HTTP_CODE, $_i/12)..."
-  sleep 5
-done
-if [ "$READY" = "1" ]; then
-  echo "[install] readiness ok (api http=$HTTP_CODE, worker heartbeat fresh)"
+if ega_wait_for_readiness "$RELEASE_DIR" "$ETC/config.json" \
+    "$EFFECTIVE_PORT" /tmp/ega-install-ready.json install; then
+  echo "[install] readiness ok (all mandatory stages proven)"
 else
   # Rollback rule (R33): restore PRIOR symlink ONLY when compat passes;
   # else leave manual-recovery state. Never restart the broken release.

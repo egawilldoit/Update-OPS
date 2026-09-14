@@ -82,6 +82,11 @@ class Settings:
     body_limit_bytes: int = 256 * 1024
     # Tool owner / runner
     tool_owner: str = "ubuntu"
+    # Dedicated non-root API service identity (W4-D8): the deployment
+    # readiness gate proves THIS account can read config/csrf.secret,
+    # open the DB, and traverse/write the runtime paths. The installed
+    # api unit's User= is authoritative when it can be queried.
+    api_user: str = "ega-update"
     # Joint group shared by the API and the tool owner for the shared
     # config/state paths (D1: effective access must not rely on the
     # running user manager's stale supplementary-group vector).
@@ -201,6 +206,7 @@ def load_settings():
     s.body_limit_bytes = pick_int(
         "EGA_BODY_LIMIT_BYTES", "body_limit_bytes", s.body_limit_bytes)
     s.tool_owner = pick("EGA_TOOL_OWNER", "tool_owner") or s.tool_owner
+    s.api_user = pick("EGA_API_USER", "api_user", s.api_user) or s.api_user
     s.shared_group = pick(
         "EGA_SHARED_GROUP", "shared_group", s.shared_group) or s.shared_group
     s.node_path = pick("EGA_NODE_PATH", "node_path") or s.node_path

@@ -15,11 +15,37 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import struct
+import sys
 from typing import Any, Dict, List, Tuple
 
 DEFAULT_RELEASE_LINK = "/opt/ega-update/current"
+
+# Canonical owner-transient acceptance (W4-D8): ONE definition shared by
+# the deployment readiness gate (install.sh and upgrade.sh consume only
+# the gate exit code). The primitive launches the existing D1 probe in a
+# real `systemd-run --user` transient unit as the configured tool owner
+# and positively proves: user bus reachable; transient unit launched;
+# effective owner identity correct; shared paths traversable; payload,
+# config and secrets readable; typed result written and read back; unit
+# termination positively observed. It never installs or updates any
+# managed tool and never accepts an arbitrary shell command.
+SYSTEMD_USER_RUN = "systemd-run --user"
+# Canonical command shape (documentation): the launcher runs
+# `python -m backend.app.owner_env probe ... --report-out <json>` inside a
+# transient user unit; the parent verifies the report with the ONE
+# owner_env verify machinery (verify_report; the CLI `verify` subcommand
+# uses the same function) and positively queries unit termination.
+TRANSIENT_ACCEPTANCE_PROFILE = "owner-transient-acceptance"
+TRANSIENT_ACCEPTANCE_TIMEOUT_S = 60.0
+TRANSIENT_ACCEPTANCE_RUNTIME_MAX_S = 30
+TRANSIENT_ACCEPTANCE_REQUIRED_CHECKS = (
+    "state_dir_traverse", "state_dir_write", "log_dir_write",
+    "backup_dir_write", "config_dir_traverse", "config_file_read",
+    "secrets_file_read", "payload_read", "result_write", "result_read",
+)
 
 # Documented default joint group shared by the API (ega-update) and the
 # tool owner (ubuntu). Real deployments may override it via config
@@ -1002,15 +1028,18 @@ def execution_credentials_probe(settings=None, paths=None, owner="",
                                 backup_dir="", config_dir="",
                                 config_file="", secrets_file="",
                                 inventory_file="", payload_path="",
-                                result_path="", stream_path=""):
+                                result_path="", stream_path="", nonce=""):
     # type: (...) -> Dict[str, Any]
     """Verify the ACTUAL execution identity and access (D1).
 
     Reports effective uid/gid/supplementary groups plus real read/write
     access to the config source, probe payload, and result/stream
-    directories. Contains only booleans, ids, labels, and paths -- never
-    file contents, secret values, or environment dumps. ``ok`` is True
-    only when every required access is effective in THIS process.
+    directories. When ``result_path`` is given, a typed result document is
+    actually written and read back with ``nonce`` so result
+    writability/readability is proven, not inferred. Contains only
+    booleans, ids, labels, and paths -- never file contents, secret
+    values, or environment dumps. ``ok`` is True only when every required
+    access is effective in THIS process.
     """
     owner = _resolve_owner(owner, settings)
     shared_group = resolve_shared_group(settings, None, group)
@@ -1095,12 +1124,350 @@ def execution_credentials_probe(settings=None, paths=None, owner="",
          lambda: _write_probe(result_dir))
     _add("stream_dir_write", stream_dir, True,
          lambda: _write_probe(stream_dir))
+    if result_path:
+        # Positive typed round trip: write a nonce-bound result document
+        # and read it back under THIS identity (never infer from modes).
+        result_nonce = str(nonce or "")
+        typed = {"profile": "owner-exec-effective-access",
+                 "uid": os.getuid(), "nonce": result_nonce}
+        written = [False]
+
+        def _write_typed_result():
+            # type: () -> bool
+            try:
+                with open(result_path, "w", encoding="utf-8") as fh:
+                    json.dump(typed, fh, sort_keys=True)
+                written[0] = True
+                return True
+            except Exception:
+                written[0] = False
+                return False
+
+        def _read_typed_result():
+            # type: () -> bool
+            if not written[0]:
+                return False
+            try:
+                with open(result_path, "r", encoding="utf-8") as fh:
+                    back = json.load(fh)
+                return bool(isinstance(back, dict)
+                            and str(back.get("nonce", "")) == result_nonce
+                            and int(back.get("uid", -1) or -1)
+                            == os.getuid())
+            except Exception:
+                return False
+
+        _add("result_write", result_path, True, _write_typed_result)
+        _add("result_read", result_path, True, _read_typed_result)
     report["reasons"] = [
         "%s failed (%s)" % (label, entry.get("path", ""))
         for label, entry in report["checks"].items()
         if entry.get("required") and not entry.get("ok")]
     report["ok"] = not report["reasons"]
     return report
+
+
+def verify_report(report):
+    # type: (object) -> Tuple[bool, List[str]]
+    """Verify one probe/acceptance report. ONE definition (CLI + deploy)."""
+    if isinstance(report, dict) and report.get("ok") is True:
+        return True, []
+    if isinstance(report, dict):
+        reasons = report.get("reasons", [])
+        if isinstance(reasons, list):
+            return False, [str(r) for r in reasons][:10]
+    return False, ["malformed credential report"]
+
+
+def _default_command_runner(argv, env=None, timeout_s=60.0):
+    # type: (object, object, object) -> Dict[str, Any]
+    """Bounded subprocess boundary (never a persistent shell)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            list(argv), env=env, capture_output=True, text=True,
+            timeout=max(1.0, float(timeout_s)),
+            stdin=subprocess.DEVNULL)
+        return {"returncode": int(proc.returncode),
+                "stdout": proc.stdout or "", "stderr": proc.stderr or ""}
+    except Exception as exc:
+        return {"returncode": 255, "stdout": "",
+                "stderr": type(exc).__name__}
+
+
+def _bus_reachable(socket_path, timeout_s=2.0):
+    # type: (str, float) -> bool
+    """Positive user-bus proof: connect to the manager's socket."""
+    try:
+        import socket as _socket
+
+        path = str(socket_path or "")
+        if not path or not os.path.exists(path):
+            return False
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            sock.settimeout(max(0.1, float(timeout_s)))
+            sock.connect(path)
+            return True
+        finally:
+            sock.close()
+    except Exception:
+        return False
+
+
+def _su_transient_argv(owner, runtime_dir, command):
+    # type: (str, str, object) -> List[str]
+    """Run a bounded command as the owner with the user-manager bus set.
+
+    The command list is shell-quoted and passed as ONE `su -c` string so
+    no unquoted token can split or inject; the bus env is explicit (the
+    already-running user manager's vector, not a fresh login)."""
+    import shlex
+
+    inner = " ".join(
+        [("XDG_RUNTIME_DIR=%s" % shlex.quote(str(runtime_dir or "")))] +
+        [shlex.quote(str(part)) for part in command])
+    return ["su", "-s", "/bin/bash", str(owner), "-c", inner]
+
+
+def _acceptance_launch_command(unit, release, python, owner, group, paths,
+                               payload_path, result_path, stream_path,
+                               report_path, nonce, runtime_max_s, timeout_s):
+    # type: (...) -> List[str]
+    import shlex
+
+    return (["timeout", str(int(timeout_s))] + shlex.split(SYSTEMD_USER_RUN)
+            + ["--wait", "--collect", "--quiet",
+               "--unit=%s" % unit,
+               "--property=RuntimeMaxSec=%d" % int(runtime_max_s),
+               "--working-directory=%s" % release,
+               str(python), "-m", "backend.app.owner_env", "probe",
+               "--owner", str(owner), "--group", str(group),
+               "--state-dir", paths["state_dir"],
+               "--log-dir", paths["log_dir"],
+               "--backup-dir", paths["backup_dir"],
+               "--config-dir", paths["config_dir"],
+               "--config-file", paths["config_file"],
+               "--secrets-file", paths["secrets_file"],
+               "--inventory-file", paths["inventory_file"],
+               "--payload", payload_path, "--result", result_path,
+               "--stream", stream_path, "--nonce", nonce,
+               "--report-out", report_path])
+
+
+def _unit_termination_proven(proc):
+    # type: (object) -> Tuple[bool, str]
+    """Positive termination proof from `systemctl --user show`.
+
+    Proven only when the unit is inactive, or already unloaded after a
+    successful `--wait` run (not-found is impossible for a unit that was
+    just launched). Any active/activating/failed/unparseable state fails.
+    """
+    try:
+        code = int((proc or {}).get("returncode", 255))
+    except Exception:
+        code = 255
+    stdout = str((proc or {}).get("stdout", "") or "")
+    stderr = str((proc or {}).get("stderr", "") or "")
+    fields = {}
+    for line in stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+    active = fields.get("ActiveState", "")
+    sub = fields.get("SubState", "")
+    if code == 0:
+        if active == "inactive":
+            return True, "%s/%s" % (active, sub or "dead")
+        return False, active or "unknown"
+    lowered = (stdout + " " + stderr).lower()
+    if "not found" in lowered or "could not be found" in lowered:
+        return True, "not-found"
+    return False, "unproven"
+
+
+def transient_acceptance(settings=None, paths=None, owner="", group="",
+                         state_dir="", log_dir="", backup_dir="",
+                         config_dir="", config_file="", secrets_file="",
+                         inventory_file="", work_dir="", work_root="",
+                         bus_path="", release_root="", venv_python="",
+                         command_runner=None, timeout_s=None,
+                         runtime_max_s=None, keep_work=False):
+    # type: (...) -> Dict[str, Any]
+    """Canonical owner transient round-trip acceptance (W4-D8).
+
+    Deterministic, read-only w.r.t. managed tools, bounded, secret-safe.
+    The report contains booleans/ids/paths only; probe report reasons
+    never include file contents. This is the ONE primitive behind
+    `cli status --require-ready` stage `owner_transient_execution`
+    (install.sh and upgrade.sh consume only the gate exit code) and the
+    `owner_env accept` CLI (VM acceptance harness).
+    """
+    result = {
+        "ok": False, "profile": TRANSIENT_ACCEPTANCE_PROFILE,
+        "owner": "", "uid": None, "bus_path": "", "bus_reachable": False,
+        "unit": "", "launch_exit": None, "report_ok": False,
+        "identity_ok": False, "result_ok": False,
+        "unit_terminated": False, "unit_state": "", "checks": {},
+        "reasons": [],
+    }  # type: Dict[str, Any]
+    reasons = result["reasons"]  # type: List[str]
+    owner = _resolve_owner(owner, settings)
+    result["owner"] = owner
+    uid = _grantable_uid(owner)
+    if uid is None:
+        reasons.append("owner account unresolvable")
+        return result
+    result["uid"] = uid
+    try:
+        bound = float(timeout_s) if timeout_s is not None \
+            else TRANSIENT_ACCEPTANCE_TIMEOUT_S
+    except (TypeError, ValueError):
+        bound = TRANSIENT_ACCEPTANCE_TIMEOUT_S
+    try:
+        runtime_max = int(runtime_max_s) if runtime_max_s is not None \
+            else TRANSIENT_ACCEPTANCE_RUNTIME_MAX_S
+    except (TypeError, ValueError):
+        runtime_max = TRANSIENT_ACCEPTANCE_RUNTIME_MAX_S
+    runner = command_runner or _default_command_runner
+    bus = str(bus_path or "") or ("/run/user/%d/bus" % uid)
+    result["bus_path"] = bus
+    if not _bus_reachable(bus):
+        reasons.append("user manager bus unavailable (%s)" % bus)
+        return result
+    result["bus_reachable"] = True
+    p = _access_paths(settings, paths, state_dir, log_dir, backup_dir,
+                      config_dir, config_file, secrets_file,
+                      inventory_file)
+    try:
+        resolved = resolved_paths(settings)
+    except Exception:
+        resolved = {}
+    release = str(release_root or resolved.get("release_root", "")
+                  or DEFAULT_RELEASE_LINK)
+    python = str(venv_python or resolved.get("venv_python", "")
+                 or sys.executable)
+    created_work = False
+    work = str(work_dir or "")
+    if not work:
+        try:
+            import tempfile
+            work = tempfile.mkdtemp(
+                prefix="ega-owner-acceptance-",
+                dir=str(work_root or "") or None)
+            created_work = True
+        except Exception as exc:
+            reasons.append("acceptance work dir unavailable (%s)"
+                           % type(exc).__name__)
+            return result
+    try:
+        os.makedirs(work, mode=0o700, exist_ok=True)
+        os.chmod(work, 0o700)
+        if os.geteuid() == 0:
+            os.chown(work, uid, uid)
+    except Exception:
+        pass
+    nonce = os.urandom(8).hex()
+    unit = "ega-update-accept-%d-%s.service" % (
+        os.getpid(), os.urandom(4).hex())
+    result["unit"] = unit
+    payload_path = os.path.join(work, "payload.json")
+    result_path = os.path.join(work, "result.json")
+    stream_path = os.path.join(work, "stream.jsonl")
+    report_path = os.path.join(work, "report.json")
+    try:
+        with open(payload_path, "w", encoding="utf-8") as fh:
+            json.dump({"profile": TRANSIENT_ACCEPTANCE_PROFILE,
+                       "nonce": nonce, "uid": uid}, fh, sort_keys=True)
+        os.chmod(payload_path, 0o644)
+        if os.geteuid() == 0:
+            os.chown(payload_path, uid, uid)
+    except Exception as exc:
+        reasons.append("cannot stage acceptance payload (%s)"
+                       % type(exc).__name__)
+        return result
+    launch = _acceptance_launch_command(
+        unit, release, python, owner, resolve_shared_group(
+            settings, None, group), p, payload_path, result_path,
+        stream_path, report_path, nonce, runtime_max, bound)
+    proc = runner(_su_transient_argv(owner, os.path.dirname(bus), launch),
+                  None, bound)
+    try:
+        launch_exit = int(proc.get("returncode", 255))
+    except Exception:
+        launch_exit = 255
+    result["launch_exit"] = launch_exit
+    if launch_exit != 0:
+        reasons.append("transient unit launch failed (exit %s)" % launch_exit)
+    report = {}
+    try:
+        with open(report_path, "r", encoding="utf-8") as fh:
+            report = json.load(fh)
+    except Exception:
+        report = {}
+    report_ok, report_reasons = verify_report(report)
+    result["report_ok"] = bool(report_ok)
+    if not report_ok:
+        reasons.append("transient acceptance report not ok")
+        for entry in report_reasons[:5]:
+            reasons.append("report: %s" % entry)
+    report_checks = report.get("checks", {}) if isinstance(report, dict) \
+        else {}
+    checks = {}  # type: Dict[str, bool]
+    for name in TRANSIENT_ACCEPTANCE_REQUIRED_CHECKS:
+        entry = (report_checks or {}).get(name)
+        checks[name] = bool(isinstance(entry, dict) and entry.get("ok"))
+    result["checks"] = checks
+    failed_checks = [name for name in TRANSIENT_ACCEPTANCE_REQUIRED_CHECKS
+                     if not checks[name]]
+    for name in failed_checks:
+        reasons.append("effective access check failed: %s" % name)
+    identity_ok = False
+    if isinstance(report, dict):
+        try:
+            identity_ok = (int(report.get("uid", -1) or -1) == uid
+                           and str(report.get("user", "")) == owner)
+        except Exception:
+            identity_ok = False
+    result["identity_ok"] = bool(identity_ok)
+    if not identity_ok:
+        reasons.append("effective owner identity mismatch")
+    result_ok = False
+    try:
+        with open(result_path, "r", encoding="utf-8") as fh:
+            written = json.load(fh)
+        result_ok = bool(
+            isinstance(written, dict)
+            and str(written.get("nonce", "")) == nonce
+            and int(written.get("uid", -1) or -1) == uid)
+    except Exception:
+        result_ok = False
+    result["result_ok"] = bool(result_ok)
+    if not result_ok:
+        reasons.append("transient result not readable/writable")
+    if launch_exit == 0:
+        term = runner(_su_transient_argv(
+            owner, os.path.dirname(bus),
+            ["systemctl", "--user", "show",
+             "--property=ActiveState,SubState,Result", unit]), None, 10.0)
+        proven, state = _unit_termination_proven(term)
+        result["unit_terminated"] = bool(proven)
+        result["unit_state"] = state
+        if not proven:
+            reasons.append(
+                "transient unit termination not positively proven (%s)"
+                % state)
+    else:
+        result["unit_state"] = "launch-failed"
+    result["ok"] = bool(
+        result["bus_reachable"] and launch_exit == 0
+        and result["report_ok"] and result["identity_ok"]
+        and result["result_ok"] and result["unit_terminated"]
+        and not failed_checks)
+    if created_work and not keep_work:
+        shutil.rmtree(work, ignore_errors=True)
+    return result
 
 
 def main(argv=None):
@@ -1111,6 +1478,9 @@ def main(argv=None):
       provision  Apply the explicit effective-access contract (ACLs).
       probe      Emit a redacted effective-credential/access report.
       verify     Exit 0 only when a probe report says ok.
+      accept     Run the canonical owner transient acceptance round trip
+                 (user bus -> transient unit -> identity/path/result
+                 proof -> positive termination) and print its report.
     """
     import argparse
     import sys
@@ -1137,9 +1507,17 @@ def main(argv=None):
     p_probe.add_argument("--payload", default="")
     p_probe.add_argument("--result", default="")
     p_probe.add_argument("--stream", default="")
+    p_probe.add_argument("--nonce", default="")
     p_probe.add_argument("--report-out", default="")
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--report", required=True)
+    p_accept = sub.add_parser("accept")
+    _common(p_accept)
+    p_accept.add_argument("--bus", default="")
+    p_accept.add_argument("--release-root", default="")
+    p_accept.add_argument("--venv-python", default="")
+    p_accept.add_argument("--timeout", type=float, default=None)
+    p_accept.add_argument("--runtime-max-sec", type=int, default=None)
     try:
         args = ap.parse_args(argv)
     except SystemExit as exc:
@@ -1152,11 +1530,11 @@ def main(argv=None):
         except Exception as exc:
             sys.stderr.write("credential report unreadable: %s\n" % exc)
             return 1
-        if isinstance(report, dict) and report.get("ok") is True:
+        ok, reasons = verify_report(report)
+        if ok:
             sys.stdout.write("ok\n")
             return 0
-        summary = {"reasons": (report or {}).get("reasons", [])
-                   if isinstance(report, dict) else ["malformed"]}
+        summary = {"reasons": reasons}
         sys.stderr.write("credential report not ok: %s\n"
                          % json.dumps(summary, sort_keys=True))
         return 1
@@ -1173,9 +1551,17 @@ def main(argv=None):
         sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
         return 0 if report.get("ok") else 1
 
+    if args.command == "accept":
+        report = transient_acceptance(
+            **kwargs, bus_path=args.bus, release_root=args.release_root,
+            venv_python=args.venv_python, timeout_s=args.timeout,
+            runtime_max_s=args.runtime_max_sec)
+        sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
+        return 0 if report.get("ok") else 1
+
     report = execution_credentials_probe(
         **kwargs, payload_path=args.payload, result_path=args.result,
-        stream_path=args.stream)
+        stream_path=args.stream, nonce=args.nonce)
     if args.report_out:
         try:
             parent = os.path.dirname(os.path.abspath(args.report_out))

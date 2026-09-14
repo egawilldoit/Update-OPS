@@ -269,16 +269,26 @@ cd /opt/ega-update/current && EGA_CONFIG_FILE=/etc/ega-update/config.json venv/b
   active delegated operations, drain present — bounded 120s, fail
   closed; version-independent, needs no installed release) + proven stop +
   consistent backup + stage + validator + migrate + atomic switch + units
-  (+ port drop-in) + start + bounded readiness (curl localhost health +
-  `cli status --require-ready` worker alive):
+  (+ port drop-in) + start + bounded readiness (ONE shared canonical gate
+  `deploy/scripts/lib/deploy_common.sh` ->
+  `cli status --require-ready`, exit 0 only when ALL mandatory stages are
+  proven: api service identity effective access, loopback auth boundary,
+  worker heartbeat, durable `probe_worker.heartbeat` probe-executor
+  marker, and the canonical transient owner round trip; machine-readable
+  per-stage results with `failed_stages`):
   `sudo rm -f /var/lib/ega-update/drain`. install.sh (existing-deploy
   path) and upgrade.sh create the drain FIRST, prove quiescence via the
   deploy controller, prove services stopped (fail closed, abort, keep
-  drain), and remove the drain only on the success path. Failures keep
-  the drain; the PRIOR release symlink is restored ONLY when
-  `validate-release.py --check-compat OLD NEW` passes, else the host stays
-  in manual-recovery state (never "start same broken release" as
-  rollback).
+  drain), and remove the drain only on the success path. Ordering
+  guarantee (W4-D8): on an existing deployment, READ-ONLY PRECHECKS ->
+  DRAIN/ADMISSION STOP -> QUIESCENCE PROOF -> host/runtime mutations
+  (accounts, dirs, linger, owner ACLs, release staging); fresh installs
+  still prove every runtime prerequisite through the same gate before
+  success. Failures keep the drain; the PRIOR release symlink is restored
+  ONLY when `validate-release.py --check-compat OLD NEW` passes, else the
+  host stays in manual-recovery state (never "start same broken release"
+  as rollback). Failure output carries booleans/ids/paths only — never
+  secret contents.
 - **Hermes sudoers snippet.** The Hermes adapter never uses a generic
   `sudo -n true` proof. Install the narrowly-scoped allow-list:
   `sudo cp deploy/etc/sudoers.d/ega-update-hermes.example
