@@ -1,48 +1,69 @@
 import React from "react";
-import type { ToolCard as Card } from "../api/client";
+import type { JobView, ToolCard as Card } from "../api/client";
 import type { CheckState } from "../useToolChecks";
+import { TOOL_ORDER } from "../operational";
+import { ActiveOperation } from "../components/ActiveOperation";
+import { RecentHistory } from "../components/RecentHistory";
 import { ToolCard } from "../components/ToolCard";
-
-const ORDER = ["hermes", "opencode", "codex", "t3"];
 
 export function Overview({
   cards,
-  updateDisabled,
-  disableReason,
+  history,
+  lastFailures,
+  updateBlocked,
+  blockedReason,
   checkStates,
   planningId,
+  activeJob,
   disconnected,
   onCheck,
   onPlan,
+  onOpenJob,
+  onViewHistory,
 }: {
   cards: Card[];
-  updateDisabled: boolean;
-  disableReason: string;
+  history: JobView[];
+  lastFailures: Record<string, JobView>;
+  updateBlocked: boolean;
+  blockedReason: string;
   checkStates: Record<string, CheckState>;
   planningId: string;
+  activeJob?: JobView;
   disconnected: boolean;
   onCheck: (toolId: string) => void;
   onPlan: (toolId: string) => void;
+  onOpenJob: (jobId: string) => void;
+  onViewHistory: () => void;
 }): React.ReactElement {
-  const sorted = [...cards].sort((a, b) => ORDER.indexOf(a.id) - ORDER.indexOf(b.id));
+  const sorted = [...cards].sort((a, b) => TOOL_ORDER.indexOf(a.id) - TOOL_ORDER.indexOf(b.id));
   return (
-    <section aria-label="Tool overview">
-      <div className="card-grid">
-        {sorted.map((c) => (
-          <ToolCard
-            key={c.id}
-            card={c}
-            updateDisabled={updateDisabled}
-            disableReason={disableReason}
-            onCheck={() => onCheck(c.id)}
-            onPlan={() => onPlan(c.id)}
-            checking={checkStates[c.id]?.kind === "checking" || checkStates[c.id]?.kind === "pending"}
-            checkState={checkStates[c.id]}
-            planning={planningId === c.id}
-            disconnected={disconnected}
-          />
-        ))}
-      </div>
-    </section>
+    <>
+      {activeJob ? <ActiveOperation job={activeJob} onOpen={onOpenJob} /> : null}
+      <section aria-label="Tool overview">
+        <header className="section-head">
+          <h2>Tools</h2>
+          <p className="hint">
+            {updateBlocked ? blockedReason : "Each card shows the last confirmed state and the next operator action."}
+          </p>
+        </header>
+        <div className="card-grid">
+          {sorted.map((c) => (
+            <ToolCard
+              key={c.id}
+              card={c}
+              updateBlocked={updateBlocked}
+              blockedReason={blockedReason}
+              checkState={checkStates[c.id]}
+              lastFailure={lastFailures[c.id]}
+              planning={planningId === c.id}
+              disconnected={disconnected}
+              onCheck={() => onCheck(c.id)}
+              onPlan={() => onPlan(c.id)}
+            />
+          ))}
+        </div>
+      </section>
+      <RecentHistory jobs={history} onOpen={onOpenJob} onViewAll={onViewHistory} />
+    </>
   );
 }

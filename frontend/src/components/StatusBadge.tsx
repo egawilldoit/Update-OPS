@@ -6,6 +6,8 @@ const CLASS_FOR: Record<string, string> = {
   unhealthy: "badge badge-unhealthy",
   unknown: "badge badge-unknown",
   stale: "badge badge-stale",
+  maintenance: "badge badge-degraded",
+  normal: "badge badge-healthy",
   succeeded: "badge badge-healthy",
   failed: "badge badge-unhealthy",
   health_failed: "badge badge-unhealthy",
@@ -27,7 +29,6 @@ const CLASS_FOR: Record<string, string> = {
 
 export function StatusBadge({ status, label }: { status: string; label?: string }): React.ReactElement {
   const cls = CLASS_FOR[status] ?? "badge badge-unknown";
-  // Text label always accompanies color (PRD: text labels alongside colors).
   return (
     <span className={cls} role="status" aria-label={`status: ${label ?? status}`}>
       {label ?? status}
