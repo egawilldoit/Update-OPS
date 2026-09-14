@@ -189,11 +189,27 @@ The dashboard shows which job holds the block; terminal state alone does
 not clear it. Do not hand-edit `recovery_required` in SQLite — use the
 reconcile command so the `recovered` event is recorded.
 
-## 7. Console code rollback (schema-compatibility rule)
+## 7. Console code rollback (schema-compatibility rule; POINTER only)
 
-- Compatible (new release's `schema_meta.version` == current): re-point and restart:
-  `sudo ln -sfn /opt/ega-update/releases/<prev-commit> /opt/ega-update/current &&
-   sudo systemctl restart ega-update-api ega-update-worker`
+The ONLY supported way to switch `/opt/ega-update/current` is the shared
+atomic primitive `backend/app/deploy_release.py` (temporary symlink +
+`os.replace`/rename(2); never `ln -sfn`, which unlinks before creating
+and leaves a missing-`current` window). Automatic recovery performs at
+most a **POINTER RESTORE**: it never rolls back the database and never
+reverts the release-versioned systemd unit files copied from the failed
+release (V1 boundary — `daemon-reload` + restart run the restored
+pointer's code with the installed units; restoring unit files is a
+manual decision). Both deploy scripts hold a host-local kernel flock
+(`/opt/ega-update/deploy.lock`) for the whole critical section, so a
+second concurrent deployment fails fast before any mutation.
+
+- Compatible (`validate-release.py --check-compat OLD NEW` passes; the
+  prior release can run the DB migrated by the new release): atomic
+  pointer restore + service restart:
+  `sudo env PYTHONPATH=<operator-checkout> python3 -m backend.app.deploy_release switch \
+     --current /opt/ega-update/current --target /opt/ega-update/releases/<prev-commit> \
+     --releases-root /opt/ega-update/releases &&
+   sudo systemctl daemon-reload && sudo systemctl restart ega-update-api ega-update-worker`
 - Incompatible / migrate failed: follow the **migration-recovery procedure**:
   1. Stop console services. 2. Restore the pre-upgrade backup
      (`/var/lib/ega-update/backups/state-preupgrade-<ts>.db`) to
@@ -284,11 +300,15 @@ cd /opt/ega-update/current && EGA_CONFIG_FILE=/etc/ega-update/config.json venv/b
   DRAIN/ADMISSION STOP -> QUIESCENCE PROOF -> host/runtime mutations
   (accounts, dirs, linger, owner ACLs, release staging); fresh installs
   still prove every runtime prerequisite through the same gate before
-  success. Failures keep the drain; the PRIOR release symlink is restored
-  ONLY when `validate-release.py --check-compat OLD NEW` passes, else the
-  host stays in manual-recovery state (never "start same broken release"
-  as rollback). Failure output carries booleans/ids/paths only — never
-  secret contents.
+  success. Failures keep the drain; the PRIOR release pointer is restored
+  ONLY when `validate-release.py --check-compat OLD NEW` passes, and then
+  ONLY through the atomic pointer primitive (W5-D9) with a host-local
+  kernel flock serializing deployments; unknown/false compatibility and
+  migration failures stop services and leave the host in manual-recovery
+  state (never "start same broken release" as rollback, never boot
+  unproven old code against a newer DB). Messages distinguish POINTER
+  RESTORE vs DATABASE ROLLBACK vs SERVICE RESTORATION. Failure output
+  carries booleans/ids/paths only — never secret contents.
 - **Hermes sudoers snippet.** The Hermes adapter never uses a generic
   `sudo -n true` proof. Install the narrowly-scoped allow-list:
   `sudo cp deploy/etc/sudoers.d/ega-update-hermes.example

@@ -12,6 +12,113 @@
 #
 # Sourced by install.sh/upgrade.sh after SCRIPT_DIR is resolved.
 
+# ===== W5-D9 deployment serialization + atomic release pointer =====
+#
+# ONE atomic release-pointer primitive for BOTH scripts
+# (backend/app/deploy_release.py, operator-side, stdlib only, run from
+# the TRUSTED operator checkout — never from the candidate release).
+# The shell never uses `ln -sfn` for `current`: unlink-then-create leaves
+# a missing-`current` window. switch/restore create a temporary symlink
+# in the SAME parent directory and commit with os.replace (rename(2)).
+#
+# Failure policy shared vocabulary: POINTER RESTORE (console symlink
+# only), DATABASE ROLLBACK (never automatic), SERVICE RESTORATION
+# (restarting previously-active units). Restoration happens ONLY when
+# `validate-release.py --check-compat OLD NEW` proves the prior release
+# can run the migrated DB; unknown/false compatibility stays in manual
+# recovery.
+
+# Deterministic test-only hook (W5-D9). Inert unless
+# EGA_DEPLOY_FAULT_POINT names this exact point.
+ega_maybe_fail() {
+  local point="$1" what="${2:-}"
+  [ "${EGA_DEPLOY_FAULT_POINT:-}" = "$point" ] || return 0
+  echo "[deploy] FAULT INJECTED at ${point}${what:+: $what}" >&2
+  return 1
+}
+
+# Delegate to the operator-checkout primitive (F06). Machine-readable
+# JSON on stdout; exit codes distinguish inspect/validate/switch/verify.
+# Runs from the trusted checkout in a subshell: `python3 -m` puts the CWD
+# first on sys.path, so a candidate release sharing the `backend` package
+# name must NEVER shadow the operator-side module (the scripts cd into
+# the release dir before the switch).
+ega_deploy_release() {
+  (
+    cd "$REPO_ROOT" || exit 1
+    PYTHONPATH="$REPO_ROOT" python3 -m backend.app.deploy_release "$@"
+  )
+}
+
+# Capture the exact PREVIOUS raw/resolved pointer via `inspect`
+# (never a `readlink -f` guess). Prints the resolved previous target on
+# stdout (empty when `current` is absent); non-zero on invalid evidence.
+ega_release_previous_target() {
+  local current="$1" releases_root="$2"
+  ega_deploy_release inspect --current "$current" \
+    --releases-root "$releases_root" --field previous_target
+}
+
+# Atomic switch/restore. $4 (optional) is the expected current target
+# (compare-and-swap guard, closes the inspect->switch race).
+ega_switch_release() {
+  local current="$1" target="$2" releases_root="$3" previous="${4:-}"
+  if [ -n "$previous" ]; then
+    ega_deploy_release switch --current "$current" --target "$target" \
+      --releases-root "$releases_root" --previous "$previous"
+  else
+    ega_deploy_release switch --current "$current" --target "$target" \
+      --releases-root "$releases_root"
+  fi
+}
+
+# True when `current` resolves exactly to `target` (post-switch recovery
+# discriminator: "never replaced" vs "replaced then reported failure").
+ega_verify_release() {
+  local current="$1" target="$2"
+  ega_deploy_release verify --current "$current" --target "$target" \
+    >/dev/null 2>&1
+}
+
+# Existing compatibility contract (validator --check-compat OLD NEW):
+# true ONLY when the prior release can run the DB migrated by NEW.
+# Unknown/unreadable compatibility is FALSE (fail closed).
+ega_compat_proven() {
+  local new_rel="$1" prev_rel="$2" cfg="$3"
+  [ -n "$prev_rel" ] || return 1
+  [ -d "$prev_rel" ] || return 1
+  [ -f "$new_rel/deploy/etc/validate-release.py" ] || return 1
+  (
+    cd "$new_rel" || exit 1
+    EGA_CONFIG_FILE="$cfg" "$new_rel/venv/bin/python" \
+      "$new_rel/deploy/etc/validate-release.py" --check-compat \
+      "$prev_rel" "$new_rel"
+  ) >/dev/null 2>&1
+}
+
+# Host-local kernel flock around the critical deployment execution,
+# acquired BEFORE any maintenance mutation and released by the kernel on
+# process exit (no stale-PID semantics, no SQLite lock). Fail fast when
+# another operator/deployment owns it. Uses fd 9 in the calling shell.
+ega_acquire_deploy_lock() {
+  local lock_file="$1" label="$2" lock_dir=""
+  lock_dir="$(dirname "$lock_file")"
+  if [ ! -d "$lock_dir" ]; then
+    echo "[$label] REFUSING: deployment lock directory missing: $lock_dir" >&2
+    return 1
+  fi
+  if ! exec 9>"$lock_file"; then
+    echo "[$label] REFUSING: cannot open deployment lock $lock_file" >&2
+    return 1
+  fi
+  if ! flock -n 9; then
+    echo "[$label] REFUSING: another deployment is active (deployment lock held: $lock_file)" >&2
+    return 1
+  fi
+  echo "[$label] deployment lock acquired: $lock_file"
+  return 0
+}
+
 # Advisory reachability code (not a gate).
 ega_advisory_http_probe() {
   local port="$1"
