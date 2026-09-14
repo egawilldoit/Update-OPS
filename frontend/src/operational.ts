@@ -10,8 +10,6 @@ export const TOOL_NAMES: Record<string, string> = {
 
 export const TOOL_ORDER = ["hermes", "opencode", "codex", "t3"];
 
-export const TERMINAL_JOB_STATES = ["succeeded", "blocked", "failed", "health_failed", "interrupted"];
-export const NONTERMINAL_JOB_STATES = ["accepted", "preflight", "backup", "updating", "verifying"];
 export const FAILED_JOB_STATES = ["blocked", "failed", "health_failed", "interrupted"];
 
 export function toolName(id: string): string {
@@ -94,10 +92,6 @@ export function jobOutcome(state: string): OutcomeView {
   }
 }
 
-export function isActiveJob(job: JobView | undefined): boolean {
-  return job !== undefined && NONTERMINAL_JOB_STATES.includes(job.state);
-}
-
 export function lastFailureByTool(jobs: JobView[]): Record<string, JobView> {
   const out: Record<string, JobView> = {};
   for (const job of jobs) {
@@ -108,10 +102,6 @@ export function lastFailureByTool(jobs: JobView[]): Record<string, JobView> {
     if (!previous || at > previousAt) out[job.tool_id] = job;
   }
   return out;
-}
-
-export function mostRecentActiveJob(jobs: JobView[]): JobView | undefined {
-  return jobs.find(isActiveJob);
 }
 
 export function formatBytes(bytes: number): string {
