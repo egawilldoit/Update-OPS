@@ -156,8 +156,8 @@ async def _owner_probe(tool_id, op, timeout_s=25.0):
         return "error", {"reason": "probe wait crashed: %s" % _safe_detail(exc, 200)}
 
 
-async def _owner_probe_handle(tool_id, op, timeout_s=25.0):
-    # type: (str, str, float) -> Tuple[str, Dict[str, Any], str]
+async def _owner_probe_handle(tool_id, op, timeout_s=25.0, subject="api"):
+    # type: (str, str, float, str) -> Tuple[str, Dict[str, Any], str]
     """Durable owner-probe submit + bounded wait (W3).
 
     Enqueues (coalescing with an identical active request in SQLite) and
@@ -165,6 +165,10 @@ async def _owner_probe_handle(tool_id, op, timeout_s=25.0):
     request_id); the request_id is the durable handle to poll when the
     wait times out. The route never persists the result or the
     observation — the dispatcher/coordinator owns both.
+
+    W9: the caller passes the normalized authenticated subject; it is
+    stored on the durable request so GET /probes/{request_id} can bind
+    the handle to its owner (same identity semantics as plans/jobs).
     """
     try:
         from ..owner_probes import request_owner_probe_handle
@@ -176,7 +180,8 @@ async def _owner_probe_handle(tool_id, op, timeout_s=25.0):
             return "error", {"reason": "probe boundary unavailable"}, ""
     try:
         return await asyncio.to_thread(
-            request_owner_probe_handle, tool_id, op, timeout_s)
+            request_owner_probe_handle, tool_id, op, timeout_s,
+            subject=subject)
     except Exception as exc:
         return "error", {
             "reason": "probe wait crashed: %s" % _safe_detail(exc, 200)}, ""
@@ -550,7 +555,7 @@ async def post_tool_check(tool_id: str, request: Request):
     gated = _authed(request, kind="write")
     if isinstance(gated, JSONResponse):
         return gated
-    claims, _subject, _rid = gated
+    claims, subject, _rid = gated
     guard = deps.require_mutation_guards(request, claims or {})
     if guard is not None:
         return guard
@@ -662,9 +667,11 @@ async def post_tool_check(tool_id: str, request: Request):
     # observation. No transaction is held across the wait (bounded 25s in
     # a worker thread; the event loop stays responsive per R16). A wait
     # timeout returns the cached card labeled pending plus the durable
-    # request id; it never mutates probe lifecycle.
+    # request id; it never mutates probe lifecycle. W9: the durable
+    # request records the authenticated subject so the handle can only be
+    # polled by its owner.
     _status, _payload, _request_id = await _owner_probe_handle(
-        tool_id, "refresh", 25.0)
+        tool_id, "refresh", 25.0, subject)
     if _status == "deferred":
         return _ok(_with_probe_handle(
             _labeled_cached(dict(cached),
@@ -734,10 +741,19 @@ def get_probe(request_id: str, request: Request):
     durable lifecycle instead of forcing one long connection. Never
     writes: probe execution, result storage, observation application and
     exclusion release all belong to the dispatcher/coordinator.
+
+    W9 ownership: the handle is readable only by the authenticated
+    subject recorded on the durable request (the same normalized
+    ``deps.subject_of`` identity used when plans/jobs/probes are
+    enqueued). A different subject gets the exact unknown-probe 404
+    envelope, so probe existence is never disclosed across subjects.
+    Rows with an empty or pre-W9 shared (``"api"``) subject fail closed:
+    they are never transferable to an authenticated subject.
     """
     gated = _authed(request)
     if isinstance(gated, JSONResponse):
         return gated
+    _claims, subject, _rid = gated
     if not deps.is_valid_uuid(request_id):
         return deps.error_envelope(
             422, "invalid_request", "request id must be a UUID", "")
@@ -749,8 +765,8 @@ def get_probe(request_id: str, request: Request):
                 " res.result_json AS result_json,"
                 " res.finished_at AS finished_at"
                 " FROM probe_requests pr LEFT JOIN probe_results res"
-                " ON res.request_id=pr.id WHERE pr.id=?",
-                (request_id,)).fetchone()
+                " ON res.request_id=pr.id WHERE pr.id=? AND pr.subject=?",
+                (request_id, subject)).fetchone()
         except Exception:
             row = None
     finally:
@@ -761,6 +777,12 @@ def get_probe(request_id: str, request: Request):
     if row is None:
         return deps.error_envelope(404, "not_found", "unknown probe", "")
     d = dict(row)
+    # Defense in depth for the fail-closed policy: an empty authenticated
+    # subject (no allow-listed email/sub) or an empty/legacy stored
+    # subject can never match, so the denial also survives a future
+    # loosening of the SQL binding above.
+    if not subject or str(d.get("subject") or "") != subject:
+        return deps.error_envelope(404, "not_found", "unknown probe", "")
     state = str(d.get("state") or "unknown")
     deadline = str(d.get("claim_deadline") or "")
     finished_at = str(d.get("finished_at") or "")
@@ -1502,7 +1524,7 @@ def get_job_logs(job_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# 9. GET /health — authenticated API/database/worker readiness summary
+# 9. GET /health — authenticated API/database/worker readiness + drain truth
 # ---------------------------------------------------------------------------
 @router.get("/health")
 def get_health(request: Request):
@@ -1514,6 +1536,11 @@ def get_health(request: Request):
     recovery_required = False
     worker = "down"
     api = "ok"
+    # Maintenance/drain is reported DIRECTLY from the actual
+    # <state_dir>/drain marker (read-only, never inferred from a refused
+    # mutation). It is an independent operational fact: drain=true is not
+    # a failure and never alters api/database/worker/recovery_required.
+    drain = _drained()
     conn = None
     try:
         conn = _db()
@@ -1554,5 +1581,6 @@ def get_health(request: Request):
         "database": database,
         "worker": worker,
         "recovery_required": bool(recovery_required),
+        "drain": bool(drain),
         "checked_at": now_iso,
     })
