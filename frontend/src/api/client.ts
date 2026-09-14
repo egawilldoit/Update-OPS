@@ -54,6 +54,17 @@ export interface ToolCard {
   install_identity: string;
 }
 
+export type ToolCheck = ToolCard & { probe_pending?: boolean; probe_request_id?: string };
+
+export interface ProbeView {
+  request_id: string;
+  tool_id: string;
+  state: string;
+  pending: boolean;
+  status: string;
+  observation_applied: boolean;
+}
+
 export interface PlanView {
   id: string;
   tool_id: string;
@@ -209,34 +220,32 @@ export function backoffMs(attempt: number, retryAfterMs: number | null): number 
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let res: Response;
+  const abort = () => controller.abort();
+  init?.signal?.addEventListener("abort", abort, { once: true });
+  if (init?.signal?.aborted) controller.abort();
+  const timer = window.setTimeout(abort, REQUEST_TIMEOUT_MS);
   try {
-    res = await fetch(`${BASE}${path}`, {
+    const res = await fetch(`${BASE}${path}`, {
       credentials: "same-origin",
       ...init,
       signal: controller.signal,
     });
-  } catch {
-    window.clearTimeout(timer);
-    // Abort (15s timeout) and network failure both surface as disconnected;
-    // callers apply backoff and reconnect state, never cached-green.
-    throw new DisconnectedError();
-  }
-  window.clearTimeout(timer);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    let retryAfterMs: number | null = null;
-    if (res.status === 429) {
-      try {
-        retryAfterMs = parseRetryAfterMs(res.headers.get("Retry-After"));
-      } catch {
-        retryAfterMs = null;
-      }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      const retryAfterMs = res.status === 429 ? parseRetryAfterMs(res.headers.get("Retry-After")) : null;
+      throw new ApiError(res.status, parseErrorBody(text), retryAfterMs);
     }
-    throw new ApiError(res.status, parseErrorBody(text), retryAfterMs);
+    const body: unknown = await res.json();
+    if (init?.signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+    return body as T;
+  } catch (error) {
+    if (init?.signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+    if (error instanceof ApiError) throw error;
+    throw new DisconnectedError();
+  } finally {
+    window.clearTimeout(timer);
+    init?.signal?.removeEventListener("abort", abort);
   }
-  return (await res.json()) as T;
 }
 
 function mutationHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -253,21 +262,26 @@ export const api = {
     setCsrfToken(s.csrf_token);
     return s;
   },
-  getTools(): Promise<ToolCard[]> {
-    return req<ToolCard[]>("/tools");
+  getTools(signal?: AbortSignal): Promise<ToolCard[]> {
+    return req<ToolCard[]>("/tools", { signal });
   },
-  checkTool(toolId: string, force = false): Promise<ToolCard> {
+  checkTool(toolId: string, force = false, signal?: AbortSignal): Promise<ToolCheck> {
     const suffix = force ? "?force=1" : "";
-    return req<ToolCard>(`/tools/${encodeURIComponent(toolId)}/check${suffix}`, {
+    return req<ToolCheck>(`/tools/${encodeURIComponent(toolId)}/check${suffix}`, {
+      signal,
       method: "POST",
       headers: mutationHeaders(),
       body: JSON.stringify({}),
     });
   },
-  createPlan(toolId: string): Promise<PlanView> {
+  getProbe(requestId: string, signal?: AbortSignal): Promise<ProbeView> {
+    return req<ProbeView>(`/probes/${encodeURIComponent(requestId)}`, { signal });
+  },
+  createPlan(toolId: string, signal?: AbortSignal): Promise<PlanView> {
     // Never send ack at plan time: unknown activity is recorded on the
     // plan (201) and acknowledged at POST /jobs.
     return req<PlanView>(`/tools/${encodeURIComponent(toolId)}/plans`, {
+      signal,
       method: "POST",
       headers: mutationHeaders(),
       body: JSON.stringify({}),

@@ -12,6 +12,7 @@ import {
   type PlanView,
   type ToolCard as Card,
 } from "./api/client";
+import { useToolChecks } from "./useToolChecks";
 import { HealthPanel } from "./components/HealthPanel";
 import { History } from "./views/History";
 import { JobDetail } from "./views/JobDetail";
@@ -43,8 +44,7 @@ export function App(): React.ReactElement {
   const [bootError, setBootError] = React.useState("");
   const [health, setHealth] = React.useState<HealthView | null>(null);
   const [cards, setCards] = React.useState<Card[]>([]);
-  const [view, setView] = React.useState<View>({ kind: "overview" });
-  const [checkingId, setCheckingId] = React.useState("");
+  const [view, setViewState] = React.useState<View>({ kind: "overview" });
   const [planningId, setPlanningId] = React.useState("");
   const [plan, setPlan] = React.useState<PlanView | null>(null);
   const [planLoading, setPlanLoading] = React.useState(false);
@@ -72,14 +72,60 @@ export function App(): React.ReactElement {
   const jobPollBackoff = React.useRef({ attempt: 0, untilMs: 0 });
   // R21: serialize per-job polls — never overlap fetches for the same job.
   const jobInflight = React.useRef(false);
-  // R21: plan generation IDs per tool — ignore stale plan responses.
-  const planGen = React.useRef<Record<string, number>>({});
+  const planRequest = React.useRef<AbortController | null>(null);
+  const sessionActive = React.useRef(true);
+  const toolsGeneration = React.useRef(0);
+  const cardGeneration = React.useRef(new Map<string, number>());
+  const activeGeneration = React.useRef(0);
+  const checks = useToolChecks({
+    onCard: card => {
+      cardGeneration.current.set(card.id, (cardGeneration.current.get(card.id) ?? 0) + 1);
+      setCards(prev => prev.map(old => old.id === card.id ? card : old));
+      clearBucket("mutation");
+    },
+    onError: error => {
+      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) endSession();
+      else if (error instanceof ApiError && error.status === 429) noteRateLimited("mutation", error);
+      else markMaybeDisconnected(error);
+    },
+  });
+
+  function endSession(): void {
+    sessionActive.current = false;
+    planRequest.current?.abort();
+    planRequest.current = null;
+    checks.cancel();
+    setEmail("");
+    setBootError("Session ended. Reload after signing in.");
+  }
+
+  function setView(next: View): void {
+    planRequest.current?.abort();
+    planRequest.current = null;
+    setPlanningId("");
+    setPlan(null);
+    setPlanError("");
+    setPlanLoading(false);
+    setViewState(next);
+  }
+
+  React.useEffect(() => {
+    sessionActive.current = true;
+    const stop = () => {
+      sessionActive.current = false;
+      planRequest.current?.abort();
+      planRequest.current = null;
+    };
+    window.addEventListener("pagehide", stop);
+    return () => { stop(); window.removeEventListener("pagehide", stop); };
+  }, []);
 
   function markConnected(): void {
     setDisconnected(false);
   }
   function markMaybeDisconnected(e: unknown): void {
     if (e instanceof DisconnectedError) setDisconnected(true);
+    if (e instanceof ApiError && (e.status === 401 || e.status === 403)) endSession();
   }
 
   function noteRateLimited(bucket: "read" | "mutation" | "job", e: ApiError): void {
@@ -99,13 +145,14 @@ export function App(): React.ReactElement {
   }
 
   function readThrottled(): boolean {
-    return Date.now() < readBackoff.current.untilMs;
+    return !sessionActive.current || Date.now() < readBackoff.current.untilMs;
   }
 
   const loadHealth = React.useCallback(async () => {
     if (readThrottled()) return;
     try {
       const h = await api.getHealth();
+      if (!sessionActive.current) return;
       markConnected();
       clearBucket("read");
       setReconnect("");
@@ -122,10 +169,15 @@ export function App(): React.ReactElement {
   const loadTools = React.useCallback(async () => {
     if (readThrottled()) return;
     try {
+      const generation = ++toolsGeneration.current;
+      const revisions = new Map(cardGeneration.current);
       const t = await api.getTools();
+      if (!sessionActive.current || generation !== toolsGeneration.current) return;
       markConnected();
       clearBucket("read");
-      setCards(t);
+      setCards(prev => t.map(card =>
+        cardGeneration.current.get(card.id) === revisions.get(card.id)
+          ? card : prev.find(old => old.id === card.id) ?? card));
     } catch (e) {
       if (e instanceof ApiError && e.status === 429) {
         noteRateLimited("read", e);
@@ -136,9 +188,11 @@ export function App(): React.ReactElement {
   }, []);
 
   const loadHistory = React.useCallback(async (cursor = "") => {
+    if (!sessionActive.current) return;
     setHistoryLoading(true);
     try {
       const page = await api.listJobs(cursor, 25);
+      if (!sessionActive.current) return;
       markConnected();
       setHistory((prev) => (cursor ? [...prev, ...page.jobs] : page.jobs));
       setNextCursor(page.next_cursor);
@@ -160,7 +214,9 @@ export function App(): React.ReactElement {
   const loadActive = React.useCallback(async () => {
     if (readThrottled()) return;
     try {
+      const generation = ++activeGeneration.current;
       const page = await api.listActiveJobs(25);
+      if (!sessionActive.current || generation !== activeGeneration.current) return;
       markConnected();
       clearBucket("read");
       setActiveJobs(page.jobs);
@@ -260,25 +316,7 @@ export function App(): React.ReactElement {
       setNotice("Rate limited — Check again is backing off (Retry-After honored, max 30s).");
       return;
     }
-    setCheckingId(toolId);
-    setNotice("");
-    try {
-      const c = await api.checkTool(toolId, true);
-      markConnected();
-      clearBucket("mutation");
-      setReconnect("");
-      setCards((prev) => prev.map((x) => (x.id === toolId ? c : x)));
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 429) {
-        noteRateLimited("mutation", e);
-        setNotice("rate_limited: Check again backing off (Retry-After honored, max 30s).");
-        return;
-      }
-      markMaybeDisconnected(e);
-      setNotice(errText(e));
-    } finally {
-      setCheckingId("");
-    }
+    await checks.check(toolId);
   }
 
   async function handlePlan(toolId: string): Promise<void> {
@@ -286,25 +324,25 @@ export function App(): React.ReactElement {
       setPlanError("Rate limited — plan retry backing off (Retry-After honored, max 30s).");
       return;
     }
-    // R21: plan generation IDs per tool — ignore stale responses.
-    const gen = (planGen.current[toolId] || 0) + 1;
-    planGen.current[toolId] = gen;
+    if (!sessionActive.current) return;
     setView({ kind: "plan", toolId });
+    const request = new AbortController();
+    planRequest.current = request;
     setPlanningId(toolId);
     setPlanLoading(true);
     setPlanError("");
     setPlan(null);
     setAck(false);
     try {
-      const p = await api.createPlan(toolId);
-      if (planGen.current[toolId] !== gen) return;
+      const p = await api.createPlan(toolId, request.signal);
+      if (planRequest.current !== request) return;
       markConnected();
       clearBucket("mutation");
       setReconnect("");
       setPlan(p);
       setIdemKey(newIdempotencyKey());
     } catch (e) {
-      if (planGen.current[toolId] !== gen) return;
+      if (planRequest.current !== request) return;
       if (e instanceof ApiError && e.status === 429) {
         noteRateLimited("mutation", e);
         setPlanError("rate_limited: plan retry backing off (Retry-After honored, max 30s).");
@@ -313,7 +351,7 @@ export function App(): React.ReactElement {
       markMaybeDisconnected(e);
       setPlanError(errText(e));
     } finally {
-      if (planGen.current[toolId] === gen) {
+      if (planRequest.current === request) {
         setPlanLoading(false);
         setPlanningId("");
       }
@@ -321,7 +359,7 @@ export function App(): React.ReactElement {
   }
 
   async function handleStart(): Promise<void> {
-    if (!plan) return;
+    if (!sessionActive.current || !plan) return;
     if (Date.now() < mutationBackoff.current.untilMs) {
       setNotice("Rate limited — Start update is backing off (Retry-After honored, max 30s).");
       return;
@@ -366,7 +404,7 @@ export function App(): React.ReactElement {
   const jobId = view.kind === "job" ? view.jobId : "";
   const loadMoreRef = React.useRef<() => void>(() => {});
   React.useEffect(() => {
-    if (!jobId) return;
+    if (!jobId || !sessionActive.current) return;
     let cancelled = false;
     let logAfter = 0;
     let timer = 0;
@@ -389,6 +427,7 @@ export function App(): React.ReactElement {
     }
     async function fetchOnce(): Promise<boolean> {
       // Serialize: skip this tick when the previous fetch is still in flight.
+      if (!sessionActive.current) return true;
       if (jobInflight.current) return done;
       if (Date.now() < jobPollBackoff.current.untilMs) return done;
       jobInflight.current = true;
@@ -534,7 +573,7 @@ export function App(): React.ReactElement {
             cards={cards}
             updateDisabled={updateDisabled}
             disableReason={disableReason}
-            checkingId={checkingId}
+            checkStates={checks.states}
             planningId={planningId}
             disconnected={disconnected}
             onCheck={(t) => void handleCheck(t)}
