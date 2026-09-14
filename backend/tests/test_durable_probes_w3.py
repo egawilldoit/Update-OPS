@@ -1178,9 +1178,21 @@ def test_restart_reconcile_safe_with_unfinished_probe(
     try:
         assert dispatch_lib._require_probe_worker(worker) is None
         assert _unreleased_probe_leases(conn)
-        _patch_units(monkeypatch, {unit: "confirmed_stopped"})
-        dispatch_lib.reconcile_boot(conn)
-        assert _unreleased_probe_leases(conn) == []
     finally:
+        # Quiesce the executor before proof-based reconciliation: a live
+        # worker may legitimately claim the resumed request and hold its
+        # OWN new lease while the probe runs, which would make a blanket
+        # "no unreleased leases" assertion race that execution. Production
+        # order is exactly reconcile_boot -> ProbeWorker.start().
         worker.stop(timeout_s=2.0)
+    _patch_units(monkeypatch, {unit: "confirmed_stopped"})
+    dispatch_lib.reconcile_boot(conn)
+    assert _unreleased_probe_leases(conn) == []
+    # A healthy new executor still passes the supervisor gate afterwards.
+    worker2 = dispatch_lib.ProbeWorker(db_path, interval_s=0.05)
+    worker2.start()
+    try:
+        assert dispatch_lib._require_probe_worker(worker2) is None
+    finally:
+        worker2.stop(timeout_s=2.0)
     conn.close()
