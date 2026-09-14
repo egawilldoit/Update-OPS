@@ -1,0 +1,67 @@
+{
+  "commit_sha": "8d243a7a8cda8a1b53ffad91a934a8b00c812c8c",
+  "environment": {
+    "architecture": "aarch64",
+    "distro": {
+      "ID": "ubuntu",
+      "PRETTY_NAME": "Ubuntu 22.04.5 LTS",
+      "VERSION_ID": "22.04"
+    },
+    "filesystem": [
+      {
+        "access": [
+          "rw"
+        ],
+        "filesystem_type": "ext4",
+        "mount_type": "filesystem"
+      }
+    ],
+    "gid": 1001,
+    "kernel": "6.8.0-1058-oracle",
+    "production_equivalence": false,
+    "python": "3.10.12",
+    "real_vm_designated": false,
+    "supplementary_groups": [
+      20,
+      24,
+      25,
+      27,
+      29,
+      30,
+      44,
+      46,
+      119,
+      120,
+      1001
+    ],
+    "systemd": "systemd 249 (249.11-0ubuntu3.22)",
+    "uid": 1001
+  },
+  "evidence": {
+    "cases": {
+      "api_identity": "NOT_EXECUTED",
+      "atomic_pointer": "NOT_EXECUTED",
+      "canonical_readiness": "NOT_EXECUTED",
+      "complete_install": "NOT_EXECUTED",
+      "csrf_unreadable": "NOT_EXECUTED",
+      "flock": "NOT_EXECUTED",
+      "mandatory_stage_failures": "NOT_EXECUTED",
+      "reboot_after_drain": "NOT_EXECUTED",
+      "reboot_after_migration": "NOT_EXECUTED",
+      "reboot_after_switch": "NOT_EXECUTED",
+      "sqlite_wal": "NOT_EXECUTED",
+      "transient_launch_failure": "NOT_EXECUTED",
+      "unit_state_unknown": "NOT_EXECUTED",
+      "user_bus_negative": "NOT_EXECUTED",
+      "users_acl_stale_manager": "NOT_EXECUTED",
+      "worker_liveness_restart": "NOT_EXECUTED"
+    },
+    "production_contacted": false,
+    "production_modified": false
+  },
+  "failure_reason": "No explicitly designated disposable VM is available; local host is not an acceptance target",
+  "finished_at": "2026-09-14T15:24:51.532683+00:00",
+  "started_at": "2026-09-14T15:24:51.521556+00:00",
+  "status": "BLOCKED_REAL_VM_REQUIRED",
+  "test_case": "vm_contract_acceptance"
+}
