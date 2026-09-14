@@ -120,6 +120,11 @@ example). Unknown estimates block. No wholesale archiving of the observed
 - Logs: `/var/lib/ega-update/logs/<job-id>.jsonl`
 - Backups: `/var/lib/ega-update/backups/`
 - Dispatcher heartbeat: `/var/lib/ega-update/dispatcher.heartbeat` (`{ts, pid}`)
+- Probe-executor ready marker (W4-D8):
+  `/var/lib/ega-update/probe_worker.heartbeat` (`{ts, pid, ready:true}`,
+  freshness bound 20s), written ONLY by the W3.1 `ProbeWorker` thread while
+  its DB connection is established; withdrawn on graceful stop. Deployment
+  readiness requires this marker separately from the dispatcher heartbeat.
 - Drain flag: `/var/lib/ega-update/drain` (presence refuses new plans/jobs: 503)
 - Log caps: 20 MiB/job, 500 MiB total, 30 days completed logs, 90 days metadata.
 
@@ -181,6 +186,25 @@ example). Unknown estimates block. No wholesale archiving of the observed
 - CLI (`backend/app/cli.py`, `python -m backend.app.cli`): JSON envelope,
   exits 0/2/3/4/5/6 preserved via `exec` wrappers; `apply` = reserve +
   observe canonical dispatch, never direct runner.
+- Deployment readiness (`deployment_readiness.py`, W4-D8): ONE
+  machine-readable assessment behind `cli status --require-ready`
+  (exit 0 only when ALL mandatory stages pass; 3 otherwise). Stages and
+  evidence: `api_service_identity` (probe run UNDER the api identity via
+  runuser/su: config read, csrf.secret resolved, DB open/read,
+  runtime-path traverse/write); `api_security_boundary` (configured
+  loopback listener reachable and an unauthenticated request rejected
+  401/403 — a rejection alone is NEVER readiness); `worker_process`
+  (dispatcher heartbeat current); `probe_executor` (fresh durable
+  `probe_worker.heartbeat` written by the W3.1 ProbeWorker thread, never
+  the dispatcher heartbeat); `owner_transient_execution` (canonical
+  `owner_env.transient_acceptance`: user bus reachable, transient
+  `systemd-run --user` unit launched, effective owner identity, shared
+  path/payload/config/secrets access, typed result written+read, positive
+  unit termination). Output carries booleans/ids/paths only (never secret
+  contents) plus per-stage results and `failed_stages`. Schema version 1.
+  `--require-quiescent` and plain `status` output are unchanged.
+  install.sh and upgrade.sh consume ONLY the exit code through the shared
+  helper `deploy/scripts/lib/deploy_common.sh`.
 - Retention (`retention.py`): 500MiB/30d/90d/latest-two-backups + tombstones;
   protects active/recovery/unresolved; dispatcher invokes daily.
 - Logs: `final_log_seq` published after durable flush; UI drains to terminal

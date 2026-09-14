@@ -58,6 +58,13 @@ PROBE_OP_TIMEOUT_S = 120
 # never connected (ProbeWorker._run returns silently on connect failure).
 PROBE_WORKER_START_TIMEOUT_S = 5.0
 HEARTBEAT_FILENAME = "dispatcher.heartbeat"
+# Durable probe-executor readiness marker (W4-D8): written ONLY by the
+# ProbeWorker thread while its connection is established and its loop is
+# live. External processes (deploy readiness) cannot see the in-process
+# `is_ready()` event, so this is the minimal durable signal that proves
+# the REQUIRED executor is alive SEPARATELY from the dispatcher heartbeat.
+PROBE_WORKER_HEARTBEAT_FILENAME = "probe_worker.heartbeat"
+PROBE_WORKER_HEARTBEAT_MAX_AGE_S = 20
 RETENTION_STAMP = "retention.lastdate"
 _lock_fh = None  # type: Any
 
@@ -99,6 +106,100 @@ def _receipt_path(job_id):
     log_dir = getattr(settings, "log_dir", "/var/lib/ega-update/logs") \
         or "/var/lib/ega-update/logs"
     return os.path.join(log_dir, "%s.receipt.json" % job_id)
+
+
+def _probe_worker_heartbeat_path():
+    # type: () -> str
+    return os.path.join(_state_dir(), PROBE_WORKER_HEARTBEAT_FILENAME)
+
+
+def _write_probe_worker_heartbeat():
+    # type: () -> None
+    """Publish the durable probe-executor ready marker (W4-D8).
+
+    Written by the ProbeWorker thread itself only after its DB connection
+    succeeded, and refreshed each loop iteration while it stays ready.
+    Failure to write is silent (deploy readiness then fails closed on the
+    stale/absent marker)."""
+    path = _probe_worker_heartbeat_path()
+    try:
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        payload = {"ts": utcnow_iso(), "pid": os.getpid(), "ready": True}
+        tmp = "%s.tmp-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _clear_probe_worker_heartbeat():
+    # type: () -> None
+    """Withdraw the marker on graceful stop (fail closed immediately)."""
+    try:
+        os.unlink(_probe_worker_heartbeat_path())
+    except Exception:
+        pass
+
+
+def read_probe_worker_heartbeat(state_dir="", max_age_s=None):
+    # type: (str, object) -> Dict[str, object]
+    """Read the durable probe-executor marker; {} unless fresh AND ready.
+
+    Stale, unparseable, missing, or non-ready markers yield {}. The
+    dispatcher heartbeat is deliberately NOT accepted here: the probe
+    executor is a separate mandatory component (W3.1).
+    """
+    try:
+        base = str(state_dir or "") or _state_dir()
+    except Exception:
+        base = _state_dir()
+    if not base:
+        return {}
+    try:
+        bound = float(max_age_s) if max_age_s is not None \
+            else float(PROBE_WORKER_HEARTBEAT_MAX_AGE_S)
+    except (TypeError, ValueError):
+        bound = float(PROBE_WORKER_HEARTBEAT_MAX_AGE_S)
+    path = os.path.join(base, PROBE_WORKER_HEARTBEAT_FILENAME)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or data.get("ready") is not True:
+        return {}
+    raw_ts = data.get("ts", "")
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return {}
+    text = raw_ts.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.fromisoformat(text)
+        if ts.tzinfo is None:
+            return {}
+        now = _dt.datetime.now(_dt.timezone.utc)
+        age = (now - ts.astimezone(_dt.timezone.utc)).total_seconds()
+    except Exception:
+        return {}
+    if age < 0:
+        age = 0.0
+    if age > bound:
+        return {}
+    out = dict(data)
+    out["age_s"] = int(age)
+    out["max_age_s"] = int(bound)
+    out["path"] = path
+    return out
 
 
 def _singleton_lock():
@@ -555,6 +656,7 @@ class ProbeWorker(object):
                 % type(exc).__name__
             return
         self._ready.set()
+        _write_probe_worker_heartbeat()
         try:
             while not self._stop.is_set():
                 try:
@@ -564,6 +666,9 @@ class ProbeWorker(object):
                         conn.rollback()
                     except Exception:
                         pass
+                # Refresh the durable ready marker while this executor
+                # thread stays live (W4-D8); it stops advancing on death.
+                _write_probe_worker_heartbeat()
                 self._stop.wait(self._interval_s)
         finally:
             try:
@@ -581,6 +686,7 @@ class ProbeWorker(object):
                 t.join(timeout=max(0.1, float(timeout_s)))
             except Exception:
                 pass
+        _clear_probe_worker_heartbeat()
 
     def is_alive(self):
         # type: () -> bool

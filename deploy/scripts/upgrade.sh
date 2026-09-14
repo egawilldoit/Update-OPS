@@ -9,14 +9,18 @@
 #
 # Usage: sudo deploy/scripts/upgrade.sh --commit <sha> --release-tarball <path>
 #
-# Maintenance protocol (R33, 11 steps):
+# Maintenance protocol (R33, W4-D8 ordering):
 #  (1) write drain file; (2) cli status proves no active/unresolved
 #  (bounded 120s, fail closed); (3) stop API+worker, PROVE stopped (fail
 #  closed, abort, keep drain); (4) consistent DB backup; (5) stage+validate
 #  (validator); (6) migrate via release venv; (7) atomic symlink switch;
-#  (8) install units (+ port drop-in); (9) start; (10) bounded API+worker
-#  readiness (health endpoint via curl localhost + heartbeat freshness via
-#  cli status); (11) release drain only on success.
+#  (8) install units (+ port drop-in); (9) start; (10) bounded readiness:
+#  the ONE shared pre-undrain acceptance gate
+#  (deploy/scripts/lib/deploy_common.sh -> `cli status --require-ready`:
+#  api_service_identity, api_security_boundary, worker_process,
+#  probe_executor, owner_transient_execution); (11) release drain only on
+#  success. No host/runtime mutation (including secrets.env provisioning)
+#  happens before the drain + proven quiescence + proven stopped.
 # Failure: preserve drain, restore PRIOR release symlink ONLY if schema
 # compat check passes (validator --check-compat OLD NEW), else leave
 # manual-recovery state with a clear message. Never "start same broken
@@ -44,6 +48,9 @@ VALIDATE_ARCHIVE="$SCRIPT_DIR/../etc/validate-archive.py"
 # from stable DB/systemd contracts without requiring any installed
 # release to implement the newest protocol.
 QUIESCE_CHECK="$SCRIPT_DIR/../etc/quiescence-check.py"
+# Shared deployment helpers (W4-D8): ONE pre-undrain acceptance gate.
+# shellcheck source=lib/deploy_common.sh
+source "$SCRIPT_DIR/lib/deploy_common.sh"
 
 COMMIT=""
 TARBALL=""
@@ -102,21 +109,6 @@ fi
 # EGA_CONFIG_FILE exported for ALL python invocations (R32), including
 # quiescence/status/validator/migrate/readiness.
 export EGA_CONFIG_FILE="$ETC/config.json"
-
-# Known-secret redaction source (S01, idempotent): older installs may
-# predate secrets.env provisioning. Create EMPTY when absent so the
-# structural secret-source contract holds after upgrade; never touch an
-# existing owner-managed file, never write values, never print contents.
-# 0640 root:ega-update: readable by the ubuntu worker and the ega-update
-# API via group (see install.sh; 0600 root-owned would fail readiness).
-if [ -e "$ETC/secrets.env" ]; then
-  :
-else
-  : > "$ETC/secrets.env"
-  chmod 0640 "$ETC/secrets.env"
-  chown root:ega-update "$ETC/secrets.env"
-  echo "[upgrade] created empty known-secret source $ETC/secrets.env"
-fi
 
 # Config values come ONLY from the trusted checkout parser (F06/N16):
 # PYTHONPATH=$REPO_ROOT (operator checkout), never the candidate
@@ -228,6 +220,23 @@ if systemctl is-active --quiet ega-update-worker 2>/dev/null; then
 fi
 echo "[upgrade] stopped: api and worker proven inactive"
 
+# (3b) Known-secret redaction source (S01, idempotent): older installs may
+# predate secrets.env provisioning. Created EMPTY when absent so the
+# structural secret-source contract holds after upgrade; never touch an
+# existing owner-managed file, never write values, never print contents.
+# 0640 root:ega-update: readable by the ubuntu worker and the ega-update
+# API via group (see install.sh; 0600 root-owned would fail readiness).
+# W4-D8: this host/runtime mutation runs AFTER the maintenance boundary
+# (drain + proven quiescence + proven stopped), never before it.
+if [ -e "$ETC/secrets.env" ]; then
+  :
+else
+  : > "$ETC/secrets.env"
+  chmod 0640 "$ETC/secrets.env"
+  chown root:ega-update "$ETC/secrets.env"
+  echo "[upgrade] created empty known-secret source $ETC/secrets.env"
+fi
+
 # (4) Consistent DB backup (SQLite backup API via the release db tool —
 # never bare cp of a live DB, never inline python). Writers stopped above.
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -332,26 +341,18 @@ systemctl daemon-reload || fail "daemon-reload failed"
 # (9) Start console services (DB/logs/backups preserved — outside releases).
 systemctl restart ega-update-api ega-update-worker cloudflared-ega-update || fail "service restart failed"
 
-# (10) Bounded readiness: API health via curl localhost + worker heartbeat
-# freshness via cli status. Both must pass before undrain.
+# (10) Bounded readiness: ONE canonical acceptance gate shared with
+# install.sh (deploy/scripts/lib/deploy_common.sh) proves ALL mandatory
+# stages through `cli status --require-ready` (api_service_identity,
+# api_security_boundary, worker_process, probe_executor,
+# owner_transient_execution). The shell consumes only the gate exit code;
+# failed stages are named in the machine-readable report and stderr.
 echo "[upgrade] waiting for readiness (bounded 60s)..."
-READY=0
-for _i in $(seq 1 12); do
-  HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EFFECTIVE_PORT_NOW/api/v1/health" 2>/dev/null || printf '000')"
-  if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "200" ]; then
-    cd "$RELEASE_DIR"
-    if EGA_CONFIG_FILE="$ETC/config.json" "$RELEASE_DIR/venv/bin/python" -m backend.app.cli status --require-ready >/tmp/ega-upgrade-ready.json 2>/dev/null; then
-      READY=1
-      break
-    fi
-  fi
-  echo "[upgrade] readiness pending (http=$HTTP_CODE, $_i/12)..."
-  sleep 5
-done
-if [ "$READY" = "1" ]; then
+if ega_wait_for_readiness "$RELEASE_DIR" "$ETC/config.json" \
+    "$EFFECTIVE_PORT_NOW" /tmp/ega-upgrade-ready.json upgrade; then
   :
 else
-  fail "readiness failed after 60s (api/worker not healthy; drain kept)"
+  fail "readiness failed after 60s (mandatory stages unproven; drain kept)"
 fi
 if systemctl is-active --quiet ega-update-api; then
   :
@@ -363,7 +364,7 @@ if systemctl is-active --quiet ega-update-worker; then
 else
   fail "worker failed to stay active — see rollback below"
 fi
-echo "[upgrade] readiness ok (api http=$HTTP_CODE, worker heartbeat fresh)"
+echo "[upgrade] readiness ok (all mandatory stages proven)"
 
 # (11) Success path ONLY: remove drain to re-admit plans/jobs — but only
 # when this run created it. A pre-existing drain (manual maintenance) is

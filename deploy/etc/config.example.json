@@ -29,6 +29,8 @@
   "rate_limit_per_min": 60,
   "body_limit_bytes": 262144,
   "tool_owner": "ubuntu",
+  "api_user": "ega-update",
+  "_comment_api_user": "Dedicated non-root API service identity (mirrors systemd/ega-update-api.service User=). The readiness gate proves effective access under this account; the installed unit's User= is authoritative.",
   "shared_group": "ega-update",
   "node_path": "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/node",
   "npm_path": "/home/ubuntu/.nvm/versions/node/v24.18.0/bin/npm",

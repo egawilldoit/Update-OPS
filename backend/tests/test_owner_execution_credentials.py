@@ -40,9 +40,22 @@ def _owner_env():
 
 
 def _install_text():
-    with open(os.path.join(_REPO_ROOT, "deploy", "scripts", "install.sh"),
-              "r", encoding="utf-8") as fh:
-        return fh.read()
+    # W4-D8: the effective-access PROOF moved into ONE canonical primitive:
+    # backend.app.owner_env transient acceptance (launched inside a real
+    # systemd-run --user unit) consumed through the shared readiness gate.
+    # The install script still provisions (owner_env provision); probe +
+    # verify machinery is pinned via owner_env.py and the shared helper.
+    parts = [
+        os.path.join(_REPO_ROOT, "deploy", "scripts", "install.sh"),
+        os.path.join(_REPO_ROOT, "backend", "app", "owner_env.py"),
+        os.path.join(_REPO_ROOT, "deploy", "scripts", "lib",
+                     "deploy_common.sh"),
+    ]
+    text = ""
+    for path in parts:
+        with open(path, "r", encoding="utf-8") as fh:
+            text += fh.read()
+    return text
 
 
 # -- shared-group resolution -------------------------------------------------

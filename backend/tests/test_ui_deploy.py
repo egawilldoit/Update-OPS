@@ -578,8 +578,17 @@ def test_validator_placeholders_port_manifest(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_install_upgrade_ordering():
+    # W4-D8: readiness acceptance is shared with the deploy helper
+    # (deploy/scripts/lib/deploy_common.sh); the scripts consume only its
+    # exit code. Prepend the helper so the ordering/marker assertions see
+    # the single canonical invocation.
+    lib_path = _repo_path("deploy", "scripts", "lib", "deploy_common.sh")
+    lib = ""
+    if os.path.isfile(lib_path):
+        with open(lib_path, "r", encoding="utf-8") as fh:
+            lib = fh.read()
     for name in ["install.sh", "upgrade.sh"]:
-        text = _read_text("deploy", "scripts", name)
+        text = lib + _read_text("deploy", "scripts", name)
         # R32: CWD-pinned release venv python + exported config for ALL
         # invocations (including quiescence/status).
         assert 'cd "$RELEASE_DIR"' in text or "cd \"$RELEASE_DIR\"" in text, name

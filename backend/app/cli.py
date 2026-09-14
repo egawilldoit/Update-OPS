@@ -370,6 +370,10 @@ def cmd_status(args):
              quiescent, reasons}
     --require-quiescent exits 0 only when proven quiescent, 3 otherwise,
     so deployment relies on the process exit, not shell JSON parsing.
+    --require-ready exits 0 only when the canonical deployment readiness
+    assessment (backend/app/deployment_readiness.py) proves ALL mandatory
+    stages; its machine-readable detail carries per-stage results and
+    `failed_stages`. Plain `status` output is unchanged.
     """
     from . import jobs as _jobs
     from .db import connect
@@ -414,13 +418,30 @@ def cmd_status(args):
             detail=assessment, exit_mapped=EXIT_BLOCKED)
         return EXIT_BLOCKED
     if getattr(args, "require_ready", False):
-        if bool(assessment.get("worker_alive", False)):
+        # W4-D8: canonical deployment readiness (all mandatory stages).
+        # A fresh dispatcher heartbeat alone is no longer sufficient.
+        readiness = {}
+        try:
+            from .deployment_readiness import assess_deployment_readiness
+            readiness = assess_deployment_readiness(
+                settings, quiescence=assessment)
+        except Exception as exc:
+            readiness = {
+                "schema_version": 1, "profile": "deployment-readiness",
+                "ready": False, "failed_stages": ["readiness_assessment"],
+                "stages": {},
+                "reasons": ["readiness assessment crashed: %s"
+                            % type(exc).__name__]}
+        readiness["quiescence"] = assessment
+        if bool(readiness.get("ready", False)):
             _emit_envelope("", "status", state="ready",
-                           detail=assessment, exit_mapped=EXIT_OK)
+                           detail=readiness, exit_mapped=EXIT_OK)
             return EXIT_OK
+        _err("not ready: failed stages: %s"
+             % ", ".join(readiness.get("failed_stages") or ["unknown"]))
         _emit_envelope(
-            "", "status", state="blocked", error_code="worker_not_ready",
-            detail=assessment, exit_mapped=EXIT_BLOCKED)
+            "", "status", state="blocked", error_code="not_ready",
+            detail=readiness, exit_mapped=EXIT_BLOCKED)
         return EXIT_BLOCKED
     _emit_envelope("", "status", state="ok", detail=assessment,
                    exit_mapped=EXIT_OK)
@@ -505,7 +526,11 @@ def build_parser():
     p.add_argument("--require-quiescent", action="store_true",
                    help="exit 0 only when quiescence is proven, else 3")
     p.add_argument("--require-ready", action="store_true",
-                   help="exit 0 only when the worker is alive, else 3")
+                   help="exit 0 only when the canonical deployment "
+                        "readiness assessment proves ALL mandatory stages "
+                        "(api_service_identity, api_security_boundary, "
+                        "worker_process, probe_executor, "
+                        "owner_transient_execution), else 3")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("retention")
     p.set_defaults(func=cmd_retention)
