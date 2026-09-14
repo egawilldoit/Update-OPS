@@ -202,8 +202,12 @@ fail_keep_drain() {
   elif [ "$MIGRATION_STARTED" = "1" ]; then
     echo "[install] migration failed — database state unproven; services NOT restarted; MANUAL RECOVERY REQUIRED (docs/RUNBOOK.md §7)" >&2
   fi
-  echo "[install] drain KEPT (blocking admission) for manual review." >&2
-  echo "[install] inspect, reconcile (docs/RUNBOOK.md), then sudo rm -f <state_dir>/drain only when healthy." >&2
+  if [ -n "${DRAIN:-}" ] && [ -f "${DRAIN:-}" ]; then
+    echo "[install] drain KEPT at $DRAIN (blocking admission) for manual review." >&2
+    echo "[install] inspect, reconcile (docs/RUNBOOK.md), then sudo rm -f $DRAIN only when healthy." >&2
+  else
+    echo "[install] no drain present (this failure ended before/without the drain step); no admission change was made." >&2
+  fi
   exit 1
 }
 
@@ -219,9 +223,14 @@ echo "[install] pinned release: $COMMIT (existing deploy resolved after config p
 export EGA_CONFIG_FILE="$ETC/config.json"
 
 # Resolve state paths from config (N16/R32: never hardcoded for backup/drain).
-EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")"
-EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
-EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
+# W6: the assignments MUST propagate a cfg_value failure — cfg_value's
+# fail_keep_drain runs in a command-substitution subshell, so without the
+# explicit `|| exit 1` an existing-but-unparsable config would only end the
+# subshell and the install would continue with EMPTY state/db/backup paths
+# (fail-closed contract, D8 read-only precheck).
+EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")" || exit 1
+EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")" || exit 1
+EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")" || exit 1
 DRAIN="$EFFECTIVE_STATE/drain"
 echo "[install] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB backups=$EFFECTIVE_BACKUPS"
 # F08: existing deployment = the CONFIGURED DB path exists (determined
@@ -254,6 +263,16 @@ if [ -L "$CURRENT_LINK" ] || [ -e "$CURRENT_LINK" ]; then
   fi
 fi
 echo "[install] previous release: ${PREV_RELEASE:-<none>}"
+
+# READ-ONLY PRECHECK (W6-D8 ordering): never overwrite a release dir that
+# already exists (repeated invocation, or a partial directory left by an
+# earlier failed attempt). Evaluated BEFORE the maintenance boundary so a
+# repeat invocation cannot stop running services, create a drain, or touch
+# the pointer. A partial dir must be removed deliberately before a retry.
+if [ -e "$RELEASE_DIR" ]; then
+  echo "[install] REFUSING: release dir already exists: $RELEASE_DIR (use a new commit or remove the partial dir)" >&2
+  exit 1
+fi
 
 # Drain-file hooks: <state_dir>/drain blocks new plans/jobs (API refuses
 # while present). No drain by default on fresh installs; existing deploys
@@ -320,11 +339,9 @@ id "$TOOL_OWNER" >/dev/null 2>&1 || { echo "tool-owner account $TOOL_OWNER missi
 
 # 2. Release layout: immutable release dir + `current` symlink (staged but
 #    NOT switched until stage+validate+migrate succeed — see step 7).
+#    The release-dir precheck above already refused an existing dir before
+#    the maintenance boundary.
 mkdir -p "$PREFIX/releases"
-if [ -e "$RELEASE_DIR" ]; then
-  echo "[install] release dir already exists: $RELEASE_DIR (refusing to overwrite)" >&2
-  exit 1
-fi
 mkdir -p "$RELEASE_DIR"
 # F15: immutable staging — the operator-supplied tarball path may live in
 # a writable location, so copy it into a root-controlled staging dir,
