@@ -68,6 +68,97 @@ PROBE_WORKER_HEARTBEAT_MAX_AGE_S = 20
 RETENTION_STAMP = "retention.lastdate"
 _lock_fh = None  # type: Any
 
+# W8 boot-reconciliation policy. Boot reconciliation is MANDATORY and is
+# never silently skipped:
+#   * safe hold  - live/unknown probe unit or unresolved job row: reported
+#                  in the result, never fatal (the lease/row stays held and
+#                  the continuous loop retries it);
+#   * retryable  - transient SQLite contention (SQLITE_BUSY/SQLITE_LOCKED):
+#                  bounded retry with short exponential backoff;
+#   * fatal      - any other storage error, or transient contention that
+#                  outlasts the retry bound: ReconcileError; worker startup
+#                  must not proceed (systemd restarts the whole service).
+# A failed reconciliation NEVER releases a lease: unknown -> held.
+BOOT_RECONCILE_ATTEMPTS = 5
+BOOT_RECONCILE_BACKOFF_S = 0.1
+BOOT_RECONCILE_MAX_BACKOFF_S = 1.0
+_boot_sleep = time.sleep  # injectable in tests; bounded by the policy
+
+
+class ReconcileError(RuntimeError):
+    """Mandatory boot reconciliation could not be completed.
+
+    step names the failing phase (probe_request_reconcile,
+    probe_lease_reconcile, job_reconcile); attempts is the number of
+    tries spent; detail is the underlying error text. Startup converts
+    this into SystemExit so the worker never reports a successful
+    reconciliation it did not perform.
+    """
+
+    def __init__(self, step, detail, attempts=0):
+        # type: (str, str, int) -> None
+        super().__init__(
+            "boot reconcile %s failed after %d attempt(s): %s"
+            % (step, int(attempts), detail))
+        self.step = str(step)
+        self.detail = str(detail)
+        self.attempts = int(attempts)
+
+
+_TRANSIENT_STORAGE_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+)
+
+
+def _is_transient_storage_error(exc):
+    # type: (BaseException) -> bool
+    """True only for SQLite busy/locked contention (retryable).
+
+    Everything else (healthy schema errors, disk failures, programming
+    errors) is NOT transient and must fail loudly at boot.
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    try:
+        text = str(exc).lower()
+    except Exception:
+        return False
+    return any(marker in text for marker in _TRANSIENT_STORAGE_MARKERS)
+
+
+def _boot_reconcile_step(step, operation, sleeper=None):
+    # type: (str, Any, Any) -> Any
+    """Run one mandatory boot step with bounded transient-lock retry.
+
+    Returns the operation result unchanged (e.g. a reconcile report).
+    Raises ReconcileError immediately for a non-transient failure, or
+    after BOOT_RECONCILE_ATTEMPTS tries when contention persists. The
+    retry loop is finite and the backoff stays small (<= 1s per wait).
+    """
+    wait = sleeper or _boot_sleep
+    last = None  # type: Any
+    for attempt in range(1, int(BOOT_RECONCILE_ATTEMPTS) + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_transient_storage_error(exc):
+                raise ReconcileError(step, str(exc), attempt) from exc
+            last = exc
+            if attempt >= int(BOOT_RECONCILE_ATTEMPTS):
+                break
+            delay = BOOT_RECONCILE_BACKOFF_S * (2 ** (attempt - 1))
+            try:
+                wait(min(float(BOOT_RECONCILE_MAX_BACKOFF_S),
+                         float(delay)))
+            except Exception:
+                pass
+    raise ReconcileError(
+        step, "transient storage contention persisted: %s" % (last,),
+        int(BOOT_RECONCILE_ATTEMPTS)) from last
+
 
 def _state_dir():
     # type: () -> str
@@ -934,12 +1025,13 @@ def _reconcile_row(conn, row):
     return "interrupted-recovery" if needs_recovery else "interrupted"
 
 
-def _reconcile_candidates(conn):
-    # type: (sqlite3.Connection) -> list
+def _reconcile_candidates(conn, strict=False):
+    # type: (sqlite3.Connection, bool) -> list
     """Rows needing reconcile: nonterminals, unresolved markers, and
     terminal jobs whose mutation lease is still held (F02: otherwise a
     terminal+held-lease row would never be revisited and its lease never
-    released)."""
+    released). strict=True (boot path) re-raises transient SQLite
+    contention instead of degrading to a silent empty list."""
     try:
         rows = conn.execute(
             "SELECT DISTINCT jobs.* FROM jobs LEFT JOIN execution_leases"
@@ -949,22 +1041,26 @@ def _reconcile_candidates(conn):
             " WHERE jobs.state IN (?,?,?,?,?) OR jobs.unresolved=1"
             " OR execution_leases.id IS NOT NULL").fetchall()
         return list(rows)
-    except Exception:
-        pass
+    except Exception as exc:
+        if strict and _is_transient_storage_error(exc):
+            raise
     try:
         rows = conn.execute(
             "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)"
             " OR unresolved=1").fetchall()
         return list(rows)
-    except Exception:
-        pass
+    except Exception as exc:
+        if strict and _is_transient_storage_error(exc):
+            raise
     # Pre-migration schema without unresolved: nonterminals only.
     try:
         rows = conn.execute(
             "SELECT * FROM jobs WHERE state IN (?,?,?,?,?)",
             NONTERMINAL).fetchall()
         return list(rows)
-    except Exception:
+    except Exception as exc:
+        if strict and _is_transient_storage_error(exc):
+            raise
         return []
 
 
@@ -1000,6 +1096,48 @@ def reconcile_claimed_jobs(conn):
     return acted
 
 
+def reconcile_boot_jobs(conn):
+    # type: (sqlite3.Connection) -> Dict[str, Any]
+    """Boot-path job reconcile with explicit failure classification.
+
+    Transient storage contention propagates so the boot wrapper can
+    retry it. A non-transient per-row failure is a safe hold: the row
+    stays nonterminal and the continuous loop retries it; it is counted
+    in the returned report and never silently dropped. Unknown/live
+    units remain holds by design (reconcile_core.decide)."""
+    report = {"candidates": 0, "acted": 0, "held": 0, "errors": 0}
+    rows = _reconcile_candidates(conn, strict=True)
+    report["candidates"] = len(rows)
+    for row in rows:
+        try:
+            nonce = row["dispatch_nonce"]
+        except Exception:
+            nonce = ""
+        try:
+            state = row["state"]
+        except Exception:
+            report["errors"] += 1
+            continue
+        if state in NONTERMINAL and not nonce:
+            continue  # accepted, never claimed: expiry owns it
+        try:
+            outcome = _reconcile_row(conn, row)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if _is_transient_storage_error(exc):
+                raise
+            report["errors"] += 1
+            continue
+        if outcome not in ("live", "skipped", "unknown-held"):
+            report["acted"] += 1
+        else:
+            report["held"] += 1
+    return report
+
+
 def reconcile_probe_requests(conn, units_mod=None, only_past_deadline=False):
     # type: (sqlite3.Connection, object, bool) -> Dict[str, Any]
     """Restart reconciliation of durable probe execution state (W3).
@@ -1024,7 +1162,11 @@ def reconcile_probe_requests(conn, units_mod=None, only_past_deadline=False):
     try:
         rows = conn.execute(
             "SELECT * FROM probe_requests WHERE state='running'").fetchall()
-    except Exception:
+    except Exception as exc:
+        # W8: transient contention must reach the boot retry (a silent
+        # empty report would claim a reconciliation that never ran).
+        if _is_transient_storage_error(exc):
+            raise
         return report
     query = units_mod or _units
     stopped = str(getattr(query, "CONFIRMED_STOPPED",
@@ -1055,11 +1197,15 @@ def reconcile_probe_requests(conn, units_mod=None, only_past_deadline=False):
                     " AND state='running'", (rid,))
                 conn.commit()
                 report["finalized"] += 1
-            except Exception:
+            except Exception as exc:
                 try:
                     conn.rollback()
                 except Exception:
                     pass
+                # W8: surface transient storage contention (boot retries);
+                # any other storage failure leaves the row running (hold).
+                if _is_transient_storage_error(exc):
+                    raise
             continue
         unit = _probe_unit_name(rid)
         unit_state = "unknown"
@@ -1084,11 +1230,15 @@ def reconcile_probe_requests(conn, units_mod=None, only_past_deadline=False):
                     " WHERE id=? AND state='running'", (rid,))
                 report["expired"] += 1
             conn.commit()
-        except Exception:
+        except Exception as exc:
             try:
                 conn.rollback()
             except Exception:
                 pass
+            # W8: transient storage contention is retryable by the boot
+            # wrapper; anything else leaves the request running (hold).
+            if _is_transient_storage_error(exc):
+                raise
     try:
         from .. import observation as _observation
         report["applied"] = int(
@@ -1099,7 +1249,7 @@ def reconcile_probe_requests(conn, units_mod=None, only_past_deadline=False):
 
 
 def reconcile_boot(conn):
-    # type: (sqlite3.Connection) -> None
+    # type: (sqlite3.Connection) -> Dict[str, Any]
     """On start: probe-request + probe-lease reconcile, then job rows.
 
     Never auto-resumes work. D5: a dispatcher restart does not stop the
@@ -1108,28 +1258,61 @@ def reconcile_boot(conn):
     stop proof — a live survivor keeps blocking mutation admission. W3
     adds durable probe-request reconciliation (resume/terminal) and
     observation application before any exclusion release.
+
+    W8 return/failure contract (never a void swallow):
+    - returns a structured per-step report
+      {"probe_request_reconcile": ..., "probe_lease_reconcile": ...,
+       "job_reconcile": ...}; step reports carry the safe holds;
+    - transient SQLite contention is retried with a short bounded
+      backoff (BOOT_RECONCILE_*);
+    - if a mandatory step still cannot complete, raises ReconcileError:
+      startup fails closed (see _reconcile_boot_or_exit) and NO lease is
+      released on failure (unknown reconciliation -> lease held).
+
+    Failure classification per step:
+    - probe_request_reconcile / probe_lease_reconcile:
+      live/unknown unit state = safe hold (reported); SQLITE_BUSY/locked
+      = retryable; any other storage error or exhausted retries = fatal.
+    - job_reconcile:
+      unknown/live unit or per-row non-storage error = safe hold
+      (reported in "errors"/"held"; continuous loop retries); transient
+      storage contention = retryable; exhausted retries = fatal.
     """
     # W3 lifecycle order: finalize/apply durable result state BEFORE any
     # exclusion release, so a mutation admitted right after a release can
     # never race an unapplied observation.
+    request_report = _boot_reconcile_step(
+        "probe_request_reconcile",
+        lambda: reconcile_probe_requests(conn))
+    lease_report = _boot_reconcile_step(
+        "probe_lease_reconcile", lambda: _reconcile_boot_leases(conn))
+    job_report = _boot_reconcile_step(
+        "job_reconcile", lambda: reconcile_boot_jobs(conn))
+    return {"probe_request_reconcile": request_report or {},
+            "probe_lease_reconcile": lease_report or {},
+            "job_reconcile": job_report or {}}
+
+
+def _reconcile_boot_leases(conn):
+    # type: (sqlite3.Connection) -> Dict[str, Any]
+    """Boot-path probe-lease reconcile (positive stop proof only).
+
+    Transient storage contention originates in the strict release and
+    propagates; a legitimate live/unknown unit is reported as held."""
+    from ..leases import reconcile_probe_leases
+    return reconcile_probe_leases(conn, include_unexpired=True)
+
+
+def _reconcile_boot_or_exit(conn):
+    # type: (sqlite3.Connection) -> Dict[str, Any]
+    """Startup gate: boot reconciliation must complete, or the worker
+    must not start. ReconcileError -> SystemExit so systemd restarts the
+    whole service and retries; a failed reconciliation never releases a
+    lease (fail closed)."""
     try:
-        reconcile_probe_requests(conn)
-    except Exception:
-        pass
-    try:
-        from ..leases import reconcile_probe_leases
-        reconcile_probe_leases(conn, include_unexpired=True)
-    except Exception:
-        pass
-    for row in _reconcile_candidates(conn):
-        try:
-            _reconcile_row(conn, row)
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            continue
+        return reconcile_boot(conn)
+    except ReconcileError as exc:
+        raise SystemExit("boot reconciliation failed: %s" % exc)
 
 
 def _maybe_retain(conn):
@@ -1202,7 +1385,8 @@ def main():
         validate_schema(conn)
     except Exception as exc:
         raise SystemExit("schema validation failed: %s" % exc)
-    reconcile_boot(conn)
+    # W8: mandatory boot reconciliation; completes or startup aborts.
+    _reconcile_boot_or_exit(conn)
     # W3: probes execute on a bounded worker thread with its own
     # connection (the thread owns the reference). The main loop keeps
     # heartbeat, job dispatch, and reconciliation alive while a

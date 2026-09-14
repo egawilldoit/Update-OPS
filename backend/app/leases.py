@@ -225,10 +225,17 @@ def acquire_probe_lease(conn, tool_id, holder, ttl_s=PROBE_LEASE_TTL_S,
         return None
 
 
-def release_lease(conn, lease_id):
-    # type: (sqlite3.Connection, str) -> bool
+def release_lease(conn, lease_id, fail_on_storage_error=False):
+    # type: (sqlite3.Connection, str, bool) -> bool
     """Release a lease idempotently. Returns True when held-then-released
-    or already released; False on storage failure."""
+    or already released; False on storage failure.
+
+    fail_on_storage_error=True re-raises the storage error instead of
+    returning False. Reconciliation uses it (W8) to distinguish transient
+    SQLite contention (boot retries) from a legitimate safe hold; a
+    release failure must never be silently mistaken for "already held by
+    a live unit".
+    """
     if not lease_id or not _tables_present(conn):
         return False
     try:
@@ -243,6 +250,8 @@ def release_lease(conn, lease_id):
             conn.execute("ROLLBACK")
         except Exception:
             pass
+        if fail_on_storage_error:
+            raise
         return False
 
 
@@ -305,6 +314,11 @@ def reconcile_probe_leases(conn, units_mod=None, include_unexpired=False):
     units_mod defaults to backend.app.units (lazy import); tests inject
     a fake exposing query_unit — real systemd is never required.
 
+    W8: a release that cannot commit (e.g. transient SQLITE_BUSY) raises
+    the storage error instead of being reported as "held": the caller
+    (boot reconciliation) retries with a bounded backoff or fails
+    startup. A lease is still NEVER released on failure.
+
     Returns {"checked", "released", "held", "unbound", "evidence"}.
     """
     report = {"checked": 0, "released": 0, "held": 0, "unbound": 0,
@@ -349,7 +363,8 @@ def reconcile_probe_leases(conn, units_mod=None, include_unexpired=False):
                 unit_state = "unknown"
         entry["state"] = unit_state
         if unit_state == stopped and release_lease(
-                conn, str(lease.get("id") or "")):
+                conn, str(lease.get("id") or ""),
+                fail_on_storage_error=True):
             report["released"] += 1
             entry["action"] = "released"
         else:
