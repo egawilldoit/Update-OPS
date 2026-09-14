@@ -55,6 +55,38 @@ OBSERVATION_APPLY_WAIT_S = 2.0
 # narrow subset into INSTALLATION_READ_OPS).
 CONTENDING_OPS = INSTALLATION_READ_OPS
 
+# Serialized probe-result size contract (W3.2). probe_results.result_json
+# is a bounded, VALID UTF-8 JSON document. PROBE_RESULT_MAX_BYTES is the
+# serialized UTF-8 byte size of that document as stored (ensure_ascii=
+# False). A result within the bound is stored verbatim with its original
+# status; a result over the bound is REPLACED by a small typed error
+# document (never truncated into invalid JSON).
+PROBE_RESULT_MAX_BYTES = 200_000
+_TOO_LARGE_REASON = "probe_result_too_large"
+_SERIALIZATION_FAILED_REASON = "probe_result_serialization_failed"
+_SERIALIZATION_FAILED_DOC = json.dumps(
+    {"reason": _SERIALIZATION_FAILED_REASON}, sort_keys=True)
+
+
+def _serialize_probe_result(payload):
+    # type: (Any) -> str
+    """Serialize one probe payload exactly as it will be stored."""
+    return json.dumps(payload or {}, sort_keys=True, default=str,
+                      ensure_ascii=False)
+
+
+def _oversized_result_doc(actual_bytes):
+    # type: (int) -> str
+    """Small typed replacement for an over-bound result.
+
+    Non-sensitive metadata only: no payload fragments, oversized fields,
+    secrets, or raw environment data.
+    """
+    return json.dumps({"reason": _TOO_LARGE_REASON,
+                       "max_bytes": PROBE_RESULT_MAX_BYTES,
+                       "actual_bytes": int(actual_bytes)},
+                      sort_keys=True, ensure_ascii=False)
+
 
 def _utcnow():
     # type: () -> str
@@ -322,6 +354,12 @@ def finish_probe(conn, request_id, status, payload):
     # type: (sqlite3.Connection, str, str, Dict[str, Any]) -> bool
     """Dispatcher-side: store the typed result (payload pre-sanitized).
 
+    The stored document is always valid UTF-8 JSON, bounded by
+    PROBE_RESULT_MAX_BYTES serialized bytes and never truncated: an
+    over-bound result is replaced by the small typed
+    `probe_result_too_large` error document with status "error", and a
+    serialization failure by `probe_result_serialization_failed`.
+
     Returns True only when the result is durably stored and the request
     marked done (one transaction). Observation application is a separate
     coordinator step (observation.apply_probe_result) so a crash between
@@ -330,15 +368,25 @@ def finish_probe(conn, request_id, status, payload):
     if not _tables_present(conn):
         return False
     try:
-        raw = json.dumps(payload or {}, sort_keys=True, default=str)
+        raw = _serialize_probe_result(payload)
     except Exception:
-        raw, status = "{}", "error"
+        # A payload that cannot be serialized is never stored as ``{}``
+        # (which would pretend to describe the original result): the
+        # typed error is the honest outcome.
+        raw, status = _SERIALIZATION_FAILED_DOC, "error"
+    else:
+        actual_bytes = len(raw.encode("utf-8"))
+        if actual_bytes > PROBE_RESULT_MAX_BYTES:
+            # Fail closed: never cut serialized JSON. The oversized
+            # payload is replaced by the small typed error document.
+            status = "error"
+            raw = _oversized_result_doc(actual_bytes)
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "INSERT OR REPLACE INTO probe_results(request_id,status,"
             "result_json,finished_at) VALUES(?,?,?,?)",
-            (request_id, status, raw[:200000], _utcnow()))
+            (request_id, status, raw, _utcnow()))
         conn.execute(
             "UPDATE probe_requests SET state='done' WHERE id=?",
             (request_id,))
