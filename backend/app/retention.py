@@ -7,6 +7,11 @@ Policy (CONTRACTS section 7, frozen interfaces):
 - Latest-two completed backups per tool (completed_at ordered, excess removed).
 - Expired unused plans (expires_at past, used_at empty, unreferenced).
 - Old receipts (<job-id>.receipt.json files for aged-out terminal jobs).
+- 90d durable probe metadata (W9): old terminal probe requests whose
+  result is durably classified/applied and whose execution stop is
+  positively resolved, plus released old probe leases. Never a queued/
+  running probe, an unreleased probe lease, an unapplied observation, or
+  any mutation lease.
 
 Protection (NEVER touch):
 - Nonterminal jobs (accepted/preflight/backup/updating/verifying).
@@ -27,10 +32,12 @@ Filesystem layout (from settings, never hardcoded):
 
 Entry point: run_retention(conn, settings) -> dict with keys
 deleted_logs, deleted_backups, deleted_plans, deleted_receipts,
+deleted_probe_requests, deleted_probe_results, deleted_probe_leases,
 tombstoned, errors. Never raises; all failures are collected in errors.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -124,6 +131,326 @@ def _safe_job_id(job_id):
     return job_id
 
 
+# W9 probe metadata retention constants. A terminal request is removable
+# only with a classified result whose observation was durably applied
+# (observation ops), or -- expired, never executed -- without a result.
+_PROBE_TERMINAL_STATES = ("done", "expired")
+_PROBE_TERMINAL_STATUSES = ("ok", "deferred", "error")
+
+
+def _probe_op_sets():
+    # type: () -> Any
+    """(all_ops, observation_ops) from the single owner_probes authority.
+
+    Falls back to the frozen op tuple when owner_probes is unavailable
+    (older checkout): an unknown op is then retained, never deleted.
+    """
+    try:
+        from .owner_probes import OBSERVATION_APPLIED_OPS, OPS
+        return (tuple(OPS or ()), tuple(OBSERVATION_APPLIED_OPS or ()))
+    except Exception:
+        return (("inspect", "discover", "activity", "plan", "verify",
+                 "refresh"), ("refresh",))
+
+
+def _probe_unit_name(request_id):
+    # type: (object) -> str
+    """Canonical transient probe unit for a request id, or "" when the id
+    cannot bind one (callers then treat the binding as unprovable)."""
+    try:
+        from .owner_env import transient_probe_name
+        return str(transient_probe_name(request_id) or "")
+    except Exception:
+        return ""
+
+
+def _probe_result_unresolved(conn, raw):
+    # type: (Any, object) -> bool
+    """True when a stored result carries UNRESOLVED exclusion evidence.
+
+    A result that names a held exclusion is removable only when the named
+    probe lease is durably released. An unparsable/non-object document,
+    a missing lease row, or an unreleased lease all mean unresolved
+    (KEEP the row; never delete because parsing failed).
+    """
+    try:
+        doc = json.loads(raw) if raw else {}
+    except Exception:
+        return True
+    if not isinstance(doc, dict):
+        return True
+    try:
+        held = bool(doc.get("exclusion_held", False))
+        recon = str(doc.get("reconciliation", "") or "")
+        lease_id = str(doc.get("lease_id", "") or "")
+    except Exception:
+        return True
+    if not held and recon != "required":
+        return False
+    if not lease_id:
+        return True
+    try:
+        row = conn.execute(
+            "SELECT released_at FROM execution_leases WHERE id=?",
+            (lease_id,)).fetchone()
+    except Exception:
+        return True
+    if row is None:
+        return True
+    try:
+        return not bool(str(dict(row).get("released_at", "") or ""))
+    except Exception:
+        return True
+
+
+def _probe_unit_in_use(conn, unit):
+    # type: (Any, str) -> bool
+    """True when any surviving probe request derives this canonical unit.
+
+    Used only for legacy unbound released leases: unknown/unreadable
+    state keeps the lease (fail-safe).
+    """
+    if not unit:
+        return True
+    try:
+        rows = conn.execute("SELECT id FROM probe_requests").fetchall()
+    except Exception:
+        return True
+    for row in rows:
+        try:
+            rid = str(dict(row).get("id") or "")
+        except Exception:
+            continue
+        if rid and _probe_unit_name(rid) == unit:
+            return True
+    return False
+
+
+def _retain_probe_metadata(conn, cutoff, result, err, tombstone):
+    # type: (Any, Any, Dict[str, Any], Any, Any) -> None
+    """Bounded retention for durable probe queue metadata (W9).
+
+    PROTECTED (never removed):
+    - queued/running requests and any state outside the terminal pair;
+    - requests bound to an unreleased probe lease (request_id binding, or
+      the legacy canonical unit subject);
+    - done requests whose result is missing, unclassified, unparsable, or
+      (observation ops) not durably applied (result_id != finished_at);
+    - results naming an exclusion whose release is unproven;
+    - every non-probe lease (mutation/maintenance) is out of scope.
+    ELIGIBLE:
+    - done + result: terminal status, applied marker for observation ops,
+      completion older than the metadata cutoff, no unreleased bound
+      probe lease;
+    - expired without result (never executed): created_at aged, no lease;
+    - released old probe leases whose bound request is removed in the
+      same run (or whose request row is already gone).
+
+    Deletion order follows the real FK (probe_results.request_id ->
+    probe_requests.id): released probe lease, then result, then request,
+    one transaction per request. An interruption rolls the whole unit
+    back (fail-safe); a rerun is idempotent. Unknown -> KEEP.
+    """
+    if not (_table_exists(conn, "probe_requests")
+            and _table_exists(conn, "probe_results")):
+        return
+    if not _table_exists(conn, "execution_leases"):
+        # Cannot prove stop resolution without the lease table: retain.
+        return
+    all_ops, obs_ops = _probe_op_sets()
+
+    # Snapshot probe lease state. Unreleased leases protect their bound
+    # requests; released leases are evidence until the request is gone.
+    held_request_ids = set()  # type: Set[str]
+    held_subjects = set()  # type: Set[str]
+    probe_leases = []  # type: List[Dict[str, str]]
+    try:
+        rows = conn.execute(
+            "SELECT id, request_id, subject, released_at FROM"
+            " execution_leases WHERE kind='probe'").fetchall()
+    except Exception as exc:
+        err("probe lease scan: %s" % exc)
+        return
+    for row in rows:
+        try:
+            d = dict(row)
+        except Exception:
+            continue
+        lease = {"id": str(d.get("id") or ""),
+                 "request_id": str(d.get("request_id") or ""),
+                 "subject": str(d.get("subject") or ""),
+                 "released_at": str(d.get("released_at") or "")}
+        if not lease["id"]:
+            continue
+        probe_leases.append(lease)
+        if not lease["released_at"]:
+            if lease["request_id"]:
+                held_request_ids.add(lease["request_id"])
+            if lease["subject"]:
+                held_subjects.add(lease["subject"])
+
+    # Snapshot terminal requests; anything else is protected by the WHERE.
+    try:
+        rows = conn.execute(
+            "SELECT id, op, state, created_at, result_id FROM probe_requests"
+            " WHERE state IN (?,?)", _PROBE_TERMINAL_STATES).fetchall()
+    except Exception as exc:
+        err("probe request scan: %s" % exc)
+        return
+
+    eligible = []  # type: List[Dict[str, Any]]
+    for row in rows:
+        try:
+            d = dict(row)
+        except Exception:
+            continue
+        rid = str(d.get("id") or "")
+        if not rid:
+            continue
+        op = str(d.get("op") or "")
+        state = str(d.get("state") or "")
+        created = _parse_ts(d.get("created_at"))
+        if rid in held_request_ids:
+            continue
+        if held_subjects:
+            unit = _probe_unit_name(rid)
+            if unit and unit in held_subjects:
+                continue
+        try:
+            rrow = conn.execute(
+                "SELECT status, result_json, finished_at FROM probe_results"
+                " WHERE request_id=?", (rid,)).fetchone()
+        except Exception as exc:
+            err("probe result scan %s: %s" % (rid, exc))
+            continue
+        if rrow is not None:
+            try:
+                r = dict(rrow)
+                status = str(r.get("status") or "")
+                raw = r.get("result_json")
+                finished_raw = str(r.get("finished_at") or "")
+            except Exception:
+                continue
+            if state != "done" or status not in _PROBE_TERMINAL_STATUSES:
+                continue
+            finished = _parse_ts(finished_raw)
+            if finished is None:
+                continue
+            if op in obs_ops:
+                # Observation result: only the durable applied marker
+                # (result_id == finished_at token) proves it was applied.
+                if not finished_raw or \
+                        str(d.get("result_id") or "") != finished_raw:
+                    continue
+            elif op not in all_ops:
+                # Unknown op: cannot prove there is no observation.
+                continue
+            if _probe_result_unresolved(conn, raw):
+                continue
+            if not (finished < cutoff):
+                continue
+            eligible.append({"id": rid, "has_result": True, "leases": []})
+        else:
+            # No result: only a never-executed expired request is
+            # classifiable; a done request without a result is unknown.
+            if state != "expired":
+                continue
+            if created is None or not (created < cutoff):
+                continue
+            eligible.append({"id": rid, "has_result": False, "leases": []})
+
+    eligible_ids = {entry["id"] for entry in eligible}
+    by_id = {entry["id"]: entry for entry in eligible}
+    orphan_leases = []  # type: List[str]
+    for lease in probe_leases:
+        if not lease["released_at"]:
+            continue
+        released = _parse_ts(lease["released_at"])
+        if released is None or not (released < cutoff):
+            continue
+        rid = lease["request_id"]
+        if rid:
+            # Released evidence: removable only together with an eligible
+            # (or already absent) request. A retained request keeps it.
+            if rid in eligible_ids:
+                by_id[rid]["leases"].append(lease["id"])
+            else:
+                try:
+                    alive = conn.execute(
+                        "SELECT 1 FROM probe_requests WHERE id=?",
+                        (rid,)).fetchone() is not None
+                except Exception:
+                    alive = True  # unreadable -> keep (fail-safe)
+                if not alive:
+                    orphan_leases.append(lease["id"])
+            continue
+        # Legacy unbound lease: keep it when its canonical subject still
+        # names a surviving request.
+        if lease["subject"] and _probe_unit_in_use(conn, lease["subject"]):
+            continue
+        orphan_leases.append(lease["id"])
+
+    deleted_requests = 0
+    deleted_results = 0
+    deleted_leases = 0
+    for entry in sorted(eligible, key=lambda e: e["id"]):
+        rid = entry["id"]
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            lease_n = 0
+            for lease_id in entry["leases"]:
+                cur = conn.execute(
+                    "DELETE FROM execution_leases WHERE id=? AND"
+                    " kind='probe' AND released_at<>''", (lease_id,))
+                lease_n += int(cur.rowcount or 0)
+            cur = conn.execute(
+                "DELETE FROM probe_results WHERE request_id=?", (rid,))
+            result_n = int(cur.rowcount or 0)
+            cur = conn.execute(
+                "DELETE FROM probe_requests WHERE id=? AND state IN (?,?)",
+                (rid,) + _PROBE_TERMINAL_STATES)
+            request_n = int(cur.rowcount or 0)
+            if request_n == 1 and (result_n >= 1 or not entry["has_result"]):
+                conn.execute("COMMIT")
+                deleted_requests += 1
+                deleted_results += result_n
+                deleted_leases += lease_n
+            else:
+                # Evidence vanished or state changed under us: keep.
+                conn.execute("ROLLBACK")
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            err("probe request %s: %s" % (rid, exc))
+    for lease_id in orphan_leases:
+        try:
+            cur = conn.execute(
+                "DELETE FROM execution_leases WHERE id=? AND kind='probe'"
+                " AND released_at<>''", (lease_id,))
+            if cur.rowcount and cur.rowcount > 0:
+                conn.commit()
+                deleted_leases += 1
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            err("probe lease %s: %s" % (lease_id, exc))
+
+    result["deleted_probe_requests"] += deleted_requests
+    result["deleted_probe_results"] += deleted_results
+    result["deleted_probe_leases"] += deleted_leases
+    if deleted_requests or deleted_results or deleted_leases:
+        # Bounded tombstone evidence: ONE summary row per run, never one
+        # row per deleted probe (probe metadata is the unbounded growth
+        # concern this retention exists to bound).
+        tombstone("probe", utcnow_iso(),
+                  "probe-metadata-retention requests=%d results=%d leases=%d"
+                  % (deleted_requests, deleted_results, deleted_leases))
+
+
 def run_retention(conn, settings):
     # type: (Any, Any) -> Dict[str, Any]
     """Enforce retention; return counts. Never raises."""
@@ -132,6 +459,9 @@ def run_retention(conn, settings):
         "deleted_backups": 0,
         "deleted_plans": 0,
         "deleted_receipts": 0,
+        "deleted_probe_requests": 0,
+        "deleted_probe_results": 0,
+        "deleted_probe_leases": 0,
         "tombstoned": 0,
         "errors": [],
     }  # type: Dict[str, Any]
@@ -576,6 +906,19 @@ def run_retention(conn, settings):
                     pass
     except Exception as exc:
         _err("metadata: %s" % exc)
+
+    # 7. 90d durable probe metadata (W9): terminal requests with durably
+    #    classified/applied results and positively resolved execution
+    #    stops, plus released old probe leases. Protected rows survive
+    #    regardless of age and any unprovable state keeps the row.
+    try:
+        _retain_probe_metadata(conn, meta_cutoff, result, _err, _tombstone)
+    except Exception as exc:
+        _err("probe metadata: %s" % exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
     try:
         conn.commit()
