@@ -147,10 +147,15 @@ cfg_value() {
   fi
 }
 
-EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")"
-EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")"
-EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")"
-EFFECTIVE_PORT="$(cfg_value listen_port "8771")"
+# W6: the assignments MUST propagate a cfg_value failure — cfg_value's
+# `exit 1` for an existing-but-unparsable config runs in a
+# command-substitution subshell, so without the explicit `|| exit 1` the
+# upgrade would continue with EMPTY state/db/backup paths (no-fail-open
+# contract, D8 read-only precheck).
+EFFECTIVE_STATE="$(cfg_value state_dir "$STATE")" || exit 1
+EFFECTIVE_DB="$(cfg_value db_path "$EFFECTIVE_STATE/state.db")" || exit 1
+EFFECTIVE_BACKUPS="$(cfg_value backup_dir "$EFFECTIVE_STATE/backups")" || exit 1
+EFFECTIVE_PORT="$(cfg_value listen_port "8771")" || exit 1
 DRAIN="$EFFECTIVE_STATE/drain"
 DRAIN_CREATED_BY_US=0
 WAS_API=0
@@ -239,6 +244,16 @@ else
   exit 1
 fi
 
+# READ-ONLY PRECHECK (W6-D8 ordering): the target release dir must not
+# exist yet. Evaluated BEFORE the maintenance boundary so a repeated
+# invocation (same commit) fails fast without draining admission, stopping
+# services, or taking a backup. Never overwrite a staged/installed release;
+# a partial dir must be removed deliberately before a retry.
+if [ -e "$RELEASE_DIR" ]; then
+  echo "[upgrade] REFUSING: release dir already exists: $RELEASE_DIR (use a new commit or remove the partial dir)" >&2
+  exit 1
+fi
+
 echo "[upgrade] $PREV_RELEASE -> $RELEASE_DIR"
 echo "[upgrade] state_dir=$EFFECTIVE_STATE db=$EFFECTIVE_DB port=$EFFECTIVE_PORT"
 
@@ -318,7 +333,8 @@ echo "[upgrade] backup: $EFFECTIVE_BACKUPS/state-preupgrade-$TS.db"
 
 # (5) Stage the new release dir (immutable, root-owned), write MANIFEST via
 # sha256sum, install venv with --require-hashes (NO fallback), then validate.
-if [ -e "$RELEASE_DIR" ]; then fail "release dir exists: $RELEASE_DIR"; fi
+# The release-dir precheck above already refused an existing dir before the
+# maintenance boundary.
 mkdir -p "$RELEASE_DIR" || fail "cannot create $RELEASE_DIR"
 # F15: immutable staging — copy the operator tarball into a
 # root-controlled staging dir, digest it, validate the STAGED copy,

@@ -8,6 +8,23 @@ shim records an event into an events log, so tests can assert the
 OBSERVED order of host/runtime mutations relative to the drain +
 quiescence maintenance boundary.
 
+Deterministic W6 acceptance knobs (all default off / production
+behavior, so the existing W4/W5 suites are unaffected):
+  quiesce_fail           quiescence-check.py exits 3 forever
+  archive_validate_fail  validate-archive.py blocks the staged tarball
+  pip_fail               release venv pip install fails
+  missing_frontend       extracted tarball lacks backend/app/static/index.html
+  provision_fail         owner_env provision (ACL bootstrap) fails
+  drain_create_fail      touch <state>/drain fails
+  config_parse_fail      config_cli get --require fails (broken config)
+  current_invalid        current is a regular file / dir / escaping symlink
+  cas_race               another actor moves `current` after inspect
+  start_fail_units       systemctl start/restart fails for named units
+  compat_error           --check-compat exits with an unexpected error (unknown)
+  secrets_env_present    omit the pre-provisioned secrets.env
+  etc_readonly           /etc/ega-update is not writable (host-prep failure)
+  unit_content_from_commit  copied units embed the release commit (F boundary)
+
 Safety: no real account/group/systemd/ACL/filesystem mutation is
 possible — the rewritten constants point at the sandbox and every
 external command that could touch the host is shimmed. Only the deploy
@@ -78,6 +95,13 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "backend.app.cli" ]; then
       printf '{"state":"blocked"}\\n'
       exit 3
     fi
+    if [ -n "${EGA_HARNESS_READY_FAIL_STAGES:-}" ]; then
+      record "READINESS_FAIL_STAGES ${EGA_HARNESS_READY_FAIL_STAGES}"
+      printf 'not ready: failed stages: %s\\n' \
+        "${EGA_HARNESS_READY_FAIL_STAGES}" >&2
+      printf '{"state":"blocked"}\\n'
+      exit 3
+    fi
     record "READINESS_OK"
     printf '{"state":"ready"}\\n'
     exit 0
@@ -86,14 +110,32 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "backend.app.cli" ]; then
 fi
 case "${1:-}" in
   *validate-release.py*)
+    _check_compat=0
+    _validate=0
     for _a in "$@"; do
-      if [ "$_a" = "--check-compat" ] \
-         && [ "${EGA_HARNESS_COMPAT_FAIL:-0}" = "1" ]; then
-        record "VALIDATE_COMPAT_FAIL"
-        printf 'blocked: schema drift 3->4 (harness compat failure)\n'
-        exit 3
-      fi
+      [ "$_a" = "--check-compat" ] && _check_compat=1
+      [ "$_a" = "--release" ] && _validate=1
     done
+    if [ "$_check_compat" = "1" ]; then
+      case "${EGA_HARNESS_COMPAT_FAIL:-0}" in
+        error)
+          record "VALIDATE_COMPAT_ERROR"
+          printf 'error: compatibility check unavailable (harness)\\n'
+          exit 7 ;;
+        fail|1)
+          record "VALIDATE_COMPAT_FAIL"
+          printf 'blocked: schema drift 3->4 (harness compat failure)\\n'
+          exit 3 ;;
+        *) exit 0 ;;
+      esac
+    fi
+    if [ "$_validate" = "1" ] \
+       && [ "${EGA_HARNESS_VALIDATOR_REQUIRE_SECRETS:-1}" = "1" ] \
+       && [ ! -e "${EGA_HARNESS_ETC:-/nonexistent}/secrets.env" ]; then
+      record "VALIDATE_BLOCKED_SECRETS"
+      printf 'blocked: secrets.env missing (harness fidelity gate)\\n'
+      exit 3
+    fi
     record "VALIDATE_RELEASE"; exit 0 ;;
   *owner_env*) record "RELEASE_PY_OWNER_ENV"; exit 0 ;;
 esac
@@ -104,6 +146,10 @@ _FAKE_VENV_PIP = """\
 #!/usr/bin/env bash
 record() { printf '%s\\n' "$*" >> "$EGA_HARNESS_EVENTS"; }
 record "PIP $*"
+if [ "${EGA_HARNESS_PIP_FAIL:-0}" = "1" ]; then
+  record "PIP_FAIL"
+  exit 1
+fi
 exit 0
 """
 
@@ -116,7 +162,8 @@ def _install_shims(bin_dir, sandbox):
           exit 0
         fi
         case "${1:-}" in
-          ega-update) exit 1 ;;
+          ega-update)
+            [ "${EGA_HARNESS_USER_EXISTS:-0}" = "1" ] && exit 0 || exit 1 ;;
           *) exit 0 ;;
         esac
         """)
@@ -146,6 +193,29 @@ def _install_shims(bin_dir, sandbox):
         """)
     _shim(bin_dir, "touch", """
         record "TOUCH $*"
+        if [ "${EGA_HARNESS_DRAIN_CREATE_FAIL:-0}" = "1" ]; then
+          for _a in "$@"; do
+            case "$_a" in
+              */drain) record "TOUCH_FAIL $_a"; exit 1 ;;
+            esac
+          done
+        fi
+        for _a in "$@"; do
+          case "$_a" in
+            */drain)
+              if [ -n "${EGA_HARNESS_LOCK:-}" ] \\
+                 && [ -e "${EGA_HARNESS_LOCK}" ]; then
+                exec 8>"${EGA_HARNESS_LOCK}"
+                if flock -n 8 2>/dev/null; then
+                  record "LOCK_FREE_DURING_MUTATION"
+                  flock -u 8 2>/dev/null || true
+                else
+                  record "LOCK_HELD_DURING_MUTATION"
+                fi
+                exec 8>&-
+              fi ;;
+          esac
+        done
         command /usr/bin/touch "$@"
         """)
     _shim(bin_dir, "mkdir", """
@@ -190,16 +260,48 @@ def _install_shims(bin_dir, sandbox):
         """)
     _shim(bin_dir, "systemctl", """\
         state_file="$EGA_HARNESS_SANDBOX/.systemctl-state"
+        statedir="$EGA_HARNESS_SANDBOX/.systemctl-state.d"
+        unit_state() {
+          if [ -f "$statedir/$1" ]; then cat "$statedir/$1"
+          elif [ -f "$state_file" ]; then cat "$state_file"
+          else echo inactive; fi
+        }
+        set_state() {
+          st="$1"; shift
+          mkdir -p "$statedir"
+          for u in "$@"; do
+            case "$u" in -*) continue ;; esac
+            printf '%s\\n' "$st" > "$statedir/$u" 2>/dev/null || true
+          done
+          printf '%s\\n' "$st" > "$state_file"
+        }
         case "${1:-}" in
           is-active)
-            [ "$(cat "$state_file" 2>/dev/null)" = "active" ] && exit 0 || exit 3 ;;
+            unit=""
+            for a in "$@"; do
+              case "$a" in --quiet|-q|--no-pager) ;; *) unit="$a" ;; esac
+            done
+            if [ -n "$unit" ]; then
+              [ "$(unit_state "$unit")" = "active" ] && exit 0 || exit 3
+            fi
+            [ "$(unit_state '')" = "active" ] && exit 0 || exit 3 ;;
           stop)
-            printf 'stopped\\n' > "$state_file"
             record "SYSTEMCTL $*"
+            shift
+            set_state stopped "$@"
             exit 0 ;;
           start|restart)
-            printf 'active\\n' > "$state_file"
             record "SYSTEMCTL $*"
+            for u in "${@:2}"; do
+              case ",${EGA_HARNESS_START_FAIL_UNITS:-}," in
+                *",$u,"*)
+                  printf 'stopped\\n' > "$statedir/$u" 2>/dev/null || true
+                  record "SYSTEMCTL_FAIL $*"
+                  exit 1 ;;
+              esac
+            done
+            shift
+            set_state active "$@"
             exit 0 ;;
           list-timers)
             echo "(none)"
@@ -238,16 +340,32 @@ def _install_shims(bin_dir, sandbox):
           prev="$arg"
         done
         [ -n "$dest" ] || exit 1
+        _commit="$(basename "$dest")"
         mkdir -p "$dest/backend/app/static" "$dest/backend/migrations" \\
                  "$dest/systemd/user" "$dest/deploy/etc"
-        : > "$dest/backend/app/static/index.html"
+        if [ "${EGA_HARNESS_MISSING_FRONTEND:-0}" = "1" ]; then
+          record "TAR_MISSING_FRONTEND"
+        else
+          : > "$dest/backend/app/static/index.html"
+        fi
         : > "$dest/backend/requirements.txt"
         : > "$dest/backend/app/__init__.py"
         : > "$dest/deploy/etc/validate-release.py"
-        : > "$dest/systemd/ega-update-api.service"
-        : > "$dest/systemd/ega-update-worker.service"
-        : > "$dest/systemd/ega-update-runner@.service"
-        : > "$dest/systemd/user/ega-update-runner@.service"
+        if [ "${EGA_HARNESS_UNIT_CONTENT_FROM_COMMIT:-0}" = "1" ]; then
+          printf '# unit from release %s\\n' "$_commit" \\
+            > "$dest/systemd/ega-update-api.service"
+          printf '# unit from release %s\\n' "$_commit" \\
+            > "$dest/systemd/ega-update-worker.service"
+          printf '# unit from release %s\\n' "$_commit" \\
+            > "$dest/systemd/ega-update-runner@.service"
+          printf '# unit from release %s\\n' "$_commit" \\
+            > "$dest/systemd/user/ega-update-runner@.service"
+        else
+          : > "$dest/systemd/ega-update-api.service"
+          : > "$dest/systemd/ega-update-worker.service"
+          : > "$dest/systemd/ega-update-runner@.service"
+          : > "$dest/systemd/user/ega-update-runner@.service"
+        fi
         exit 0
         """)
     _shim(bin_dir, "python3", """\
@@ -255,6 +373,10 @@ def _install_shims(bin_dir, sandbox):
         if [ "${1:-}" = "-m" ]; then
           case "${2:-}" in
             backend.app.config_cli)
+              if [ "${EGA_HARNESS_CONFIG_PARSE_FAIL:-0}" = "1" ]; then
+                record "CONFIG_PARSE_FAIL $*"
+                exit 1
+              fi
               shift 2
               cmd="${1:-}"; shift || true
               case "$cmd" in
@@ -285,7 +407,12 @@ def _install_shims(bin_dir, sandbox):
               exit 0 ;;
             backend.app.owner_env)
               case "${3:-}" in
-                provision) record "PROVISION" ;;
+                provision)
+                  record "PROVISION"
+                  if [ "${EGA_HARNESS_PROVISION_FAIL:-0}" = "1" ]; then
+                    record "PROVISION_FAIL"
+                    exit 1
+                  fi ;;
                 probe) record "TRANSIENT_PROBE" ;;
                 verify) record "TRANSIENT_VERIFY" ;;
               esac
@@ -314,14 +441,44 @@ def _install_shims(bin_dir, sandbox):
                 exit "$_rc"
               fi
               "$EGA_HARNESS_REAL_PY" -m backend.app.deploy_release "$@"
-              exit $? ;;
+              _rc=$?
+              if [ "${EGA_HARNESS_CAS_RACE:-0}" = "1" ] \
+                 && [ "${1:-}" = "inspect" ] \
+                 && [ ! -f "$EGA_HARNESS_SANDBOX/.cas-raced" ]; then
+                mkdir -p "$EGA_HARNESS_RACE_TARGET/venv/bin" \
+                         "$EGA_HARNESS_RACE_TARGET/deploy/etc"
+                cp "$EGA_HARNESS_FAKE_PY" \
+                   "$EGA_HARNESS_RACE_TARGET/venv/bin/python"
+                cp "$EGA_HARNESS_FAKE_PIP" \
+                   "$EGA_HARNESS_RACE_TARGET/venv/bin/pip"
+                chmod 0755 "$EGA_HARNESS_RACE_TARGET/venv/bin/python" \
+                           "$EGA_HARNESS_RACE_TARGET/venv/bin/pip"
+                : > "$EGA_HARNESS_RACE_TARGET/deploy/etc/validate-release.py"
+                chmod 0755 "$EGA_HARNESS_RACE_TARGET"
+                ln -sfn "$EGA_HARNESS_RACE_TARGET" "$EGA_HARNESS_CURRENT"
+                : > "$EGA_HARNESS_SANDBOX/.cas-raced"
+                record "CAS_RACE_SWITCH $EGA_HARNESS_CURRENT -> $EGA_HARNESS_RACE_TARGET"
+              fi
+              exit "$_rc" ;;
             *) exit 0 ;;
           esac
         fi
         if [ "${1:-}" = "-c" ]; then exit 0; fi
         case "${1:-}" in
-          *quiescence-check.py*) record "QUIESCE"; exit 0 ;;
-          *validate-archive.py*) record "ARCHIVE_VALIDATE"; exit 0 ;;
+          *quiescence-check.py*)
+            if [ "${EGA_HARNESS_QUIESCE_FAIL:-0}" = "1" ]; then
+              record "QUIESCE_FAIL"
+              printf '{"quiescent": false, "reasons": ["harness"]}\\n'
+              exit 3
+            fi
+            record "QUIESCE"; exit 0 ;;
+          *validate-archive.py*)
+            if [ "${EGA_HARNESS_ARCHIVE_VALIDATE_FAIL:-0}" = "1" ]; then
+              record "ARCHIVE_VALIDATE_FAIL"
+              printf 'blocked: archive member rejected (harness)\\n'
+              exit 3
+            fi
+            record "ARCHIVE_VALIDATE"; exit 0 ;;
           *validate-release.py*) record "VALIDATE_RELEASE"; exit 0 ;;
         esac
         exit 0
@@ -359,9 +516,18 @@ def _rewrite_script(text, repo_root, sandbox, script_name):
 
 def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
                       db_exists=True, preexisting_drain=False,
-                      ready_fail=False, services_active=False,
-                      fault_point=None, compat_fail=False,
-                      switch_post_replace_fail=False, lock_held=False):
+                      ready_fail=False, ready_fail_stages=None,
+                      services_active=False, fault_point=None,
+                      compat_fail=False, compat_error=False,
+                      switch_post_replace_fail=False, lock_held=False,
+                      quiesce_fail=False, archive_validate_fail=False,
+                      pip_fail=False, missing_frontend=False,
+                      provision_fail=False, drain_create_fail=False,
+                      config_parse_fail=False, current_invalid=None,
+                      cas_race=False, start_fail_units=(),
+                      secrets_env_present=True, etc_readonly=False,
+                      unit_content_from_commit=False, user_exists=False,
+                      preserve_pointer=False, env_extra=None):
     """Run install.sh/upgrade.sh in a sandbox. Returns (proc, sandbox,
     events, env, paths).
 
@@ -369,10 +535,14 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
       * fault_point        -> EGA_DEPLOY_FAULT_POINT for the shared
                               deploy_common.sh hook / primitive hook
       * compat_fail        -> fake release venv says --check-compat fails
+      * compat_error       -> fake --check-compat exits with an unexpected
+                              error (compatibility unknown, not proven false)
       * switch_post_replace_fail -> harness corrupts the switch AFTER the
                               real atomic replace (post-switch recovery)
       * lock_held          -> the harness holds the kernel flock on the
                               sandbox deployment lock during the run
+
+    Deterministic W6 failure-matrix knobs (see module docstring).
     """
     sandbox = str(tmp_path / "sandbox")
     for rel in ("etc/ega-update", "etc/systemd/system",
@@ -387,6 +557,10 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
     db_path = os.path.join(state, "state.db")
     backups = os.path.join(state, "backups")
     etc = os.path.join(sandbox, "etc", "ega-update")
+    prefix = os.path.join(sandbox, "opt", "ega-update")
+    current = os.path.join(prefix, "current")
+    releases = os.path.join(prefix, "releases")
+    systemd_dir = os.path.join(sandbox, "etc", "systemd")
 
     fake_py = os.path.join(sandbox, "fake-venv-python")
     fake_pip = os.path.join(sandbox, "fake-venv-pip")
@@ -408,7 +582,8 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
         json.dump(config, fh)
     _write(os.path.join(etc, "csrf.secret"), "fixture-csrf-secret-value\n",
            0o600)
-    _write(os.path.join(etc, "secrets.env"), "", 0o640)
+    if secrets_env_present:
+        _write(os.path.join(etc, "secrets.env"), "", 0o640)
     _write(os.path.join(etc, "inventory.json"), '{"tools": {}}', 0o640)
 
     if db_exists:
@@ -416,8 +591,7 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
     if preexisting_drain:
         _write(os.path.join(state, "drain"), "")
 
-    prev_release = os.path.join(sandbox, "opt", "ega-update", "releases",
-                                "0" * 40)
+    prev_release = os.path.join(releases, "0" * 40)
     if existing_deploy:
         os.makedirs(os.path.join(prev_release, "venv", "bin"),
                     exist_ok=True)
@@ -427,10 +601,24 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
                _FAKE_VENV_PIP)
         # Immutable-release contract for the restore target (0755).
         os.chmod(prev_release, 0o755)
-        link = os.path.join(sandbox, "opt", "ega-update", "current")
-        if os.path.islink(link) or os.path.exists(link):
-            os.unlink(link)
-        os.symlink(prev_release, link)
+    if current_invalid == "file":
+        _write(current, "manual state\n")
+    elif current_invalid == "dir":
+        os.makedirs(current, exist_ok=True)
+    elif current_invalid == "escape":
+        outside = os.path.join(sandbox, "outside-current")
+        os.makedirs(outside, exist_ok=True)
+        os.symlink(outside, current)
+    elif existing_deploy:
+        if preserve_pointer and os.path.lexists(current):
+            pass
+        else:
+            if os.path.islink(current) or os.path.exists(current):
+                os.unlink(current)
+            os.symlink(prev_release, current)
+
+    if etc_readonly:
+        os.chmod(etc, 0o555)
 
     tarball = os.path.join(sandbox, "tmp", "release.tar.gz")
     _write(tarball, "not-a-real-tarball\n")
@@ -456,19 +644,56 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
         "EGA_HARNESS_STATE": state,
         "EGA_HARNESS_DB": db_path,
         "EGA_HARNESS_BACKUPS": backups,
+        "EGA_HARNESS_ETC": etc,
+        "EGA_HARNESS_CURRENT": current,
+        "EGA_HARNESS_LOCK": os.path.join(prefix, "deploy.lock"),
+        "EGA_HARNESS_RACE_TARGET": os.path.join(releases, "3" * 40),
         "EGA_HARNESS_FAKE_PY": fake_py,
         "EGA_HARNESS_FAKE_PIP": fake_pip,
         "EGA_HARNESS_REAL_PY": sys.executable,
     })
     if ready_fail:
         env["EGA_HARNESS_READY_FAIL"] = "1"
+    if ready_fail_stages:
+        env["EGA_HARNESS_READY_FAIL_STAGES"] = ",".join(ready_fail_stages)
     if fault_point:
         env["EGA_DEPLOY_FAULT_POINT"] = fault_point
     if compat_fail:
-        env["EGA_HARNESS_COMPAT_FAIL"] = "1"
+        env["EGA_HARNESS_COMPAT_FAIL"] = "fail"
+    if compat_error:
+        env["EGA_HARNESS_COMPAT_FAIL"] = "error"
     if switch_post_replace_fail:
         env["EGA_HARNESS_SWITCH_POST_REPLACE_FAIL"] = "1"
+    if quiesce_fail:
+        env["EGA_HARNESS_QUIESCE_FAIL"] = "1"
+    if archive_validate_fail:
+        env["EGA_HARNESS_ARCHIVE_VALIDATE_FAIL"] = "1"
+    if pip_fail:
+        env["EGA_HARNESS_PIP_FAIL"] = "1"
+    if missing_frontend:
+        env["EGA_HARNESS_MISSING_FRONTEND"] = "1"
+    if provision_fail:
+        env["EGA_HARNESS_PROVISION_FAIL"] = "1"
+    if drain_create_fail:
+        env["EGA_HARNESS_DRAIN_CREATE_FAIL"] = "1"
+    if config_parse_fail:
+        env["EGA_HARNESS_CONFIG_PARSE_FAIL"] = "1"
+    if cas_race:
+        env["EGA_HARNESS_CAS_RACE"] = "1"
+    if start_fail_units:
+        env["EGA_HARNESS_START_FAIL_UNITS"] = ",".join(start_fail_units)
+    if unit_content_from_commit:
+        env["EGA_HARNESS_UNIT_CONTENT_FROM_COMMIT"] = "1"
+    if user_exists:
+        env["EGA_HARNESS_USER_EXISTS"] = "1"
+    if env_extra:
+        env.update(env_extra)
     if services_active:
+        statedir = os.path.join(sandbox, ".systemctl-state.d")
+        os.makedirs(statedir, exist_ok=True)
+        for unit in ("ega-update-api", "ega-update-worker",
+                     "cloudflared-ega-update"):
+            _write(os.path.join(statedir, unit), "active\n")
         _write(os.path.join(sandbox, ".systemctl-state"), "active\n")
     lock_handle = None
     if lock_held:
@@ -485,5 +710,7 @@ def run_deploy_script(tmp_path, repo_root, script_name, *, existing_deploy,
             lock_handle.close()
     with open(events, "r", encoding="utf-8") as fh:
         event_lines = [ln.strip() for ln in fh.read().splitlines() if ln]
-    return proc, sandbox, event_lines, env, {"state": state, "db": db_path,
-                                             "backups": backups, "etc": etc}
+    return proc, sandbox, event_lines, env, {
+        "state": state, "db": db_path, "backups": backups, "etc": etc,
+        "prefix": prefix, "current": current, "releases": releases,
+        "systemd": systemd_dir}
