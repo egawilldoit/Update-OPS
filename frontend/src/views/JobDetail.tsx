@@ -1,5 +1,6 @@
 import React from "react";
 import { elapsed, type JobDetail as Detail, type LogRecord } from "../api/client";
+import { describeJobFailure, jobOutcome, toolName } from "../operational";
 import { LogViewer } from "../components/LogViewer";
 import { StatusBadge } from "../components/StatusBadge";
 
@@ -36,18 +37,33 @@ export function JobDetail({
     );
   }
   const terminal = ["succeeded", "blocked", "failed", "health_failed", "interrupted"].includes(job.state);
+  const outcome = jobOutcome(job.state);
+  const failure = describeJobFailure(job);
   const fls = typeof finalLogSeq === "number" ? finalLogSeq : typeof job.final_log_seq === "number" ? job.final_log_seq : -1;
   const cursor = typeof nextAfter === "number" ? nextAfter : 0;
   const tail = pendingTail === true || (terminal && (hasMore === true || (fls >= 0 && cursor < fls)));
   return (
     <section aria-label={`Job ${job.id}`}>
       <h2>
-        Job — {job.tool_id} <StatusBadge status={job.state} />
+        Job — {toolName(job.tool_id)} <StatusBadge status={job.state} label={outcome.label} />
       </h2>
+      <p
+        className={`outcome-banner outcome-${outcome.tone}`}
+        role={outcome.tone === "bad" || job.recovery_required ? "alert" : "status"}
+      >
+        <strong>{outcome.label}</strong> — {outcome.sentence}
+        {job.error_code ? ` ${failure.title}: ${failure.message}` : ""}
+      </p>
+      {job.recovery_required ? (
+        <p className="error" role="alert">
+          Recovery required — this job may have left {toolName(job.tool_id)} in a partial state. Reconcile over
+          SSH before any new update. The console will refuse new plans until the flag clears.
+        </p>
+      ) : null}
       <dl className="plan-facts">
         <div>
           <dt>Step</dt>
-          <dd>{job.step || job.state} (real step name — no percentage is shown)</dd>
+          <dd>{job.step || outcome.label} (real step name — no percentage is shown)</dd>
         </div>
         <div>
           <dt>Elapsed</dt>
@@ -55,22 +71,21 @@ export function JobDetail({
         </div>
         <div>
           <dt>Before → after</dt>
-          <dd>
+          <dd className="mono">
             {job.before_version || "unknown"} → {job.after_version || "pending"}
           </dd>
         </div>
         <div>
           <dt>Created / started / finished</dt>
-          <dd>
+          <dd className="mono">
             {job.created_at || "—"} / {job.started_at || "—"} / {job.finished_at || "—"}
           </dd>
         </div>
         {job.error_code ? (
           <div>
-            <dt>Error</dt>
+            <dt>Failure</dt>
             <dd>
-              {job.error_code}
-              {job.error_detail ? ` — ${job.error_detail}` : ""}
+              {failure.title}: {failure.message} Next: {failure.action}
             </dd>
           </div>
         ) : null}
@@ -86,7 +101,7 @@ export function JobDetail({
         </div>
         <div>
           <dt>Log cursor</dt>
-          <dd>
+          <dd className="mono">
             after={cursor}
             {fls >= 0 ? ` final=${fls}` : " final=unknown (durable flush pending)"}
           </dd>

@@ -1,119 +1,141 @@
 import React from "react";
-import { isStale, type ToolCard as Card } from "../api/client";
+import type { JobView, ToolCard as Card } from "../api/client";
 import type { CheckState } from "../useToolChecks";
+import { buildToolView, formatTimestamp } from "../operational";
 import { StatusBadge } from "./StatusBadge";
-
-const DISPLAY: Record<string, string> = {
-  hermes: "Hermes",
-  opencode: "OpenCode",
-  codex: "Codex",
-  t3: "T3",
-};
 
 export function ToolCard({
   card,
-  updateDisabled,
-  disableReason,
-  onCheck,
-  onPlan,
-  checking,
+  updateBlocked,
+  blockedReason,
   checkState,
+  lastFailure,
   planning,
   disconnected,
+  onCheck,
+  onPlan,
 }: {
   card: Card;
-  updateDisabled: boolean;
-  disableReason: string;
-  onCheck: () => void;
-  onPlan: () => void;
-  checking: boolean;
+  updateBlocked: boolean;
+  blockedReason: string;
   checkState?: CheckState;
+  lastFailure?: JobView;
   planning: boolean;
   disconnected?: boolean;
+  onCheck: () => void;
+  onPlan: () => void;
 }): React.ReactElement {
-  const stale = isStale(card.checked_at);
-  // Disconnected forces stale presentation regardless of cached values:
-  // never render cached green as current while the API is unreachable.
-  const forcedStale = disconnected === true;
-  const healthLabel = forcedStale ? "stale" : stale && card.health !== "stale" ? "stale" : card.health;
-  const name = DISPLAY[card.id] ?? card.id;
+  const view = buildToolView({ card, checkState, updateBlocked, blockedReason, lastFailure, disconnected });
+  const busy = checkState?.kind === "checking" || checkState?.kind === "pending";
+  const failure = view.lastFailure;
+  const blocked = view.eligibility.state === "blocked";
   return (
     <article
-      className={forcedStale ? "tool-card tool-card-stale" : "tool-card"}
-      aria-label={`${name} status card${forcedStale ? " (stale — disconnected)" : ""}`}
+      className={view.stale ? "tool-card tool-card-stale" : "tool-card"}
+      aria-label={`${view.name} status card${disconnected ? " (stale — disconnected)" : ""}`}
     >
       <header className="tool-card-head">
-        <h2>{name}</h2>
-        <StatusBadge status={healthLabel} />
+        <div className="tool-card-title">
+          <h2>{view.name}</h2>
+          <p className="tool-card-summary">{view.summary}</p>
+        </div>
+        <StatusBadge status={view.health} />
       </header>
+
       <dl className="tool-facts">
         <div>
           <dt>Installed</dt>
-          <dd>{card.installed_version || "unknown"}</dd>
+          <dd className="mono">{view.installed}</dd>
         </div>
         <div>
           <dt>Available target</dt>
-          <dd>{card.available_target || "unknown"}</dd>
+          <dd className="mono">{view.target}</dd>
         </div>
         <div>
           <dt>Channel</dt>
-          <dd>{card.channel || "—"}</dd>
+          <dd>{view.channel}</dd>
         </div>
         <div>
-          <dt>Last success</dt>
-          <dd>{card.last_success || "never"}</dd>
+          <dt>Health</dt>
+          <dd>{view.healthDetail}</dd>
         </div>
         <div>
-          <dt>Last attempt</dt>
-          <dd>{card.last_attempt || "never"}</dd>
-        </div>
-        <div>
-          <dt>Last checked</dt>
-          <dd>
-            {card.checked_at || "never"}
-            {forcedStale ? " (stale — disconnected)" : stale ? " (stale)" : ""}
+          <dt>Last successful check</dt>
+          <dd className="mono">
+            {formatTimestamp(card.checked_at || card.last_success_at || "")}
+            {view.stale ? " (stale)" : ""}
           </dd>
         </div>
-        {forcedStale ? (
+        <div>
+          <dt>Latest check</dt>
+          <dd>
+            {view.check.label}
+            {view.check.at ? <span className="meta"> {formatTimestamp(view.check.at)}</span> : null}
+          </dd>
+        </div>
+        <div>
+          <dt>Last successful update</dt>
+          <dd className="mono">{formatTimestamp(view.lastSuccess)}</dd>
+        </div>
+        {failure ? (
           <div>
-            <dt>Status</dt>
-            <dd>stale — disconnected</dd>
-          </div>
-        ) : null}
-        {card.health_detail ? (
-          <div>
-            <dt>Health detail</dt>
-            <dd>{card.health_detail}</dd>
-          </div>
-        ) : null}
-        {card.discovery_error ? (
-          <div>
-            <dt>Discovery</dt>
-            <dd>unknown — {card.discovery_error}</dd>
+            <dt>Last failed attempt</dt>
+            <dd>
+              {failure.outcome.label}
+              {failure.reason.title && failure.reason.title !== failure.outcome.label
+                ? ` — ${failure.reason.title}`
+                : ""}
+              : {failure.reason.message}
+              {failure.at ? <span className="meta"> ({formatTimestamp(failure.at)})</span> : null}
+            </dd>
           </div>
         ) : null}
       </dl>
-      {checkState?.kind === "pending" ? <p role="status">Probe pending</p> : null}
-      {checkState?.kind === "error" ? <p role="alert">Check failed: {checkState.message}</p> : null}
+
+      {view.check.kind === "pending" ? (
+        <p className="check-note" role="status">
+          {view.check.label} {view.check.detail}
+        </p>
+      ) : null}
+      {view.check.kind === "checking" ? (
+        <p className="check-note" role="status">
+          {view.check.label} {view.check.detail}
+        </p>
+      ) : null}
+      {view.check.kind === "failed" && view.check.alert ? (
+        <p className="error" role="alert">
+          Check failed: {view.check.detail}
+        </p>
+      ) : null}
+      {view.check.kind === "failed" && !view.check.alert ? (
+        <p className="warn" role="note">
+          {view.check.detail}
+        </p>
+      ) : null}
+      {view.stale && view.check.kind !== "failed" ? (
+        <p className="warn" role="note">
+          Observation is stale — the values above are the last confirmed state, not current.
+        </p>
+      ) : null}
+
       <div className="tool-actions">
-        <button type="button" onClick={onCheck} disabled={checking} aria-label={`Check ${name} again`}>
-          {checking ? "Checking…" : "Check again"}
+        <button type="button" onClick={onCheck} disabled={busy} aria-label={`Check ${view.name} again`}>
+          {view.check.kind === "checking" || view.check.kind === "pending" ? "Checking…" : "Check again"}
         </button>
         <button
           type="button"
           onClick={onPlan}
-          disabled={updateDisabled || planning}
-          aria-label={`Preview update for ${name}`}
-          title={updateDisabled ? disableReason : `Preview update for ${name}`}
+          disabled={updateBlocked || planning}
+          aria-label={`Preview update for ${view.name}`}
+          title={updateBlocked ? blockedReason : `Preview update for ${view.name}`}
         >
-          {planning ? "Loading…" : "Update…"}
+          {planning ? "Loading…" : "Plan update"}
         </button>
       </div>
-      {updateDisabled && disableReason ? (
-        <p className="hint" role="note">
-          {disableReason}
-        </p>
-      ) : null}
+
+      <p className={blocked ? "tool-gate tool-gate-blocked" : "tool-gate"} role="note">
+        <strong>{view.eligibility.label}</strong> — {view.eligibility.reason} {view.eligibility.action}
+      </p>
     </article>
   );
 }

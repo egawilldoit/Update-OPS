@@ -14,10 +14,20 @@ import {
 } from "./api/client";
 import { useToolChecks } from "./useToolChecks";
 import { HealthPanel } from "./components/HealthPanel";
+import { MaintenanceBanner } from "./components/MaintenanceBanner";
 import { History } from "./views/History";
 import { JobDetail } from "./views/JobDetail";
 import { Overview } from "./views/Overview";
 import { PlanPreview } from "./views/PlanPreview";
+import {
+  globalUpdateGate,
+  lastFailureByTool,
+  maintenanceFromError,
+  maintenanceFromHealth,
+  planErrorFromException,
+  type FailureView,
+  type MaintenanceState,
+} from "./operational";
 
 type View = { kind: "overview" } | { kind: "plan"; toolId: string } | { kind: "job"; jobId: string } | { kind: "history" };
 
@@ -43,12 +53,13 @@ export function App(): React.ReactElement {
   const [reconnect, setReconnect] = React.useState("");
   const [bootError, setBootError] = React.useState("");
   const [health, setHealth] = React.useState<HealthView | null>(null);
+  const [maintenance, setMaintenance] = React.useState<MaintenanceState>({ kind: "unknown" });
   const [cards, setCards] = React.useState<Card[]>([]);
   const [view, setViewState] = React.useState<View>({ kind: "overview" });
   const [planningId, setPlanningId] = React.useState("");
   const [plan, setPlan] = React.useState<PlanView | null>(null);
   const [planLoading, setPlanLoading] = React.useState(false);
-  const [planError, setPlanError] = React.useState("");
+  const [planError, setPlanError] = React.useState<FailureView | null>(null);
   const [ack, setAck] = React.useState(false);
   const [starting, setStarting] = React.useState(false);
   const [idemKey, setIdemKey] = React.useState("");
@@ -104,7 +115,7 @@ export function App(): React.ReactElement {
     planRequest.current = null;
     setPlanningId("");
     setPlan(null);
-    setPlanError("");
+    setPlanError(null);
     setPlanLoading(false);
     setViewState(next);
   }
@@ -157,6 +168,7 @@ export function App(): React.ReactElement {
       clearBucket("read");
       setReconnect("");
       setHealth(h);
+      setMaintenance(prev => maintenanceFromHealth(h, prev));
     } catch (e) {
       if (e instanceof ApiError && e.status === 429) {
         noteRateLimited("read", e);
@@ -199,7 +211,7 @@ export function App(): React.ReactElement {
     } catch (e) {
       if (e instanceof ApiError && e.status === 429) {
         noteRateLimited("read", e);
-        setNotice(`rate_limited: honoring Retry-After before history retry`);
+        setNotice("Rate limited — honoring Retry-After before loading history again.");
         return;
       }
       markMaybeDisconnected(e);
@@ -302,12 +314,10 @@ export function App(): React.ReactElement {
   // Gating comes from the global active poll, never from history/detail.
   const activeJob = activeJobs.find((j) => NONTERMINAL.includes(j.state));
   const recoveryRequired = health?.recovery_required === true;
-  const updateDisabled = Boolean(activeJob) || recoveryRequired;
-  const disableReason = recoveryRequired
-    ? "Updates blocked: recovery required — clear via SSH reconcile first."
-    : activeJob
-      ? `Updates blocked: job ${activeJob.id.slice(0, 8)} (${activeJob.tool_id}, ${activeJob.state}) is active.`
-      : "";
+  const gate = globalUpdateGate({ maintenance, recoveryRequired, activeJob, disconnected });
+  const updateDisabled = gate.blocked;
+  const disableReason = gate.blocked ? `${gate.reason} ${gate.action}` : "";
+  const lastFailures = React.useMemo(() => lastFailureByTool(history), [history]);
 
   async function handleCheck(toolId: string): Promise<void> {
     // R19: explicit Check again forces fresh bounded probes (?force=1);
@@ -321,7 +331,12 @@ export function App(): React.ReactElement {
 
   async function handlePlan(toolId: string): Promise<void> {
     if (Date.now() < mutationBackoff.current.untilMs) {
-      setPlanError("Rate limited — plan retry backing off (Retry-After honored, max 30s).");
+      setPlanError({
+        title: "Rate limited",
+        message: "Plan creation is backing off after a rate limit.",
+        action: "Wait for the Retry-After window, then retry.",
+        code: "rate_limited",
+      });
       return;
     }
     if (!sessionActive.current) return;
@@ -330,7 +345,7 @@ export function App(): React.ReactElement {
     planRequest.current = request;
     setPlanningId(toolId);
     setPlanLoading(true);
-    setPlanError("");
+    setPlanError(null);
     setPlan(null);
     setAck(false);
     try {
@@ -341,15 +356,23 @@ export function App(): React.ReactElement {
       setReconnect("");
       setPlan(p);
       setIdemKey(newIdempotencyKey());
+      setMaintenance({ kind: "clear" });
     } catch (e) {
       if (planRequest.current !== request) return;
       if (e instanceof ApiError && e.status === 429) {
         noteRateLimited("mutation", e);
-        setPlanError("rate_limited: plan retry backing off (Retry-After honored, max 30s).");
+        setPlanError({
+          title: "Rate limited",
+          message: "Plan creation is backing off after a rate limit.",
+          action: "Wait for the Retry-After window, then retry.",
+          code: "rate_limited",
+        });
         return;
       }
+      const maintenanceState = maintenanceFromError(e);
+      if (maintenanceState) setMaintenance(maintenanceState);
       markMaybeDisconnected(e);
-      setPlanError(errText(e));
+      setPlanError(planErrorFromException(e));
     } finally {
       if (planRequest.current === request) {
         setPlanLoading(false);
@@ -361,7 +384,7 @@ export function App(): React.ReactElement {
   async function handleStart(): Promise<void> {
     if (!sessionActive.current || !plan) return;
     if (Date.now() < mutationBackoff.current.untilMs) {
-      setNotice("Rate limited — Start update is backing off (Retry-After honored, max 30s).");
+      setNotice("Rate limited — start update is backing off (Retry-After honored, max 30s).");
       return;
     }
     setStarting(true);
@@ -383,11 +406,14 @@ export function App(): React.ReactElement {
     } catch (e) {
       if (e instanceof ApiError && e.status === 429) {
         noteRateLimited("mutation", e);
-        setNotice("rate_limited: Start update backing off (Retry-After honored, max 30s).");
+        setNotice("Rate limited — start update is backing off (Retry-After honored, max 30s).");
         return;
       }
+      const maintenanceState = maintenanceFromError(e);
+      if (maintenanceState) setMaintenance(maintenanceState);
       markMaybeDisconnected(e);
-      setNotice(errText(e));
+      const failure = planErrorFromException(e);
+      setNotice(`${failure.title}: ${failure.message} ${failure.action}`);
     } finally {
       setStarting(false);
     }
@@ -513,6 +539,7 @@ export function App(): React.ReactElement {
   const terminal = job !== null && isTerminal(job.state);
   const pendingTail =
     terminal && (hasMore || (finalLogSeq >= 0 && logsAfter < finalLogSeq));
+  const connectionLabel = disconnected ? "Disconnected" : reconnect ? "Reconnecting" : email ? "Connected" : "Connecting…";
 
   return (
     <div className="app">
@@ -520,9 +547,29 @@ export function App(): React.ReactElement {
         Skip to main content
       </a>
       <header className="app-header">
-        <div>
-          <h1>EGA Update Console</h1>
+        <div className="brand">
+          <h1>Update Console</h1>
           <p className="owner-line">{email ? `Owner: ${email}` : "Private owner console"}</p>
+        </div>
+        <div className="header-status">
+          <span
+            className={`conn-chip ${disconnected ? "conn-down" : "conn-up"}`}
+            role="status"
+            aria-label={`Connection: ${connectionLabel}`}
+          >
+            {connectionLabel}
+          </span>
+          <span
+            className={`conn-chip ${maintenance.kind === "active" ? "conn-maint" : "conn-neutral"}`}
+            role="status"
+            aria-label={`Maintenance: ${maintenance.kind}`}
+          >
+            {maintenance.kind === "active"
+              ? "Maintenance mode"
+              : maintenance.kind === "clear"
+                ? "No maintenance drain"
+                : "Maintenance state not reported"}
+          </span>
         </div>
         <nav aria-label="Primary">
           <button
@@ -550,6 +597,7 @@ export function App(): React.ReactElement {
           Disconnected — API unreachable. Status is not current; cached values are never shown as green.
         </p>
       ) : null}
+      <MaintenanceBanner state={maintenance} />
       {reconnect ? (
         <p className="banner banner-error" role="status">
           {reconnect}
@@ -567,22 +615,37 @@ export function App(): React.ReactElement {
       ) : null}
 
       <main id="main">
-        <HealthPanel health={health} disconnected={disconnected} />
+        <HealthPanel health={health} disconnected={disconnected} maintenance={maintenance} />
+        <section className="gate-strip" aria-label="Update gate">
+          <span className={`gate-state ${gate.blocked ? "gate-blocked" : "gate-open"}`} role="status">
+            {gate.blocked ? "Update blocked" : "Updates allowed"}
+          </span>
+          <p className="hint">{gate.blocked ? disableReason : gate.action}</p>
+        </section>
         {view.kind === "overview" ? (
           <Overview
             cards={cards}
-            updateDisabled={updateDisabled}
-            disableReason={disableReason}
+            history={history}
+            lastFailures={lastFailures}
+            updateBlocked={updateDisabled}
+            blockedReason={disableReason}
             checkStates={checks.states}
             planningId={planningId}
+            activeJob={activeJob}
             disconnected={disconnected}
             onCheck={(t) => void handleCheck(t)}
             onPlan={(t) => void handlePlan(t)}
+            onOpenJob={openJob}
+            onViewHistory={() => {
+              setView({ kind: "history" });
+              void loadHistory();
+            }}
           />
         ) : null}
         {view.kind === "plan" ? (
           <PlanPreview
             toolId={view.toolId}
+            current={cards.find((c) => c.id === view.toolId)}
             plan={plan}
             loading={planLoading}
             error={planError}
@@ -591,6 +654,8 @@ export function App(): React.ReactElement {
             onStart={() => void handleStart()}
             starting={starting}
             blockedReason={disableReason}
+            maintenance={maintenance}
+            recoveryRequired={recoveryRequired}
           />
         ) : null}
         {view.kind === "job" ? (
@@ -614,14 +679,6 @@ export function App(): React.ReactElement {
             onRefresh={() => void loadHistory()}
             onOpen={openJob}
           />
-        ) : null}
-        {view.kind === "job" ? (
-          <p className="hint">
-            Log cursor: after={logsAfter}
-            {finalLogSeq >= 0 ? ` final=${finalLogSeq}` : " final=unknown"}. Active logs refresh every 2
-            seconds until terminal drain; reopening resumes from 0 to full drain without duplicates.
-            {pendingTail ? " Pending tail: terminal state reached but log cursor is behind — draining." : ""}
-          </p>
         ) : null}
       </main>
     </div>

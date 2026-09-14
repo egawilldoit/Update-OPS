@@ -52,6 +52,12 @@ export interface ToolCard {
   checked_at: string;
   discovery_error: string;
   install_identity: string;
+  /** Last successful observation timestamp (never overwritten by a failed check). */
+  last_success_at?: string;
+  /** Latest check attempt timestamp, success or failure. */
+  attempted_at?: string;
+  /** Latest failed attempt reason; last-good observation fields stay intact. */
+  attempt_error?: string;
 }
 
 export type ToolCheck = ToolCard & { probe_pending?: boolean; probe_request_id?: string };
@@ -146,6 +152,10 @@ export interface HealthView {
   worker: "ok" | "stale" | "down";
   recovery_required: boolean;
   checked_at: string;
+  /** Optional: API builds that report the maintenance drain flag directly. */
+  drain?: boolean;
+  /** Optional alias for the maintenance drain flag. */
+  maintenance?: boolean;
 }
 
 const BASE = "/api/v1";
