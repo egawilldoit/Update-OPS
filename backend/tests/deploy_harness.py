@@ -508,14 +508,9 @@ def _rewrite_script(text, repo_root, sandbox, script_name):
     systemd = os.path.join(sandbox, "etc", "systemd")
     tmp = os.path.join(sandbox, "tmp")
     home = os.path.join(sandbox, "home", "ubuntu")
-    text = text.replace(
-        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-        'SCRIPT_DIR="%s/deploy/scripts"' % repo_root)
-    text = text.replace(
-        'REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"',
-        'REPO_ROOT="%s"' % repo_root)
     # /var/tmp and /tmp straddle each other as substrings; rewrite the
-    # exact script templates in ONE left-to-right pass.
+    # host paths before injecting repo_root. Otherwise the generic
+    # /home/ubuntu substitution would rewrite the repository path too.
     text = re.sub(r"/var/tmp/ega-|/tmp/ega-",
                   lambda _m: os.path.join(tmp, "ega-"), text)
     for real, fake in (
@@ -527,6 +522,12 @@ def _rewrite_script(text, repo_root, sandbox, script_name):
             ("/home/$TOOL_OWNER", home),
             ("/home/ubuntu", home)):
         text = text.replace(real, fake)
+    text = text.replace(
+        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        'SCRIPT_DIR="%s/deploy/scripts"' % repo_root)
+    text = text.replace(
+        'REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"',
+        'REPO_ROOT="%s"' % repo_root)
     return text
 
 
