@@ -1,4 +1,12 @@
-import { ApiError, DisconnectedError, isStale, type HealthView, type JobView, type ToolCard } from "./api/client";
+import {
+  ApiError,
+  DisconnectedError,
+  RequestTimeoutError,
+  isStale,
+  type HealthView,
+  type JobView,
+  type ToolCard,
+} from "./api/client";
 import type { CheckState } from "./useToolChecks";
 
 export const TOOL_NAMES: Record<string, string> = {
@@ -258,7 +266,27 @@ export function describeJobFailure(job: JobView): FailureView {
   return view;
 }
 
-export function planErrorFromException(error: unknown): FailureView {
+export function planErrorFromException(
+  error: unknown,
+  requestKind: "plan" | "start" = "plan",
+): FailureView {
+  if (error instanceof RequestTimeoutError) {
+    if (requestKind === "plan") {
+      return {
+        title: "Plan request timed out",
+        message: "The plan probe did not finish before the browser deadline.",
+        action: "Retry the plan. The control plane may still be healthy.",
+        code: "request_timeout",
+      };
+    }
+    return {
+      title: "Start request timed out",
+      message: "The start request did not finish before the browser deadline.",
+      action:
+        "Check the job history before retrying. The control plane may still be healthy.",
+      code: "request_timeout",
+    };
+  }
   if (error instanceof DisconnectedError) {
     return {
       title: "Disconnected",

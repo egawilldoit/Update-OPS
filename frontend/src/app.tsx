@@ -412,7 +412,7 @@ export function App(): React.ReactElement {
       const maintenanceState = maintenanceFromError(e);
       if (maintenanceState) setMaintenance(maintenanceState);
       markMaybeDisconnected(e);
-      const failure = planErrorFromException(e);
+      const failure = planErrorFromException(e, "start");
       setNotice(`${failure.title}: ${failure.message} ${failure.action}`);
     } finally {
       setStarting(false);

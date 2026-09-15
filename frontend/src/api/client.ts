@@ -3,9 +3,10 @@
 // - CSRF: GET /session returns csrf_token; POSTs send it as X-CSRF-Token
 //   with Content-Type: application/json (backend rejects mismatches with 403).
 // - Error envelope: {code,message,details,request_id} per CONTRACTS section 4.
-// - Disconnected: network failure or 15s AbortController timeout throws
-//   DisconnectedError so the UI shows a "disconnected" banner and never
-//   renders cached green as current.
+// - Disconnected: network failure throws DisconnectedError so the UI shows a
+//   "disconnected" banner and never renders cached green as current.
+// - Internal request deadlines throw RequestTimeoutError. Caller
+//   cancellation remains AbortError.
 // - 429: backend carries a Retry-After header (read vs mutation rate buckets
 //   are separate server-side). ApiError.retryAfterMs preserves it; callers
 //   honor Retry-After then exponential backoff (max 30s) and surface
@@ -37,6 +38,14 @@ export class ApiError extends Error {
 export class DisconnectedError extends Error {
   constructor() {
     super("API unreachable");
+    this.name = "DisconnectedError";
+  }
+}
+
+export class RequestTimeoutError extends Error {
+  constructor() {
+    super("Request timed out");
+    this.name = "RequestTimeoutError";
   }
 }
 
@@ -162,6 +171,10 @@ const BASE = "/api/v1";
 
 /** AbortController timeout for every request (R21): 15s. */
 export const REQUEST_TIMEOUT_MS = 15000;
+/** Backend owner plan probe deadline in milliseconds (backend: 30s). */
+export const BACKEND_OWNER_PLAN_TIMEOUT_MS = 30_000;
+/** Plan requests must outlive the backend owner probe deadline. */
+export const PLAN_REQUEST_TIMEOUT_MS = BACKEND_OWNER_PLAN_TIMEOUT_MS + 5_000;
 /** Backoff ceiling for 429/network retries (R21): 30s. */
 export const MAX_BACKOFF_MS = 30000;
 
@@ -228,12 +241,25 @@ export function backoffMs(attempt: number, retryAfterMs: number | null): number 
   return exp;
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+function abortError(): DOMException {
+  return new DOMException("Request cancelled", "AbortError");
+}
+
+async function req<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const externalSignal = init?.signal;
   const controller = new AbortController();
   const abort = () => controller.abort();
-  init?.signal?.addEventListener("abort", abort, { once: true });
-  if (init?.signal?.aborted) controller.abort();
-  const timer = window.setTimeout(abort, REQUEST_TIMEOUT_MS);
+  let timedOut = false;
+  externalSignal?.addEventListener("abort", abort, { once: true });
+  if (externalSignal?.aborted) controller.abort();
+  const timer = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     const res = await fetch(`${BASE}${path}`, {
       credentials: "same-origin",
@@ -242,19 +268,25 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
+      if (externalSignal?.aborted) throw abortError();
+      if (timedOut) throw new RequestTimeoutError();
       const retryAfterMs = res.status === 429 ? parseRetryAfterMs(res.headers.get("Retry-After")) : null;
       throw new ApiError(res.status, parseErrorBody(text), retryAfterMs);
     }
     const body: unknown = await res.json();
-    if (init?.signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+    if (externalSignal?.aborted) throw abortError();
+    if (timedOut) throw new RequestTimeoutError();
     return body as T;
   } catch (error) {
-    if (init?.signal?.aborted) throw new DOMException("Request cancelled", "AbortError");
+    if (externalSignal?.aborted) throw abortError();
     if (error instanceof ApiError) throw error;
+    if (error instanceof RequestTimeoutError || timedOut) {
+      throw error instanceof RequestTimeoutError ? error : new RequestTimeoutError();
+    }
     throw new DisconnectedError();
   } finally {
     window.clearTimeout(timer);
-    init?.signal?.removeEventListener("abort", abort);
+    externalSignal?.removeEventListener("abort", abort);
   }
 }
 
@@ -295,7 +327,7 @@ export const api = {
       method: "POST",
       headers: mutationHeaders(),
       body: JSON.stringify({}),
-    });
+    }, PLAN_REQUEST_TIMEOUT_MS);
   },
   createJob(planId: string, activityAck: boolean, idempotencyKey: string): Promise<JobView> {
     return req<JobView>("/jobs", {

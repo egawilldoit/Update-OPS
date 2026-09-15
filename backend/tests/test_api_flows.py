@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import sys
 import types
@@ -286,6 +287,39 @@ class _FakeAdapterBase(object):
                                      error_code="" if self._verify_passed
                                      else "health_failed",
                                      error_detail="")
+
+
+def test_frontend_plan_deadline_exceeds_backend_owner_deadline():
+    """Keep the browser deadline above the route's owner-probe bound."""
+    with open(os.path.join(_REPO_ROOT, "backend", "app", "api", "routes.py"),
+              encoding="utf-8") as fh:
+        route_source = fh.read()
+    with open(os.path.join(_REPO_ROOT, "frontend", "src", "api",
+                           "client.ts"), encoding="utf-8") as fh:
+        client_source = fh.read()
+
+    backend_match = re.search(
+        r"OWNER_PLAN_TIMEOUT_S\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+        route_source)
+    frontend_base_match = re.search(
+        r"BACKEND_OWNER_PLAN_TIMEOUT_MS\s*=\s*([0-9_]+)",
+        client_source)
+    frontend_plan_match = re.search(
+        r"PLAN_REQUEST_TIMEOUT_MS\s*=\s*"
+        r"BACKEND_OWNER_PLAN_TIMEOUT_MS\s*\+\s*([0-9_]+)",
+        client_source)
+    assert backend_match is not None
+    assert frontend_base_match is not None
+    assert frontend_plan_match is not None
+    backend_ms = float(backend_match.group(1)) * 1000
+    frontend_base_ms = int(frontend_base_match.group(1).replace("_", ""))
+    frontend_plan_ms = frontend_base_ms + int(
+        frontend_plan_match.group(1).replace("_", ""))
+    assert frontend_base_ms == backend_ms
+    assert re.search(
+        r'_owner_probe\(\s*tool_id, "plan", OWNER_PLAN_TIMEOUT_S\)',
+        route_source)
+    assert frontend_plan_ms > backend_ms
 
 
 # ---------------------------------------------------------------------------

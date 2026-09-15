@@ -45,6 +45,7 @@ router = APIRouter(prefix="/api/v1")
 CANONICAL_ORDER = ("hermes", "opencode", "codex", "t3")
 PLAN_STEPS_DEFAULT = ["preflight", "backup", "updating", "verifying"]
 DISCOVERY_CACHE_S = 15 * 60
+OWNER_PLAN_TIMEOUT_S = 30.0
 LOG_DEFAULT_LIMIT = 200
 LOG_MAX_LIMIT = 1000
 # 15-minute observation freshness: {tool_id: (snapshot_card, monotonic_ts)}.
@@ -881,7 +882,8 @@ async def post_tool_plan(tool_id: str, request: Request):
     # runs activity()+plan() and returns typed results. The API never
     # installs, downloads, or restarts; the wait is bounded (worker
     # thread, R16). No transaction is held across the wait.
-    _status, _payload = await _owner_probe(tool_id, "plan", 30.0)
+    _status, _payload = await _owner_probe(
+        tool_id, "plan", OWNER_PLAN_TIMEOUT_S)
     if _status == "deferred":
         return deps.error_envelope(
             409, "busy", "another update started; retry", "")
