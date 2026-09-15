@@ -126,6 +126,21 @@ ega_advisory_http_probe() {
     "http://127.0.0.1:$port/api/v1/health" 2>/dev/null || printf '000'
 }
 
+# ega_user_bus_env <owner> <repo_root>
+# Canonical user-bus environment for shell `systemctl --user` calls:
+# delegates to the product resolver (backend.app.owner_env bus-env ->
+# systemd_user_bus). Prints one line:
+#   "XDG_RUNTIME_DIR=<path> DBUS_SESSION_BUS_ADDRESS=unix:path=<path>/bus"
+# Returns nonzero with empty output when the bus is unresolvable (callers
+# warn; the owner transient readiness stage remains the fail-closed gate).
+ega_user_bus_env() {
+  local owner="$1" repo="$2" out=""
+  out="$(PYTHONPATH="$repo" python3 -m backend.app.owner_env bus-env \
+    --owner "$owner" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
 # ega_wait_for_readiness <release_dir> <config_file> <port> <report_path>
 #                        <label> [iterations] [sleep_s]
 # Bounded loop over the canonical readiness gate. Returns 0 only when the

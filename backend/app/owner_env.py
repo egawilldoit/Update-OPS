@@ -1481,6 +1481,10 @@ def main(argv=None):
       accept     Run the canonical owner transient acceptance round trip
                  (user bus -> transient unit -> identity/path/result
                  proof -> positive termination) and print its report.
+      bus-env    Print the resolved user-bus environment (single line,
+                 ``KEY=value KEY=value``) for shell callers such as the
+                 deploy scripts' ``systemctl --user`` invocations. Exit 1
+                 when the bus cannot be resolved; never invents values.
     """
     import argparse
     import sys
@@ -1511,6 +1515,8 @@ def main(argv=None):
     p_probe.add_argument("--report-out", default="")
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--report", required=True)
+    p_bus = sub.add_parser("bus-env")
+    p_bus.add_argument("--owner", default="")
     p_accept = sub.add_parser("accept")
     _common(p_accept)
     p_accept.add_argument("--bus", default="")
@@ -1522,6 +1528,21 @@ def main(argv=None):
         args = ap.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0) if isinstance(exc.code, int) else 1
+
+    if args.command == "bus-env":
+        # Canonical user-bus resolution for shell callers (deploy scripts
+        # run `systemctl --user` as the tool owner). Fails closed with no
+        # output when the bus cannot be resolved; never invents paths.
+        bus = systemd_user_bus(args.owner or "ubuntu")
+        xdg = str(bus.get("XDG_RUNTIME_DIR", "") or "")
+        dbus = str(bus.get("DBUS_SESSION_BUS_ADDRESS", "") or "")
+        if not (xdg and dbus):
+            sys.stderr.write("user bus unresolvable for %s\n"
+                             % (args.owner or "ubuntu"))
+            return 1
+        sys.stdout.write("XDG_RUNTIME_DIR=%s DBUS_SESSION_BUS_ADDRESS=%s\n"
+                         % (xdg, dbus))
+        return 0
 
     if args.command == "verify":
         try:

@@ -586,7 +586,17 @@ def test_a24_full_readiness_failure_compat_proven_restores_pointer_only(
     assert "rollback successful" not in message.lower()
     assert _resolves(paths["current"]) == _resolves(_prev(sandbox))
     assert _restore_switch_events(events, "upgrade.sh")
-    assert _has(events, "SYSTEMCTL start")
+    # W11/B2: the failed attempt already started the candidate units, so
+    # the restoration path must RESTART them so the restored pointer's
+    # code is actually loaded (a no-op `start` left pointer=old with the
+    # NEW processes still running).
+    restore_at = _last(events, "DEPLOY_RELEASE switch")
+    assert _last(events, "SYSTEMCTL restart ega-update-api") > restore_at
+    assert _last(events, "SYSTEMCTL restart ega-update-worker") > restore_at
+    assert not [i for i, event in enumerate(events)
+                if i > restore_at and "SYSTEMCTL start ega-update-" in event]
+    assert _has(events, "SYSTEMCTL_RESOLVED ega-update-api %s"
+                % _resolves(_prev(sandbox)))
     assert _count(events, "DEPLOY_RELEASE switch") >= 2
 
 
