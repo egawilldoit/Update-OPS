@@ -18,6 +18,7 @@ These tests run the REAL deploy scripts through the sandbox harness.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(
@@ -289,3 +290,56 @@ def test_owner_env_bus_env_fails_when_bus_unresolvable(monkeypatch, capsys):
                         lambda user="ubuntu": {})
     assert owner_env.main(["bus-env", "--owner", "ubuntu"]) != 0
     assert capsys.readouterr().out.strip() == ""
+
+
+# --------------------------------------------------------------------------
+# B1/B3 root cause: `python3 -m` puts the caller's CWD first on sys.path,
+# so a stale checkout in the operator's working directory silently shadows
+# the trusted module. Observed on the real VM: /home/ubuntu/Update-OPS
+# (an old CLI-less owner_env.py) made `-m backend.app.owner_env provision`
+# exit 0 while doing nothing. All trusted-checkout module invocations must
+# run in a subshell with CWD pinned (same rule as ega_deploy_release).
+# --------------------------------------------------------------------------
+
+def test_user_bus_env_helper_pins_trusted_checkout_cwd(tmp_path):
+    decoy = tmp_path / "decoy-cwd"
+    decoy.mkdir()
+    trusted = tmp_path / "trusted-repo"
+    trusted.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    record = tmp_path / "pwd-record.txt"
+    fake_py = bin_dir / "python3"
+    fake_py.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$PWD\" >> '" + str(record) + "'\n"
+        "printf 'XDG_RUNTIME_DIR=/run/user/1001 "
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus\\n'\n",
+        encoding="utf-8")
+    fake_py.chmod(0o755)
+    common = os.path.join(_REPO_ROOT, "deploy", "scripts", "lib",
+                          "deploy_common.sh")
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
+    proc = subprocess.run(
+        ["/bin/bash", "-c",
+         'source "%s" && ega_user_bus_env ubuntu "%s"' % (common, trusted)],
+        cwd=str(decoy), env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "XDG_RUNTIME_DIR=/run/user/1001" in proc.stdout
+    assert record.read_text(encoding="utf-8").strip() == str(trusted), (
+        "ega_user_bus_env must resolve its module from the trusted "
+        "checkout CWD, never the operator's working directory")
+
+
+def test_deploy_scripts_pin_cwd_for_trusted_module_invocations():
+    for rel in ("deploy/scripts/install.sh", "deploy/scripts/upgrade.sh"):
+        path = os.path.join(_REPO_ROOT, rel)
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        marker = "python3 -m backend.app.owner_env provision"
+        assert marker in text, rel
+        head = text[:text.index(marker)]
+        assert 'cd "$REPO_ROOT" || exit 1' in head[-400:], (
+            "%s: the owner_env provision invocation must run in a "
+            "subshell with CWD pinned to the trusted checkout" % rel)
