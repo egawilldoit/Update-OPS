@@ -135,8 +135,14 @@ ega_advisory_http_probe() {
 # warn; the owner transient readiness stage remains the fail-closed gate).
 ega_user_bus_env() {
   local owner="$1" repo="$2" out=""
-  out="$(PYTHONPATH="$repo" python3 -m backend.app.owner_env bus-env \
-    --owner "$owner" 2>/dev/null)" || return 1
+  # Same subshell-CWD rule as ega_deploy_release: `python3 -m` puts the
+  # caller's CWD first on sys.path, so a stale checkout in the operator's
+  # working directory must never shadow the trusted module.
+  out="$(
+    cd "$repo" || exit 1
+    PYTHONPATH="$repo" python3 -m backend.app.owner_env bus-env \
+      --owner "$owner" 2>/dev/null
+  )" || return 1
   [ -n "$out" ] || return 1
   printf '%s' "$out"
 }

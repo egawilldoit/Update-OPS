@@ -152,7 +152,10 @@ cfg_value() {
   local key="$1"
   local fallback="$2"
   local out=""
-  if out="$(PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli get --require "$key" 2>/dev/null)"; then
+  if out="$(
+    cd "$REPO_ROOT" || exit 1
+    PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli get --require "$key" 2>/dev/null
+  )"; then
     printf '%s' "$out"
   elif [ -f "$ETC/config.json" ]; then
     echo "[install] REFUSING: config parse failed for required key $key" >&2
@@ -502,17 +505,26 @@ fi
 #     never a wider chmod, never a group/other widening — so effective
 #     access does not depend on the running manager. Idempotent on fresh
 #     and existing installs; proven from the real transient identity below.
-SHARED_GROUP="$(PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" \
-  python3 -m backend.app.config_cli get shared_group 2>/dev/null || true)"
+SHARED_GROUP="$(
+  cd "$REPO_ROOT" || exit 1
+  PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" \
+    python3 -m backend.app.config_cli get shared_group 2>/dev/null || true
+)"
 SHARED_GROUP="${SHARED_GROUP:-${EGA_SHARED_GROUP:-ega-update}}"
 echo "[install] provisioning explicit owner-execution access (owner=$TOOL_OWNER group=$SHARED_GROUP)"
-if PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env provision \
-    --owner "$TOOL_OWNER" --group "$SHARED_GROUP" \
-    --state-dir "$EFFECTIVE_STATE" --log-dir "$EFFECTIVE_STATE/logs" \
-    --backup-dir "$EFFECTIVE_BACKUPS" --config-dir "$ETC" \
-    --config-file "$ETC/config.json" --secrets-file "$ETC/secrets.env" \
-    --inventory-file "$ETC/inventory.json" \
-    >/tmp/ega-install-owner-access.json 2>/tmp/ega-install-owner-access.err; then
+# Subshell-CWD rule (same as ega_deploy_release): `python3 -m` puts the
+# caller's CWD first on sys.path, so a stale checkout sharing the
+# `backend` package name must never shadow the provisioning CLI.
+if (
+    cd "$REPO_ROOT" || exit 1
+    PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env provision \
+      --owner "$TOOL_OWNER" --group "$SHARED_GROUP" \
+      --state-dir "$EFFECTIVE_STATE" --log-dir "$EFFECTIVE_STATE/logs" \
+      --backup-dir "$EFFECTIVE_BACKUPS" --config-dir "$ETC" \
+      --config-file "$ETC/config.json" --secrets-file "$ETC/secrets.env" \
+      --inventory-file "$ETC/inventory.json" \
+      >/tmp/ega-install-owner-access.json 2>/tmp/ega-install-owner-access.err
+  ); then
   echo "[install] owner-execution access provisioned (ACLs; no permission widening)"
 else
   cat /tmp/ega-install-owner-access.json >&2 2>/dev/null || true

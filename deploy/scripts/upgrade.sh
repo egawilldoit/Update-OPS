@@ -129,7 +129,13 @@ export EGA_CONFIG_FILE="$ETC/config.json"
 # release, never an old install. Existing config must parse; there are
 # no silent fallbacks for an existing-but-broken config.
 cfg_cli() {
-  PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli "$@"
+  # Subshell-CWD rule (same as ega_deploy_release): `python3 -m` puts the
+  # caller's CWD first on sys.path, so a stale checkout sharing the
+  # `backend` package name must never shadow the trusted parser.
+  (
+    cd "$REPO_ROOT" || exit 1
+    PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" python3 -m backend.app.config_cli "$@"
+  )
 }
 
 cfg_value() {
@@ -334,17 +340,28 @@ fi
 # them too — the SAME canonical idempotent mechanism (ACL only, never a
 # wider chmod). Runs after drain + proven quiescence + proven stopped and
 # before any service/readiness dependency on those permissions.
-SHARED_GROUP="$(PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" \
-  python3 -m backend.app.config_cli get shared_group 2>/dev/null || true)"
+SHARED_GROUP="$(
+  cd "$REPO_ROOT" || exit 1
+  PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" \
+    python3 -m backend.app.config_cli get shared_group 2>/dev/null || true
+)"
 SHARED_GROUP="${SHARED_GROUP:-${EGA_SHARED_GROUP:-ega-update}}"
 echo "[upgrade] provisioning explicit owner-execution access (owner=$TOOL_OWNER group=$SHARED_GROUP)"
-if PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env provision \
-    --owner "$TOOL_OWNER" --group "$SHARED_GROUP" \
-    --state-dir "$EFFECTIVE_STATE" --log-dir "$EFFECTIVE_STATE/logs" \
-    --backup-dir "$EFFECTIVE_BACKUPS" --config-dir "$ETC" \
-    --config-file "$ETC/config.json" --secrets-file "$ETC/secrets.env" \
-    --inventory-file "$ETC/inventory.json" \
-    >/tmp/ega-upgrade-owner-access.json 2>/tmp/ega-upgrade-owner-access.err; then
+# Subshell-CWD rule (same as ega_deploy_release): `python3 -m` puts the
+# caller's CWD first on sys.path, so a stale checkout sharing the
+# `backend` package name would silently shadow the provisioning CLI
+# (observed on the real VM: an old CLI-less module exited 0 doing
+# nothing). Pinning CWD to the trusted checkout is REQUIRED here.
+if (
+    cd "$REPO_ROOT" || exit 1
+    PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env provision \
+      --owner "$TOOL_OWNER" --group "$SHARED_GROUP" \
+      --state-dir "$EFFECTIVE_STATE" --log-dir "$EFFECTIVE_STATE/logs" \
+      --backup-dir "$EFFECTIVE_BACKUPS" --config-dir "$ETC" \
+      --config-file "$ETC/config.json" --secrets-file "$ETC/secrets.env" \
+      --inventory-file "$ETC/inventory.json" \
+      >/tmp/ega-upgrade-owner-access.json 2>/tmp/ega-upgrade-owner-access.err
+  ); then
   echo "[upgrade] owner-execution access provisioned (ACLs; no permission widening)"
 else
   cat /tmp/ega-upgrade-owner-access.json >&2 2>/dev/null || true
