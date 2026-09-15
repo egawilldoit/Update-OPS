@@ -367,6 +367,25 @@ cd /opt/ega-update/current && EGA_CONFIG_FILE=/etc/ega-update/config.json venv/b
   in between were removed by retention; shown records are ordered but not
   complete across the gap. See frontend `LogViewer.tsx` and `retention.py`.
 
+## 11. Release packaging (canonical, byte-reproducible)
+
+Build the release artifact for a pinned commit from this checkout:
+
+```bash
+deploy/scripts/build-release.sh <40-hex-commit-sha> <output-dir>
+```
+
+The canonical command stages the exact `git archive <sha>` tree (never the
+dirty working directory), builds the frontend inside that tree with
+lockfile-resolved `npm ci --prefer-offline` + `npm run build`, and writes
+`<output-dir>/ega-update-<sha>.tar.gz` plus its `.sha256`. It is
+byte-reproducible (normalized owners, mtimes = `SOURCE_DATE_EPOCH`, sorted
+names, `gzip -n`) and self-verifies fail-closed before emitting the
+artifact. Pass the artifact to `install.sh`/`upgrade.sh --release-tarball`;
+verify an existing artifact (identity, full `MANIFEST.sha256`, tracked blob
+hashes, frontend, recorded SHA) with
+`deploy/scripts/build-release.sh --verify <artifact.tar.gz>`.
+
 ## Notes (clarifications only — procedures above are unchanged)
 
 - Runner unit naming: the dispatcher (as `ubuntu`) records the transient
