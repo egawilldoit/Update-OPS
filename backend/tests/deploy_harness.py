@@ -292,6 +292,18 @@ def _install_shims(bin_dir, sandbox):
             exit 0 ;;
           start|restart)
             record "SYSTEMCTL $*"
+            for resolved_u in "$@"; do
+              case "$resolved_u" in
+                ega-update-api|ega-update-worker)
+                  resolved_target=""
+                  if [ -n "${EGA_HARNESS_CURRENT:-}" ] \
+                     && [ -e "${EGA_HARNESS_CURRENT}" ]; then
+                    resolved_target="$(command /usr/bin/readlink -f \
+                      "${EGA_HARNESS_CURRENT}" 2>/dev/null || true)"
+                  fi
+                  record "SYSTEMCTL_RESOLVED $resolved_u $resolved_target" ;;
+              esac
+            done
             for u in "${@:2}"; do
               case ",${EGA_HARNESS_START_FAIL_UNITS:-}," in
                 *",$u,"*)
@@ -408,13 +420,17 @@ def _install_shims(bin_dir, sandbox):
             backend.app.owner_env)
               case "${3:-}" in
                 provision)
-                  record "PROVISION"
+                  record "PROVISION $*"
                   if [ "${EGA_HARNESS_PROVISION_FAIL:-0}" = "1" ]; then
                     record "PROVISION_FAIL"
                     exit 1
                   fi ;;
                 probe) record "TRANSIENT_PROBE" ;;
                 verify) record "TRANSIENT_VERIFY" ;;
+                bus-env)
+                  record "BUS_ENV $*"
+                  printf 'XDG_RUNTIME_DIR=/run/user/1001 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus\n'
+                  exit 0 ;;
               esac
               exit 0 ;;
             venv)

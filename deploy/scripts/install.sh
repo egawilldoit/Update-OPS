@@ -658,7 +658,18 @@ if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
   mkdir -p "/home/$TOOL_OWNER/.config/systemd/user"
   cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" "/home/$TOOL_OWNER/.config/systemd/user/" || fail_keep_drain "user unit copy failed"
   chown -R "$TOOL_OWNER:$TOOL_OWNER" "/home/$TOOL_OWNER/.config/systemd/user"
-  su -s /bin/bash "$TOOL_OWNER" -c 'systemctl --user daemon-reload' || true
+  # W11/B3: `systemctl --user` needs the resolved user-bus environment;
+  # a bare `su` has none ("Failed to connect to bus"), leaving the copied
+  # user runner unit unreloaded. Resolution is canonical (owner_env
+  # bus-env); a WARN is non-fatal because the owner_transient readiness
+  # stage remains the fail-closed gate.
+  USER_BUS_ENV="$(ega_user_bus_env "$TOOL_OWNER" "$REPO_ROOT" || true)"
+  if [ -n "$USER_BUS_ENV" ] \
+     && su -s /bin/bash "$TOOL_OWNER" -c "env $USER_BUS_ENV systemctl --user daemon-reload"; then
+    echo "[install] user manager reloaded for $TOOL_OWNER (user units)"
+  else
+    echo "[install] WARN: user-manager daemon-reload failed; user runner unit may be stale" >&2
+  fi
 fi
 systemctl daemon-reload || fail_keep_drain "daemon-reload failed"
 systemctl enable ega-update-api ega-update-worker || fail_keep_drain "unit enable failed (api/worker)"

@@ -63,6 +63,7 @@ PREFIX="/opt/ega-update"
 ETC="/etc/ega-update"
 STATE="/var/lib/ega-update"
 API_USER="ega-update"
+TOOL_OWNER="ubuntu"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -178,8 +179,14 @@ fail() {
         if [ "$WAS_WORKER" = "1" ] || [ "$WAS_API" = "1" ]; then
           echo "[upgrade] SERVICE RESTORATION: restarting units active before maintenance" >&2
         fi
-        if [ "$WAS_WORKER" = "1" ]; then systemctl start ega-update-worker || true; fi
-        if [ "$WAS_API" = "1" ]; then systemctl start ega-update-api || true; fi
+        # W11/B2: the failed attempt already started the candidate units,
+        # so `start` is a no-op and would leave pointer=old with NEW
+        # processes running. The restored pointer's code must actually be
+        # loaded: restart the units that were active before maintenance.
+        # (Pre-migration/migration-only failure paths keep `start` — there
+        # the services were stopped by this script and hold no new code.)
+        if [ "$WAS_WORKER" = "1" ]; then systemctl restart ega-update-worker || true; fi
+        if [ "$WAS_API" = "1" ]; then systemctl restart ega-update-api || true; fi
       else
         echo "[upgrade] RESTORE FAILED: $CURRENT_LINK may still resolve to $RELEASE_DIR (POINTER NOT RESTORED) — MANUAL RECOVERY REQUIRED (docs/RUNBOOK.md §7)" >&2
         systemctl stop ega-update-worker ega-update-api || true
@@ -318,6 +325,33 @@ else
   echo "[upgrade] created empty known-secret source $ETC/secrets.env"
 fi
 
+# (3c) Explicit effective owner-execution access (W11/B1). The running
+# user@<uid>.service keeps the supplementary-group vector it had at start,
+# so transient `systemd-run --user` probe/runner units inherit a vector
+# WITHOUT the shared group and cannot traverse the group-owned shared
+# paths. install.sh has always provisioned the named-user POSIX ACLs for
+# the tool owner; upgrades of hosts that predate that model must provision
+# them too — the SAME canonical idempotent mechanism (ACL only, never a
+# wider chmod). Runs after drain + proven quiescence + proven stopped and
+# before any service/readiness dependency on those permissions.
+SHARED_GROUP="$(PYTHONPATH="$REPO_ROOT" EGA_CONFIG_FILE="$ETC/config.json" \
+  python3 -m backend.app.config_cli get shared_group 2>/dev/null || true)"
+SHARED_GROUP="${SHARED_GROUP:-${EGA_SHARED_GROUP:-ega-update}}"
+echo "[upgrade] provisioning explicit owner-execution access (owner=$TOOL_OWNER group=$SHARED_GROUP)"
+if PYTHONPATH="$REPO_ROOT" python3 -m backend.app.owner_env provision \
+    --owner "$TOOL_OWNER" --group "$SHARED_GROUP" \
+    --state-dir "$EFFECTIVE_STATE" --log-dir "$EFFECTIVE_STATE/logs" \
+    --backup-dir "$EFFECTIVE_BACKUPS" --config-dir "$ETC" \
+    --config-file "$ETC/config.json" --secrets-file "$ETC/secrets.env" \
+    --inventory-file "$ETC/inventory.json" \
+    >/tmp/ega-upgrade-owner-access.json 2>/tmp/ega-upgrade-owner-access.err; then
+  echo "[upgrade] owner-execution access provisioned (ACLs; no permission widening)"
+else
+  cat /tmp/ega-upgrade-owner-access.json >&2 2>/dev/null || true
+  cat /tmp/ega-upgrade-owner-access.err >&2 2>/dev/null || true
+  fail "owner-execution effective access could not be provisioned (drain kept)"
+fi
+
 # (4) Consistent DB backup (SQLite backup API via the release db tool —
 # never bare cp of a live DB, never inline python). Writers stopped above.
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -445,10 +479,21 @@ chmod 0644 /etc/systemd/system/ega-update-api.service.d/10-port.conf
 echo "[upgrade] rendered port drop-in 10-port.conf with EGA_LISTEN_PORT=$EFFECTIVE_PORT_NOW"
 cp "$CURRENT_LINK/systemd/"*.service /etc/systemd/system/ || fail "unit copy failed"
 if [ -f "$CURRENT_LINK/systemd/user/ega-update-runner@.service" ]; then
-  mkdir -p /home/ubuntu/.config/systemd/user
-  cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" /home/ubuntu/.config/systemd/user/ || fail "user unit copy failed"
-  chown -R ubuntu:ubuntu /home/ubuntu/.config/systemd/user || true
-  su -s /bin/bash ubuntu -c 'systemctl --user daemon-reload' || true
+  mkdir -p "/home/$TOOL_OWNER/.config/systemd/user"
+  cp "$CURRENT_LINK/systemd/user/ega-update-runner@.service" "/home/$TOOL_OWNER/.config/systemd/user/" || fail "user unit copy failed"
+  chown -R "$TOOL_OWNER:$TOOL_OWNER" "/home/$TOOL_OWNER/.config/systemd/user" || true
+  # W11/B3: `systemctl --user` needs the resolved user-bus environment;
+  # a bare `su` has none ("Failed to connect to bus"), leaving the copied
+  # user runner unit unreloaded. Resolution is canonical (owner_env
+  # bus-env); a WARN is non-fatal because the owner_transient_execution
+  # readiness stage remains the fail-closed gate.
+  USER_BUS_ENV="$(ega_user_bus_env "$TOOL_OWNER" "$REPO_ROOT" || true)"
+  if [ -n "$USER_BUS_ENV" ] \
+     && su -s /bin/bash "$TOOL_OWNER" -c "env $USER_BUS_ENV systemctl --user daemon-reload"; then
+    echo "[upgrade] user manager reloaded for $TOOL_OWNER (user units)"
+  else
+    echo "[upgrade] WARN: user-manager daemon-reload failed; user runner unit may be stale" >&2
+  fi
 fi
 systemctl daemon-reload || fail "daemon-reload failed"
 
